@@ -1,6 +1,6 @@
 from typing import List,Dict
 import unittest
-
+from itertools import count
 # class Token:
 #     def __init__(self,tokenID):
 #         self.tokenID = tokenID
@@ -9,20 +9,30 @@ import unittest
 maintain token's longest common prefix
 """
 class RadixTreeNode:
-    def __init__(self,tokens:List[int],mapping_list=None):
+
+    node_count = count()
+
+    def __init__(self,tokens:List[int],mapping_list=None,node_id = None):
         #tokens始终保留原来的顺序,重排只需要修改mapping_list,要获取重排后的顺序使用mapping_list
         self.tokens = tokens
         if mapping_list is not None:
             self.mapping_list = mapping_list
         else:
             self.mapping_list = [i for i in range(len(tokens))]
+        
         self.children:Dict[int,RadixTreeNode] = {} 
+        
+        self.node_id = node_id or RadixTreeNode.next_node_id()
+
+    @classmethod
+    def next_node_id(cls):
+        return next(cls.node_count)
     
     def is_leaf(self)->bool:
         return len(self.children) == 0
 
     def __repr__(self):
-        return f"Node(token={self.tokens},mapping_list={self.mapping_list})"
+        return f"Node[{self.node_id}](token={self.tokens}, mapping_list={self.mapping_list})"
     
     def sort_by_importance(self):
         self.mapping_list.sort(key=lambda i: self.tokens[i], reverse=True)
@@ -86,8 +96,9 @@ class RadixTree:
             if next_token in current.children:
                 child = current.children[next_token]
                 common_len = self.common_prefix_length(remaining,child.tokens)
-                ans.extend(child.tokens[:common_len])
-
+                ans.extend(
+                    [[child.node_id, t] for t in child.tokens[:common_len]]
+                )
                 if common_len != len(child.tokens):
                     break
                 remaining = remaining[common_len:]
@@ -103,7 +114,7 @@ class RadixTree:
         """for debug"""
         if node is None:
             node = self.root
-            print(f"root:")
+            print(f"root:Node_id = {node.node_id}")
         else:
             indent = "  " * depth
             print(f"{indent}{node}")
@@ -118,3 +129,12 @@ if __name__ == "__main__":
     suite = unittest.TestLoader().loadTestsFromTestCase(TestRadixTree)
     runner = unittest.TextTestRunner(verbosity=2)
     runner.run(suite)
+    # tree  = RadixTree()
+    # keys = [
+    #     [1,5,7,4,2,7],
+    #     [1,5,5,3,7],
+    # ]
+    # for key in keys:
+    #     tree.insert(key)
+    #     tree.root.children[1].sort_by_importance()
+    # tree.visualize()
