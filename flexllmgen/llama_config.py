@@ -2,6 +2,50 @@ from transformers import LlamaForCausalLM, LlamaConfig
 import torch
 import os
 import numpy as np
+from typing import List
+
+class LlamaConfig:
+    name: str = "llama-3.1",
+    num_hidden_layers: int,
+    max_position_embeddings: int,
+    hidden_size: int,
+    num_heads: int,
+    num_attention_heads: int,
+    rms_norm_eps: float = 0.00001,
+    rope_theta: int,
+    eos_token_id: List[int],
+    dtype: type = np.float16
+    
+
+def preset_llama3_config():
+    config = LlamaConfig(
+        num_hidden_layers = 32,
+        max_position_embeddings = 131072,
+        hidden_size = 4096,
+        num_heads = 32,
+        num_key_value_heads = 8,
+        rms_norm_eps = 0.00001,
+        rope_theta = 500000,
+        eos_token_id = [128001, 128008, 128009]
+    )
+    return config
+
+def get_llama_config_from(name, model_dir):
+    lm_config = LlamaConfig.from_pretrained(model_dir)
+    
+    config = LlamaConfig(
+        name = name,
+        num_hidden_layers = lm_config.num_hidden_layers,
+        max_position_embeddings = lm_config.max_position_embeddings,
+        hidden_size = lm_config.hidden_size,
+        num_heads = lm_config.num_attention_heads,
+        num_key_value_heads = lm_config.num_key_value_heads,
+        rms_norm_eps = lm_config.rms_norm_eps,
+        rope_theta = lm_config.rope_theta,
+        eos_token_id = lm_config.eos_token_id
+    )
+    
+    return config
 
 def save_weights(output_dir, name, param):
     param_path = os.path.join(output_dir, name)
