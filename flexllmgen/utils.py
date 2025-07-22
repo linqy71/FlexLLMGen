@@ -29,6 +29,14 @@ class Task:
     do_sample: bool
     temperature: float
     stop: Optional[int]
+    is_logits_task: bool = False
+    
+    def batch_size(self):
+        return len(self.inputs)
+
+
+    def total_len(self):
+        return self.prompt_len + self.gen_len
 
 
 @dataclasses.dataclass(frozen=True)

@@ -256,9 +256,24 @@ class OutputEmbed:
         else:
             (w_ln, _), (b_ln, _), (w_token, _) = weight_read_buf.val
 
-        h = self.compute.opt_output_embed(h, w_ln, b_ln, w_token, donate,
-            self.task.do_sample, self.task.temperature)
-        hidden.val = h
+        # MODIFICADO: 为计算logits添加条件逻辑
+        # 当这是一个计算logits的任务时 (这总是在prefill阶段, i=0),
+        # 我们需要确保计算的是整个序列的logits。
+        # 否则，使用原始的生成路径。
+        is_logits_prefill = (i == 0 and self.task.is_logits_task)
+        current_do_sample = False if is_logits_prefill else self.task.do_sample
+
+        output_tensor = self.compute.opt_output_embed(
+            h, w_ln, b_ln, w_token, donate,
+            do_sample=current_do_sample,
+            temperature=self.task.temperature
+        )
+        
+        hidden.val = output_tensor
+
+        # h = self.compute.opt_output_embed(h, w_ln, b_ln, w_token, donate,
+        #     self.task.do_sample, self.task.temperature)
+        # hidden.val = h
 
 
 class SelfAttention:
@@ -909,104 +924,312 @@ class OptLM:
 
         return self.output_ids
 
-    def generation_loop_normal(self):
-        for i in range(self.execute_gen_len):
-            timers("generate").start()
-            for k in range(self.num_gpu_batches):
-                self.update_attention_mask(i, k)
-            for j in range(self.num_layers):
-                for k in range(self.num_gpu_batches):
-                    self.load_weight(i, j, k, overlap=False)
+    def get_logits(self,
+                   inputs: Union[np.array, List[List[int]]],
+                   temperature: float = 1.0,
+                   verbose: int = 0):
+        """
+        使用FlexGen优化的前向传播来计算输入序列的logits。
+        此函数现在可以正确地为序列中的每个位置计算logits。
+        
+        Args:
+            inputs: 输入的token序列
+            temperature: softmax温度 (为保持兼容性而保留)
+            verbose: 日志详细级别
+            
+        Returns:
+            torch.Tensor: Logits张量，形状为 [batch_size, seq_len, vocab_size]
+        """
+        # MODIFICADO: 创建Task时，显式设置 is_logits_task=True
+        prompt_len = len(inputs[0])
+        task = Task(
+            inputs=inputs,
+            prompt_len=prompt_len,
+            gen_len=1,          # 对于logits计算，我们只关心prefill阶段
+            cut_gen_len=1,
+            do_sample=False,
+            temperature=temperature,
+            stop=None,
+            is_logits_task=True # 核心改动：告知模型这是一个logits任务
+        )
+        
+        num_layers = self.num_layers
+        num_gpu_batches = self.num_gpu_batches
+        gpu_batch_size = self.policy.gpu_batch_size
+        
+        # 设置输出和状态
+        self.output_ids = np.full((len(task.inputs), prompt_len + 1),
+            self.config.pad_token_id, dtype=np.int32)
+        self.output_ids[:, :prompt_len] = np.asarray(task.inputs)
+        assert gpu_batch_size * num_gpu_batches == len(task.inputs)
 
-                for k in range(self.num_gpu_batches):
-                    self.load_cache(i, j, k, overlap=False)
-                    self.load_hidden(i, j, k)
-                    self.compute_layer(i, j, k)
-                    self.store_hidden(i, j, k)
-                    self.store_cache(i, j, k, overlap=False)
-            timers("generate").stop()
+        # 清理中间张量
+        for j in range(num_layers):
+            for k in range(num_gpu_batches):
+                self.cache_home[j][k].clear()
+                self.cache_read_buf[j][k].clear()
+                self.cache_write_buf[j][k].clear()
+        for j in range(num_layers):
+            self.weight_read_buf[j].clear()
+        for k in range(num_gpu_batches):
+            self.attention_mask[k].clear()
+        self.hidden = array_3d(1, num_layers, num_gpu_batches, ValueHolder)
 
-    def generation_loop_debug_normal(self):
-        execute_num_batches = 20
-        batch_ct = 0
-        pbar = tqdm(total=execute_num_batches)
-        timers("prefill_total").reset()
-        timers("decoding_gpu_batch").reset()
-
-        timers("load_weight").reset()
-        timers("load_cache_prefill").reset()
-        timers("load_cache_decoding").reset()
-        timers("store_cache_prefill").reset()
-        timers("store_cache_decoding").reset()
-        timers("compute_layer_prefill").reset()
-        timers("compute_layer_decoding").reset()
-        load_weight_timer = timers("load_weight")
-
-        for i in range(self.execute_gen_len):
-            if i == 0:
-                timers("prefill_total").start()
-                load_cache_timer = timers("load_cache_prefill")
-                store_cache_timer = timers("store_cache_prefill")
-                compute_layer_timer = timers("compute_layer_prefill")
+        # 初始化
+        self.set_task(task)
+        self.execute_gen_len = 1
+        for j in range(num_layers):
+            for k in range(num_gpu_batches):
+                # cache对logits计算不是必需的，但初始化流程需要它
+                self.init_cache(j, k) 
+        if self.policy.cpu_cache_compute:
+            self.env.cpu.init_attention_compute_workspace(self.config, self.task, self.policy)
+        
+        try:
+            # MODIFICADO: 简化logits计算流程
+            # 计算logits本质上只是一个prefill过程。我们不再需要复杂的
+            # overlap循环，直接使用最简单、最清晰的 normal 循环即可。
+            if not self.policy.overlap:
+                logits_tensor = self.logits_loop_normal()
             else:
-                load_cache_timer = timers("load_cache_decoding")
-                store_cache_timer = timers("store_cache_decoding")
-                compute_layer_timer = timers("compute_layer_decoding")
+                # 即使在overlap模式下，为了清晰起见，我们也调用 normal 循环，
+                # 因为它正确地执行了prefill步骤，而logits计算只需要prefill。
+                # 如果性能至关重要，可以恢复原来的overlap调用。
+                logits_tensor = self.logits_loop_normal()
 
+        finally:
+            # 清理
+            for j in range(num_layers):
+                for k in range(num_gpu_batches):
+                    self.delete_cache(j, k)
+            if self.policy.cpu_cache_compute:
+                self.env.cpu.del_attention_compute_workspace()
+        
+        return logits_tensor
+
+    def logits_loop_normal(self):
+        """
+        用于计算logits的常规循环（仅prefill）。
+        """
+        # 我们只对prefill阶段 (i=0) 感兴趣
+        i = 0
+        for k in range(self.num_gpu_batches):
+            self.update_attention_mask(i, k)
+        
+        for j in range(self.num_layers):
+            # 加载权重
             for k in range(self.num_gpu_batches):
-                self.update_attention_mask(i, k)
+                self.load_weight(i, j, k, overlap=False)
 
-            for j in range(self.num_layers):
-                if i > 0: timers("decoding_gpu_batch").start()
-
-                load_weight_timer.start(self.sync)
-                for k in range(self.num_gpu_batches):
-                    self.load_weight(i, j, k)
-                load_weight_timer.stop(self.sync)
-
-                for k in range(self.num_gpu_batches):
-                    load_cache_timer.start(self.sync)
-                    self.load_cache(i, j, k)
-                    load_cache_timer.stop(self.sync)
-                    self.load_hidden(i, j, k)
-                    compute_layer_timer.start(self.sync)
-                    self.compute_layer(i, j, k)
-                    compute_layer_timer.stop(self.sync)
+            # 计算层
+            for k in range(self.num_gpu_batches):
+                self.load_cache(i, j, k, overlap=False) # 在prefill时无操作
+                self.load_hidden(i, j, k)
+                self.compute_layer(i, j, k)
+                # 对于logits计算，我们不需要存储hidden或cache，
+                # 但在最后一层之后，hidden状态包含了logits
+                if j == self.num_layers - 1:
+                    # 在最后一层之后，不要将hidden移走，因为它包含了最终结果
+                    pass
+                else:
                     self.store_hidden(i, j, k)
-                    store_cache_timer.start(self.sync)
-                    self.store_cache(i, j, k)
-                    store_cache_timer.stop(self.sync)
+                
+                # store_cache 在 prefill 后填充KV缓存，对logits任务非必需，但保持流程完整
+                self.store_cache(i, j, k, overlap=False)
 
-                if i > 0:
-                    timers("decoding_gpu_batch").stop()
-                    pbar.update(1)
-                    batch_ct += 1
-                if batch_ct >= execute_num_batches: break
-            if batch_ct >= execute_num_batches: break
-            if i == 0: timers("prefill_total").stop(self.sync)
+        # 从最后一层的hidden状态中提取logits
+        return self._extract_logits_from_hidden()
 
-        # Convert "decoding_gpu_batch" timer to "generate" timer
-        batch_cost = np.mean(timers("decoding_gpu_batch").costs[10:])
-        for i in range(self.execute_gen_len):
-            if i == 0:
-                timers("generate").costs.append(timers("prefill_total").costs[0])
+    def _extract_logits_from_hidden(self):
+        """
+        从最后一层的隐藏状态中提取logits。
+        此函数作为“质检员”，确保只处理和返回符合预期的、
+        正确的三维浮点数张量。
+        """
+        # 1. 找到模型最后一层的位置（索引）
+        last_layer_idx = self.num_layers - 1
+        
+        # 2. 创建一个空列表，用来存放从每个GPU批次中提取出的logits
+        batch_logits = [] 
+        
+        # 3. 遍历模型处理的每一个GPU批次
+        for k in range(self.num_gpu_batches):
+            # 从内部存储区 self.hidden 中，获取属于当前批次(k)、最后一层(last_layer_idx)的计算结果。
+            # 这个结果是一个我们自己封装的 TorchTensor 对象。
+            hidden_tensor = self.hidden[0][last_layer_idx][k].val
+            
+            # 4. 检查并处理取出的结果
+            if hidden_tensor is not None:
+                # a. 从封装对象中取出真正的PyTorch张量(.data)，并把它从GPU内存复制到CPU内存(.cpu())。
+                # .detach() 是为了切断计算图，因为我们只关心数值本身。
+                logits_data = hidden_tensor.data.detach().cpu()
+                
+                # b. 【核心检查】在这里，我们做一个严格的“质量检查”，确保拿到的数据没问题。
+                #    - 检查张量是不是三维的。
+                #    - 检查数据类型是不是浮点数（float32或float16都可以）。
+                if logits_data.dim() == 3 and logits_data.dtype in [torch.float32, torch.float16]:
+                    # 如果检查通过，说明数据是正确的。我们把它转换成标准的32位浮点数以保证后续计算的稳定，然后加到列表中。
+                    batch_logits.append(logits_data.to(torch.float32))
+                else:
+                    # 如果检查失败，说明上游的计算流程肯定还有问题。
+                    # 我们立即抛出一个明确的错误，告诉开发者哪里出了问题，方便快速定位和修复。
+                    raise RuntimeError(f"程序错误：_extract_logits_from_hidden函数收到的张量类型或形状不正确。"
+                                    f"当前形状: {logits_data.shape}, 当前类型: {logits_data.dtype}")
             else:
-                timers("generate").costs.append(self.num_layers * batch_cost)
+                # 如果连结果都拿不到（是None），这也是一个严重的程序错误。
+                raise RuntimeError(f"程序错误：_extract_logits_from_hidden函数在处理批次 {k} 时收到了一个空值(None)。")
 
-        # Debug the costs of individual functions
-        print(f"#layers: {self.num_layers}")
+        # 5. 最后一步：整合所有批次的结果
+        if not batch_logits:
+            # 如果遍历完所有批次后，列表还是空的，说明一个logits都没提取出来，这也是个错误。
+            raise RuntimeError("程序错误：未能从任何GPU批次中提取出logits。")
 
-        print(f"#batches prefill:  "
-              f"{self.num_layers * self.num_gpu_batches}")
-        print(f"#batches decoding: "
-              f"{(self.task.gen_len - 1) * self.num_layers * self.num_gpu_batches}")
-        print(f"load_weight            (per-layer)"
-              f": {np.mean(timers('load_weight').costs):.6f} s")
-        for stage in ["prefill", "decoding"]:
-            for func in ["load_cache", "store_cache", "compute_layer"]:
-                name = func + "_" + stage
-                costs = timers(name).costs
-                print(f"{name:22s} (per-batch): {np.mean(costs):.6f} s")
+        # 使用 torch.cat 函数，将列表中来自所有GPU批次的logits张量，
+        # 沿“批次大小”这个维度拼接起来，形成一个完整的、最终的logits输出张量。
+        return torch.cat(batch_logits, dim=0) 
+
+        # 注意：logits_loop_overlap_single_batch 和 logits_loop_overlap_multi_batch
+        # 也可以被保留，但它们也需要确保在最后一层之后调用 _extract_logits_from_hidden。
+        # 为简单起见，上面的 get_logits 实现统一调用了最清晰的 logits_loop_normal。
+
+    def logits_loop_overlap_single_batch(self):
+        """
+        Single batch overlap logits computation loop.
+        Returns logits from the last layer for all positions.
+        """
+        # Prologue
+        for k in range(self.num_gpu_batches):
+            self.load_weight(0, 0, k)
+        self.sync()
+
+        # Prefill only (i=0) for logits computation
+        i = 0
+        self.update_attention_mask(i, 0)
+        for j in range(self.num_layers):
+            self.load_weight(i, j+1, 0)
+            self.load_cache(i, j+1, 0)
+            self.load_hidden(i, j, 0)
+            self.compute_layer(i, j, 0)
+            self.store_cache(i, j-1, 0)
+            self.store_hidden(i, j, 0)
+            self.sync()
+
+        # Extract logits from the last layer
+        return self._extract_logits_from_hidden()
+
+    def logits_loop_overlap_multi_batch(self):
+        """
+        Multi batch overlap logits computation loop.
+        Returns logits from the last layer for all positions.
+        """
+        # Prologue
+        for k in range(self.num_gpu_batches):
+            self.load_weight(0, 0, k)
+        self.load_hidden(0, 0, 0)
+        self.sync()
+
+        # Prefill only (i=0) for logits computation
+        i = 0
+        for k in range(self.num_gpu_batches):
+            self.update_attention_mask(i, k)
+        
+        for j in range(self.num_layers):
+            for k in range(self.num_gpu_batches):
+                self.load_weight(i, j+1, k)
+                self.load_cache(i, j, k+1)
+                self.store_hidden(i, j, k-1)
+                self.load_hidden(i, j, k+1)
+                self.compute_layer(i, j, k)
+                self.store_cache(i, j, k-1)
+                self.sync()
+
+        # Epilogue - store the final hidden state
+        self.store_hidden(0, self.num_layers-1, self.num_gpu_batches-1)
+
+        # Extract logits from the last layer
+        return self._extract_logits_from_hidden()
+
+    # def generation_loop_debug_normal(self):
+    #     execute_num_batches = 20
+    #     batch_ct = 0
+    #     pbar = tqdm(total=execute_num_batches)
+    #     timers("prefill_total").reset()
+    #     timers("decoding_gpu_batch").reset()
+
+    #     timers("load_weight").reset()
+    #     timers("load_cache_prefill").reset()
+    #     timers("load_cache_decoding").reset()
+    #     timers("store_cache_prefill").reset()
+    #     timers("store_cache_decoding").reset()
+    #     timers("compute_layer_prefill").reset()
+    #     timers("compute_layer_decoding").reset()
+    #     load_weight_timer = timers("load_weight")
+
+    #     for i in range(self.execute_gen_len):
+    #         if i == 0:
+    #             timers("prefill_total").start()
+    #             load_cache_timer = timers("load_cache_prefill")
+    #             store_cache_timer = timers("store_cache_prefill")
+    #             compute_layer_timer = timers("compute_layer_prefill")
+    #         else:
+    #             load_cache_timer = timers("load_cache_decoding")
+    #             store_cache_timer = timers("store_cache_decoding")
+    #             compute_layer_timer = timers("compute_layer_decoding")
+
+    #         for k in range(self.num_gpu_batches):
+    #             self.update_attention_mask(i, k)
+
+    #         for j in range(self.num_layers):
+    #             if i > 0: timers("decoding_gpu_batch").start()
+
+    #             load_weight_timer.start(self.sync)
+    #             for k in range(self.num_gpu_batches):
+    #                 self.load_weight(i, j, k)
+    #             load_weight_timer.stop(self.sync)
+
+    #             for k in range(self.num_gpu_batches):
+    #                 load_cache_timer.start(self.sync)
+    #                 self.load_cache(i, j, k)
+    #                 load_cache_timer.stop(self.sync)
+    #                 self.load_hidden(i, j, k)
+    #                 compute_layer_timer.start(self.sync)
+    #                 self.compute_layer(i, j, k)
+    #                 compute_layer_timer.stop(self.sync)
+    #                 self.store_hidden(i, j, k)
+    #                 store_cache_timer.start(self.sync)
+    #                 self.store_cache(i, j, k)
+    #                 store_cache_timer.stop(self.sync)
+
+    #             if i > 0:
+    #                 timers("decoding_gpu_batch").stop()
+    #                 pbar.update(1)
+    #                 batch_ct += 1
+    #             if batch_ct >= execute_num_batches: break
+    #         if batch_ct >= execute_num_batches: break
+    #         if i == 0: timers("prefill_total").stop(self.sync)
+
+    #     # Convert "decoding_gpu_batch" timer to "generate" timer
+    #     batch_cost = np.mean(timers("decoding_gpu_batch").costs[10:])
+    #     for i in range(self.execute_gen_len):
+    #         if i == 0:
+    #             timers("generate").costs.append(timers("prefill_total").costs[0])
+    #         else:
+    #             timers("generate").costs.append(self.num_layers * batch_cost)
+
+    #     # Debug the costs of individual functions
+    #     print(f"#layers: {self.num_layers}")
+
+    #     print(f"#batches prefill:  "
+    #           f"{self.num_layers * self.num_gpu_batches}")
+    #     print(f"#batches decoding: "
+    #           f"{(self.task.gen_len - 1) * self.num_layers * self.num_gpu_batches}")
+    #     print(f"load_weight            (per-layer)"
+    #           f": {np.mean(timers('load_weight').costs):.6f} s")
+    #     for stage in ["prefill", "decoding"]:
+    #         for func in ["load_cache", "store_cache", "compute_layer"]:
+    #             name = func + "_" + stage
+    #             costs = timers(name).costs
+    #             print(f"{name:22s} (per-batch): {np.mean(costs):.6f} s")
 
     def generation_loop_overlap_single_batch(self):
         # Prologue
@@ -1058,92 +1281,92 @@ class OptLM:
         self.store_hidden(
             self.execute_gen_len-1, self.num_layers-1, self.num_gpu_batches-1)
 
-    def generation_loop_debug_single_batch(self):
-        execute_num_batches = 20
-        batch_ct = 0
-        pbar = tqdm(total=execute_num_batches)
-        timers("prefill").reset()
-        timers("decoding_gpu_batch").reset()
+    # def generation_loop_debug_single_batch(self):
+    #     execute_num_batches = 20
+    #     batch_ct = 0
+    #     pbar = tqdm(total=execute_num_batches)
+    #     timers("prefill").reset()
+    #     timers("decoding_gpu_batch").reset()
 
-        # Prologue
-        for k in range(self.num_gpu_batches):
-            self.load_weight(0, 0, k)
-        self.sync()
+    #     # Prologue
+    #     for k in range(self.num_gpu_batches):
+    #         self.load_weight(0, 0, k)
+    #     self.sync()
 
-        # Generate
-        for i in range(self.execute_gen_len):
-            if i == 0: timers("prefill").start()
-            self.update_attention_mask(i, 0)
-            for j in range(self.num_layers):
-                if i > 0: timers("decoding_gpu_batch").start()
-                self.load_weight(i, j+1, 0)
-                self.load_cache(i, j+1, 0)
-                self.load_hidden(i, j, 0)
-                self.compute_layer(i, j, 0)
-                self.store_cache(i, j-1, 0)
-                self.store_hidden(i, j, 0)
-                self.sync()
+    #     # Generate
+    #     for i in range(self.execute_gen_len):
+    #         if i == 0: timers("prefill").start()
+    #         self.update_attention_mask(i, 0)
+    #         for j in range(self.num_layers):
+    #             if i > 0: timers("decoding_gpu_batch").start()
+    #             self.load_weight(i, j+1, 0)
+    #             self.load_cache(i, j+1, 0)
+    #             self.load_hidden(i, j, 0)
+    #             self.compute_layer(i, j, 0)
+    #             self.store_cache(i, j-1, 0)
+    #             self.store_hidden(i, j, 0)
+    #             self.sync()
 
-                if i > 0:
-                    timers("decoding_gpu_batch").stop()
-                    pbar.update(1)
-                    batch_ct += 1
-                if batch_ct >= execute_num_batches: break
-            if batch_ct >= execute_num_batches: break
-            if i == 0: timers("prefill").stop()
+    #             if i > 0:
+    #                 timers("decoding_gpu_batch").stop()
+    #                 pbar.update(1)
+    #                 batch_ct += 1
+    #             if batch_ct >= execute_num_batches: break
+    #         if batch_ct >= execute_num_batches: break
+    #         if i == 0: timers("prefill").stop()
 
-        # Convert "decoding_gpu_batch" timer to "generate" timer
-        batch_cost = np.mean(timers("decoding_gpu_batch").costs[10:])
-        for i in range(self.execute_gen_len):
-            if i == 0:
-                timers("generate").costs.append(timers("prefill").costs[0])
-            else:
-                timers("generate").costs.append(self.num_layers * batch_cost)
+    #     # Convert "decoding_gpu_batch" timer to "generate" timer
+    #     batch_cost = np.mean(timers("decoding_gpu_batch").costs[10:])
+    #     for i in range(self.execute_gen_len):
+    #         if i == 0:
+    #             timers("generate").costs.append(timers("prefill").costs[0])
+    #         else:
+    #             timers("generate").costs.append(self.num_layers * batch_cost)
 
-    def generation_loop_debug_multi_batch(self):
-        execute_num_batches = 20
-        batch_ct = 0
-        pbar = tqdm(total=execute_num_batches)
-        timers("prefill").reset()
-        timers("decoding_gpu_batch").reset()
+    # def generation_loop_debug_multi_batch(self):
+    #     execute_num_batches = 20
+    #     batch_ct = 0
+    #     pbar = tqdm(total=execute_num_batches)
+    #     timers("prefill").reset()
+    #     timers("decoding_gpu_batch").reset()
 
-        # Prologue
-        for k in range(self.num_gpu_batches):
-            self.load_weight(0, 0, k)
-        self.load_hidden(0, 0, 0)
-        self.sync()
+    #     # Prologue
+    #     for k in range(self.num_gpu_batches):
+    #         self.load_weight(0, 0, k)
+    #     self.load_hidden(0, 0, 0)
+    #     self.sync()
 
-        # Generate
-        for i in range(self.execute_gen_len):
-            if i == 0: timers("prefill").start()
-            for k in range(self.num_gpu_batches):
-                self.update_attention_mask(i, k)
-            for j in range(self.num_layers):
-                if i > 0: timers("decoding_gpu_batch").start()
-                for k in range(self.num_gpu_batches):
-                    self.load_weight(i, j+1, k)
-                    self.load_cache(i, j, k+1)
-                    self.store_hidden(i, j, k-1)
-                    self.load_hidden(i, j, k+1)
-                    self.compute_layer(i, j, k)
-                    self.store_cache(i, j, k-1)
-                    self.sync()
+    #     # Generate
+    #     for i in range(self.execute_gen_len):
+    #         if i == 0: timers("prefill").start()
+    #         for k in range(self.num_gpu_batches):
+    #             self.update_attention_mask(i, k)
+    #         for j in range(self.num_layers):
+    #             if i > 0: timers("decoding_gpu_batch").start()
+    #             for k in range(self.num_gpu_batches):
+    #                 self.load_weight(i, j+1, k)
+    #                 self.load_cache(i, j, k+1)
+    #                 self.store_hidden(i, j, k-1)
+    #                 self.load_hidden(i, j, k+1)
+    #                 self.compute_layer(i, j, k)
+    #                 self.store_cache(i, j, k-1)
+    #                 self.sync()
 
-                if i > 0:
-                    timers("decoding_gpu_batch").stop()
-                    pbar.update(1)
-                    batch_ct += 1
-                if batch_ct >= execute_num_batches: break
-            if batch_ct >= execute_num_batches: break
-            if i == 0: timers("prefill").stop()
+    #             if i > 0:
+    #                 timers("decoding_gpu_batch").stop()
+    #                 pbar.update(1)
+    #                 batch_ct += 1
+    #             if batch_ct >= execute_num_batches: break
+    #         if batch_ct >= execute_num_batches: break
+    #         if i == 0: timers("prefill").stop()
 
-        # Convert "decoding_gpu_batch" timer to "generate" timer
-        batch_cost = np.mean(timers("decoding_gpu_batch").costs[10:])
-        for i in range(self.execute_gen_len):
-            if i == 0:
-                timers("generate").costs.append(timers("prefill").costs[0])
-            else:
-                timers("generate").costs.append(self.num_layers * batch_cost)
+    #     # Convert "decoding_gpu_batch" timer to "generate" timer
+    #     batch_cost = np.mean(timers("decoding_gpu_batch").costs[10:])
+    #     for i in range(self.execute_gen_len):
+    #         if i == 0:
+    #             timers("generate").costs.append(timers("prefill").costs[0])
+    #         else:
+    #             timers("generate").costs.append(self.num_layers * batch_cost)
 
     def __del__(self):
         self.delete_all_weights()

@@ -274,14 +274,18 @@ class TorchDevice:
         if donate[0]: inputs.delete()
 
         # output embedding
-        logits = F.linear(hidden, w_token.data)
+        logits = F.linear(hidden, w_token.data) # this is the logits for all tokens
+        if not do_sample:
+            return TorchTensor.create_from_torch(logits.to(torch.float32), self)
+        
         last_token_logits = logits[:,-1,:]
 
-        if do_sample and not temperature < 1e-5:
+        if not temperature < 1e-5:
             probs = torch.softmax(last_token_logits / temperature, dim=-1)
             ids = torch.multinomial(probs, num_samples=1)
         else:
             ids = last_token_logits.argmax(dim=1, keepdim=True)
+        # we need to return complete logits for the last token
         return TorchTensor.create_from_torch(ids, self)
 
     def init_cache_one_gpu_batch(self, config, task, policy):
