@@ -29,6 +29,7 @@ flexllmgen/apps/data_wrangle/core
 # log files
 *.tsv
 *.log
+*.jsonl
 *.raw
 
 # tmp scripts
