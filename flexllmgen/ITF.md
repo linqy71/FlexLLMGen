@@ -41,4 +41,5 @@
 ## 磁盘存储
 
 Chunk内包含了两个TorchTensor存储KV缓存。形状为shape = (chunk_size, batch * n_heads, head_dim)。表示能存储chunk_size个token在一层的KV缓存
-数据通过chunk_id,offset获取。通过ChunkPool和chunk_id定位Chunk。通过offset定位该token缓存的位置。然后通过原先的general_copy获取。
+
+数据通过chunk_id,offset获取。通过ChunkPool和chunk_id定位Chunk。通过offset定位该token缓存的位置。然后通过已有的general_copy获取。
