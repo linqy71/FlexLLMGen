@@ -1,3 +1,4 @@
+import dataclasses
 from typing import List,Dict
 import unittest
 from itertools import count
@@ -9,19 +10,20 @@ RadixTree接口:
 def insert(self,key:List[int]) 插入token序列,后续还可能要插入kv_ptr和重要性(注意一个性质,NR整体在最后一个新生成节点)
 def search(self,key:List[int])->List[RadixToken] 查找最长公共前缀,返回数据类型为RadixToken。
 """
+@dataclasses.dataclass
 class CachePointer:
-    def __init__(self, chunk_id:int = None, token_name:int = None):
-        self.chunk_id = chunk_id
-        self.token_name = token_name
+    # 通过chunk_id定位chunk，通过offset定位在chunk内的位置
+    # chunk中的kv缓存为一个TorchTensor,存了chunk_size个token的KV缓存, shape为(chunk_size, b * n_head, head_dim)
+    # offset表明该token的KV张量为 (offset:offset+1, 0:b * n_head, 0:head_dim)
+    chunk_id: int
+    offset: int
 
 class RadixToken:
-    # 节点内token的唯一标识
     token_count = count()
-    def __init__(self, token_id:int, token_name = None, importance:int = 0):
+    def __init__(self, token_id:int, token_name = None, importance:int = 0, kv_ptr:List[CachePointer] = None):
         self.token_id = token_id
         
-        self.k_ptr = None # 该token所有层的chunk_id
-        self.v_ptr = None # 该token所有层的chunk_id
+        self.kv_ptr = kv_ptr  # 为该token所有层的chunk_id. kv_ptr[i]表示第i层的缓存的CachePointer
         
         self.importance = importance
 
@@ -30,14 +32,14 @@ class RadixToken:
     def __repr__(self):
         return f"(id={self.token_id},imp={self.importance})"
 
-    
     @classmethod
     def next_token_name(cls):
         return next(cls.token_count)
 
 class RadixTreeNode:
-    def __init__(self,tokens:List[RadixToken],mapping_list=None):
-        #tokens始终保留原来的顺序,重排只需要修改mapping_list,要获取重排后的顺序使用mapping_list
+    def __init__(self,tokens:List[RadixToken], mapping_list=None):
+        # tokens始终保留原来的顺序,重排只需要修改mapping_list,要获取重排后的顺序使用mapping_list
+        # 即 tokens[mapping_list[i]] 表示按照重要性排序后的, 第i个token
         self.tokens = tokens
         if mapping_list is not None:
             self.mapping_list = mapping_list
@@ -46,9 +48,6 @@ class RadixTreeNode:
         
         self.children:Dict[int,RadixTreeNode] = {} 
     
-    def is_leaf(self)->bool:
-        return len(self.children) == 0
-
     def __repr__(self):
         return f"Node(token={self.tokens}, mapping_list={self.mapping_list})"
     
@@ -59,8 +58,11 @@ class RadixTreeNode:
         return [self.tokens[i] for i in self.mapping_list]
     
     @classmethod
-    def create_from_int(cls,tokens:List[int]):
-        tokens = [RadixToken(token_id=x) for x in tokens]
+    def create_from_token_id(cls,tokens:List[int], kv_ptr=None):
+        if kv_ptr is None:
+            tokens = [RadixToken(token_id=x) for x in tokens]
+        else:
+            tokens = [RadixToken(token_id=tokens[i], kv_ptr=kv_ptr[i]) for i in range(len(tokens))]
         return cls(tokens)
 
 
@@ -70,15 +72,18 @@ class RadixTree:
         # root is an empty node
         self.root = RadixTreeNode(tokens=[])
     
+    # 计算两个序列的最长公共前缀长度
     @staticmethod
-    def common_prefix_length(a:List,b:List[RadixToken]):
+    def common_prefix_length(a:List, b:List[RadixToken]):
         min_len = min(len(a),len(b))
         for i in range (min_len):
             if a[i] != b[i].token_id:
                 return i;
         return min_len
     
-    def insert(self,key:List[int]):
+    # 插入新的序列,同时插入新节点的kv_ptr
+    # kv_ptr:List[List[CachePointer]]  kv_ptr[i]表示NR中第i个token在每一层的缓存的位置
+    def insert(self, key:List[int], kv_ptr = None):
         if len(key) == 0:
             return
         current = self.root
@@ -107,12 +112,12 @@ class RadixTree:
                     remaining = remaining[common_len:]
                     current = new_node
             else:
-                new_node = RadixTreeNode.create_from_int(remaining)
+                new_node = RadixTreeNode.create_from_token_id(remaining, kv_ptr)
                 current.children[next_token] = new_node
                 break
 
-    
-    def search(self,key:List[int]):
+    # 查询最长公共前缀，返回最长公共前缀的kv_ptr
+    def search(self, key:List[int]):
         current = self.root
         remaining = key
         ans = list()
@@ -122,7 +127,7 @@ class RadixTree:
                 child = current.children[next_token]
                 common_len = self.common_prefix_length(remaining,child.tokens)
                 ans.extend(
-                    [t for t in child.tokens[:common_len]]
+                    [t.kv_ptr for t in child.tokens[:common_len]]
                 )
                 if common_len != len(child.tokens):
                     break
@@ -130,10 +135,10 @@ class RadixTree:
                 current = child
             else:
                 break
-        # type = List[RadixToken]
+        # type = List[List[CachePointer]]
         return ans
 
-    def delete(self,key:List):
+    def delete(self, key:List):
         pass
 
     def visualize(self, node=None, depth=0):
@@ -160,7 +165,19 @@ if __name__ == "__main__":
         [1,5,7,4,2,7],
         [1,5,5,3,7],
     ]
-    for key in keys:
-        tree.insert(key)
+    kv_ptrs=[
+        [CachePointer(1,2),CachePointer(1,2),CachePointer(1,2),CachePointer(1,2),CachePointer(1,2),CachePointer(1,2)],
+        [CachePointer(1,2),CachePointer(1,2),CachePointer(1,2),CachePointer(1,2),CachePointer(1,2)],
+    ]
+    for i in range(len(keys)):
+        key = keys[i]
+        kv_ptr = kv_ptrs[i]
+        tree.insert(key,kv_ptr)
         tree.root.children[1].sort_by_importance()
     tree.visualize()
+
+    prefix_kv_ptr = []
+    inputs=[[1,5,5],[1,5,7,2]]
+    for seq in inputs:
+        prefix_kv_ptr.append(tree.search(seq))
+    print(prefix_kv_ptr)
