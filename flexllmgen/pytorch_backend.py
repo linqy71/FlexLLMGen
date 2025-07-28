@@ -361,13 +361,15 @@ class TorchDevice:
         # (s, b * n_head, head_dim)
         k = k.permute(2, 0, 1)
         v = v.permute(1, 0, 2)
-
+        
         if compress_cache:
             k = self.compressed_device.compress(k, comp_config)
             v = self.compressed_device.compress(v, comp_config)
         else:
             k = TorchTensor.create_from_torch(k, self)
             v = TorchTensor.create_from_torch(v, self)
+
+        logger.info(f"mha:k.data = {k.data[:,:3,:10]}")
 
         return TorchTensor.create_from_torch(value, self), k, v
     
@@ -388,7 +390,12 @@ class TorchDevice:
 
             注意力掩码部分没理清,是乱写的0.0
         '''
-        
+        if compress_cache:
+            # shape: (common_prefix_len, b * n_probe_head, head_dim)
+            k = k_cache.device.decompress(k_cache)
+        else:
+            # shape: (common_prefix_len, b * n_probe_head, head_dim)
+            k = k_cache.data
 
         n_probe_head = 3
         b, s, h = inputs.shape
@@ -400,8 +407,13 @@ class TorchDevice:
         
         hidden = F.layer_norm(inputs.data, (h,), weight=w_ln.data, bias=b_ln.data)
 
-        w_q_probe = w_q.data.view(h, n_head, head_dim)[:, :n_probe_head, :].reshape(h, n_probe_head * head_dim)
-        b_q_probe = b_q.data.view(n_head, head_dim)[:n_probe_head, :].reshape(n_probe_head * head_dim)
+        # w_q_probe = w_q.data.view(h, n_head, head_dim)[:, :n_probe_head, :].reshape(h, n_probe_head * head_dim)
+        # b_q_probe = b_q.data.view(n_head, head_dim)[:n_probe_head, :].reshape(n_probe_head * head_dim)
+
+        w_q_probe = w_q.data[:n_probe_head * head_dim,:]
+        b_q_probe = b_q.data[:n_probe_head * head_dim]
+        
+        logger.info(f"IMP_Token: w_q_probe's shape={w_q_probe.data.shape},b_q_probe's shape={b_q_probe.shape},hidden's shape={b_q.data.shape}")
 
         # shape: (b * n_probe_head, s, head_dim)
         q = F.linear(hidden, w_q_probe, bias=b_q_probe) * scaling
@@ -418,6 +430,7 @@ class TorchDevice:
         attn_weights = torch.bmm(q, k)
         
         mask = attention_mask.data[:, :common_prefix_len].view(b, 1, 1, common_prefix_len)
+        #logger.info(f"IMP_Token mask={mask}")
         # expand to (b, n_probe_head, s, common_prefix_len)
         mask = mask.expand(b, n_probe_head, s, common_prefix_len)
         # reshape to match attn_weights: (b * n_probe_head, s, common_prefix_len)
@@ -430,14 +443,18 @@ class TorchDevice:
         _, topk_idx = torch.topk(attn_sum, k=n_important, dim=1)
         topk_idx = topk_idx.view(b, n_probe_head, n_important)
 
-        S_imp = [[]]
+        S_imp = [[] for _ in range(b)]
         for i in range(b):
             for j in range(n_probe_head):
                 idx_set = { int(x) for x in topk_idx[i,j]}
-            S_imp[i].append(idx_set)
+                S_imp[i].append(idx_set)
+
+        logger.info(f"IMP_Token Set:{S_imp}")
+
+        thresold = ((n_important/common_prefix_len) / (2 - n_important/common_prefix_len)) ** 0.6
         
-        thresold = (n_important/n_head) / (2 - n_important/n_head) ** 0.6
-        
+        logger.info(f"IMP_Token: thresold={thresold}")
+
         imp_token_idx = []
         for i in range(b):
             jaccard = 0
@@ -447,7 +464,7 @@ class TorchDevice:
             comb = (n_probe_head * (n_probe_head - 1)) / 2
             jaccard /= comb
             if jaccard >= thresold:
-                imp_token_idx.append(list(S_imp[0]))
+                imp_token_idx.append(sorted(S_imp[0][0]))
             else:
                 imp_token_idx.append(list(range(common_prefix_len))) #表示加载全部kv
 
@@ -525,19 +542,21 @@ class TorchDevice:
         attn_weights = torch.bmm(q, k)
 
         L = n_imp + suffix_len
-        prefix_mask = torch.ones(b, n_imp, dtype=torch.bool, device=attention_mask.device) 
-        suffix_mask = attention_mask.data[:, common_prefix_len:]
-        pad_mask = torch.cat([prefix_mask, suffix_mask], dim=1)
-        pad_mask = pad_mask.view(b, 1, 1, L)   
+        # prefix_mask = torch.ones(b, n_imp, dtype=torch.bool, device=attention_mask.device) 
+        # suffix_mask = attention_mask.data[:, common_prefix_len:]
+        # pad_mask = torch.cat([prefix_mask, suffix_mask], dim=1)
+        # pad_mask = pad_mask.view(b, 1, 1, L)   
 
         idx = torch.arange(s, device=self.dev)
         causal_mask = (idx <= idx.view(s, 1))
         
         token_idxs = imp_token_idx  +  list(range(common_prefix_len, s))
-        causal_mask = causal_mask[token_idxs, :]
+        causal_mask = causal_mask[:, token_idxs]
+        #logger.info(f"mha_prefil:token_idxs = {token_idxs}, causal_mask={causal_mask}")
         causal_mask = causal_mask.view(1, 1, s, L) 
-
-        mask = pad_mask & causal_mask
+        #logger.info(f"mha_prefill: causal_mask.shape = {causal_mask.shape}")
+        #mask = pad_mask & causal_mask
+        mask = causal_mask
 
         attn_weights = attn_weights.view(b, n_head, s, L)
         attn_weights = torch.where(mask, attn_weights, -1e4)
@@ -565,6 +584,8 @@ class TorchDevice:
             k = TorchTensor.create_from_torch(k, self)
             v = TorchTensor.create_from_torch(v, self)
 
+        #logger.info(f"mha_prefill:k.data = {k.data[:,:3,:10]}")
+
         return TorchTensor.create_from_torch(value, self), k, v
         
 
@@ -589,6 +610,7 @@ class TorchDevice:
         b, tgt_s, h = inputs.shape
         # src_s = attention_mask.shape[1]
         src_s = pos
+        logger.info(f"mha_gen: src_s = {src_s}, mask.shape={attention_mask.shape[1]}")
         head_dim = h // n_head
         scaling = head_dim ** -0.5
 
@@ -629,6 +651,7 @@ class TorchDevice:
                 v = v.permute(1, 0, 2).reshape(b * n_head, src_s, head_dim)
 
                 if k.is_cuda:
+                    #logger.info(f"mha_gen: k.dtype{k.dtype}, v.dtype{v.dtype}, q.dtype{q.dtype}")
                     value = self._attention_value(q, k, v, attention_mask.data,
                         b, src_s, tgt_s, n_head, head_dim)
                 else:
