@@ -185,8 +185,8 @@ class Chunk:
         self.chunk_id = chunk_id or Chunk.next_chunk_name()
         # shape = (1, batch*n_probe_head, head_dim)
         # shape = (chunk_size, batch * n_heads, head_dim)
-        self.full_head_k = device.allocate(shape=full_head_shape, dtype=np.float32, pin_memory=True)
-        self.full_head_v = device.allocate(shape=full_head_shape, dtype=np.float32, pin_memory=True)
+        self.full_head_k = device.allocate(shape=full_head_shape, dtype=np.float16, pin_memory=True)
+        self.full_head_v = device.allocate(shape=full_head_shape, dtype=np.float16, pin_memory=True)
     
     @classmethod
     def next_chunk_name(cls):
