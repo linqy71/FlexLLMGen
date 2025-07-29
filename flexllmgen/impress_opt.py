@@ -184,7 +184,7 @@ class InputEmbed:
             dst = self.weight_load_dst
             weight_read_buf.store((w_token.smart_copy(dst), w_pos.smart_copy(dst)))
 
-    def init_cache_one_gpu_batch(self, cache_home):
+    def init_cache_one_gpu_batch(self, cache_home, max_prompt_len, max_gen_len):
         pass  # do nothing
 
     def load_cache(self, cache_home, cache_read_buf, i, j):
@@ -255,7 +255,7 @@ class OutputEmbed:
             weight_read_buf.store((w_ln.smart_copy(dst2), b_ln.smart_copy(dst2),
                 w_token.smart_copy(dst1)))
 
-    def init_cache_one_gpu_batch(self, cache_home):
+    def init_cache_one_gpu_batch(self, cache_home, max_prompt_len, max_gen_len):
         pass  # do nothing
 
     def load_cache(self, cache_home, cache_read_buf, i, j):
@@ -297,7 +297,7 @@ class SelfAttention:
 
         self.task = None
 
-        self.prefix_cache_shape = 0 #prefill阶段的cache第一维长度，可能是n_imp + NR(jaccard超过threshold)  可能是R+NR(没有超过threshold)
+        self.prefill_cache_shape = 0 #prefill阶段的cache第一维长度，可能是n_imp + NR(jaccard超过threshold)  可能是R+NR(没有超过threshold)
 
     def set_task(self, task):
         self.task = task
@@ -345,7 +345,7 @@ class SelfAttention:
                 w_out.smart_copy(dst1), b_out.smart_copy(dst2),
                 w_ln.smart_copy(dst2), b_ln.smart_copy(dst2)))
 
-    def init_cache_one_gpu_batch(self, cache_home):
+    def init_cache_one_gpu_batch(self, cache_home, max_prompt_len, max_gen_len):
         if self.policy.cache_gpu_percent == 100:
             device = self.env.gpu
         elif self.policy.cache_cpu_percent == 100:
@@ -359,7 +359,7 @@ class SelfAttention:
             assert device.device_type != DeviceType.MIXED
             device = device.compressed_device
 
-        cache = device.init_cache_one_gpu_batch(self.config, self.task, self.policy)
+        cache = device.init_cache_one_gpu_batch(self.config, self.task, self.policy, max_prompt_len, max_gen_len)
         cache_home.store(cache)
 
     def load_probe_cache(self, cache_read_buf, i, j):
@@ -373,14 +373,14 @@ class SelfAttention:
         batch_size = self.policy.gpu_batch_size
         head_dim = self.config.input_dim // n_head
         
-        probe_cache_shape = (self.task.common_prefix_len[0], batch_size * n_probe_head, head_dim)
+        probe_cache_shape = (self.task.common_prefix_len, batch_size * n_probe_head, head_dim)
 
         pin_memory = True if dst.device_type == DeviceType.CPU else False
         k_cache = dst.allocate(probe_cache_shape, np.float16, pin_memory=pin_memory)
 
         # 第0个batch的第j个token的第i层的kv_ptr
-        for t_idx in range(self.task.common_prefix_len[0]):
-            kv_ptr = self.task.common_prefix_kv_ptr[0][t_idx][j]
+        for t_idx in range(self.task.common_prefix_len):
+            kv_ptr = self.task.common_prefix_kv_ptr[t_idx][j]
             chunk_id, offset = kv_ptr.chunk_id, kv_ptr.offset
             logger.info(f"In load_probe_cahe token:{t_idx} layer:{j}: kv_ptr = {kv_ptr}")
             self.chunk_pool.get_probe_cache(k_cache, t_idx, chunk_id, offset)
@@ -392,27 +392,26 @@ class SelfAttention:
         batch_size = self.policy.gpu_batch_size
         head_dim = self.config.input_dim // n_head
 
-        n_important = [len(idx) for idx in imp_token_idx] # 如果超过threshold长度就是重要token个数，如果没超过就是common_prefix_len
+        n_important = len(imp_token_idx) # 如果超过threshold长度就是重要token个数，如果没超过就是common_prefix_len
         dst = self.attention_compute
-        shape = (n_important[0], batch_size * n_head, head_dim)
+        shape = (n_important, batch_size * n_head, head_dim)
 
         pin_memory = True if dst.device_type == DeviceType.CPU else False
         
         k_cache = dst.allocate(shape, np.float16, pin_memory=pin_memory)
         v_cache = dst.allocate(shape, np.float16, pin_memory=pin_memory)
 
-        for b in range(batch_size):
-            for j in range(n_important[b]):
-                kv_ptr = self.task.common_prefix_kv_ptr[b][imp_token_idx[b][j]][layer]
-                chunk_id, offset = kv_ptr.chunk_id, kv_ptr.offset
-                logger.info(f"Get prefix kv: chunk_id={chunk_id}, offset={offset}")
-                self.chunk_pool.get_full_head_cache(k_cache, v_cache, j, chunk_id, offset)
+        for j in range(n_important):
+            kv_ptr = self.task.common_prefix_kv_ptr[imp_token_idx[j]][layer]
+            chunk_id, offset = kv_ptr.chunk_id, kv_ptr.offset
+            logger.info(f"Get prefix kv: chunk_id={chunk_id}, offset={offset}")
+            self.chunk_pool.get_full_head_cache(k_cache, v_cache, j, chunk_id, offset)
 
         return k_cache, v_cache
 
     def load_cache(self, cache_home, cache_read_buf, i, j):
         if i == 0:  # prefill, no cache
-            if self.task.common_prefix_len[0] > 0:
+            if self.task.common_prefix_len > 0:
                 self.load_probe_cache(cache_read_buf, i, j)
             return
 
@@ -494,7 +493,7 @@ class SelfAttention:
         else:  # decoding
             # 在原先cache的基础上拼接
             # pos = self.task.prompt_len + i
-            pos = self.prefix_cache_shape + i
+            pos = self.prefill_cache_shape + i
             indices = (slice(pos - k_new.shape[0], pos),
                        slice(0, k_new.shape[1]))
 
@@ -523,42 +522,45 @@ class SelfAttention:
 
         if i == 0:  # prefill
             mask, donate[1] = attention_mask.val.smart_copy(self.compute)
-            if self.task.common_prefix_len[0] > 0:
+            if self.task.common_prefix_len > 0:
                 (k_cache, donate[12]) = cache_read_buf.pop()
 
                 imp_token_idx = self.compute.get_important_token_idx(h, mask, w_q, b_q, 
                     w_ln, b_ln, n_head, k_cache, donate, self.policy.compress_cache, 
                     self.policy.comp_cache_config, self.policy.important_ratio)
                 
+                imp_token_idx = imp_token_idx[0] # 解开batch维度
+
                 logger.info(f"Get Important token indices: {imp_token_idx}")
 
                 k_cache, v_cache = self.get_prefix_kv(imp_token_idx, j)
 
-                logger.info(f"Prefix KV cache shape: {k_cache}, {v_cache}, common_prefix_len: {self.task.common_prefix_len[0]}")
+                logger.info(f"Prefix KV cache shape: {k_cache}, {v_cache}, common_prefix_len: {self.task.common_prefix_len}")
                 logger.info(f"Prefix KV cache: {k_cache.data[:,:3,:10]}")
+
                 h, new_k_cache, new_v_cache = self.compute.mha_prefill(h, mask, w_q, b_q,
                     w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln, n_head, k_cache, v_cache, donate,
-                    self.policy.compress_cache, self.policy.comp_cache_config, self.task.common_prefix_len[0], imp_token_idx[0])
+                    self.policy.compress_cache, self.policy.comp_cache_config, self.task.common_prefix_len, imp_token_idx)
                 
-                self.prefix_cache_shape = new_k_cache.shape[0]
-                logger.info(f"SelfAttention Prefix cache shape: {self.prefix_cache_shape}")
+                self.prefill_cache_shape = new_k_cache.shape[0]
+                logger.info(f"SelfAttention Prefix cache shape: {self.prefill_cache_shape}")
             else:
                 h, new_k_cache, new_v_cache = self.compute.mha(h, mask, w_q, b_q,
                     w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln, n_head, donate,
                     self.policy.compress_cache, self.policy.comp_cache_config)
                 
-                self.prefix_cache_shape = self.task.prompt_len
-                logger.info(f"SelfAttention Prefix cache shape: {self.prefix_cache_shape}")
+                self.prefill_cache_shape = self.task.prompt_len
+                logger.info(f"SelfAttention Prefix cache shape: {self.prefill_cache_shape}")
             # 存入的cache shape可能是(s, b * n_head, head_dim) 也可能是 (n_imp + s - common_prefix_len[0], ..., ...)
             cache_write_buf.store((new_k_cache, new_v_cache))
         else:  # decoding
             mask, donate[1] = attention_mask.val.smart_copy(self.attention_compute)
             (k_cache, donate[12]), (v_cache, donate[13]) = cache_read_buf.pop()
-            logger.info(f"SelfAttention decoding prefix_cache_shape:{self.prefix_cache_shape}, i:{i}")
+            logger.info(f"SelfAttention decoding prefill_cache_shape:{self.prefill_cache_shape}, i:{i}")
             h, new_k_cache, new_v_cache = self.compute.mha_gen(h, mask, w_q,
                 b_q, w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln, n_head,
                 k_cache, v_cache, donate, self.policy.attn_sparsity,
-                self.policy.compress_cache, self.policy.comp_cache_config,pos=self.prefix_cache_shape + i)
+                self.policy.compress_cache, self.policy.comp_cache_config,pos=self.prefill_cache_shape + i)
             cache_write_buf.store((new_k_cache, new_v_cache))
 
         hidden.val = h
@@ -612,7 +614,7 @@ class MLP:
                 wo.smart_copy(dst1), bo.smart_copy(dst2),
                 w_ln.smart_copy(dst2), b_ln.smart_copy(dst2)))
 
-    def init_cache_one_gpu_batch(self, cache_home):
+    def init_cache_one_gpu_batch(self, cache_home, max_prompt_len, max_gen_len):
         pass  # do nothing
 
     def load_cache(self, cache_home, cache_read_buf, i, j):
@@ -670,8 +672,8 @@ class TransformerLayer:
         if k == 0:
             weight_read_buf.store((read_buf1, read_buf2))
 
-    def init_cache_one_gpu_batch(self, cache_home):
-        self.attention.init_cache_one_gpu_batch(cache_home)
+    def init_cache_one_gpu_batch(self, cache_home, max_prompt_len, max_gen_len):
+        self.attention.init_cache_one_gpu_batch(cache_home, max_prompt_len, max_gen_len)
 
     def load_cache(self, cache_home, cache_read_buf, i, j):
         self.attention.load_cache(cache_home, cache_read_buf, i, j)
@@ -690,13 +692,14 @@ class TransformerLayer:
                                cache_write_buf, i, k, j)
         self.mlp.forward(hidden, None, read_buf2, attention_mask, None, i, k, j)
 
-
 class OptLM:
     def __init__(self,
                  config: Union[str, OptConfig],
                  env: ExecutionEnv,
                  path: str,
-                 policy: Policy):
+                 policy: Policy,
+                 max_prompt_len: int,
+                 max_gen_len: int):
         if isinstance(config, str):
             config = get_opt_config(config)
         self.config = config
@@ -704,6 +707,8 @@ class OptLM:
         self.path = path
         self.policy = policy
         self.num_gpu_batches = policy.num_gpu_batches
+        self.max_prompt_len = max_prompt_len
+        self.max_gen_len = max_gen_len
 
         layers = []
         layers.append(InputEmbed(self.config, self.env, self.policy))
@@ -725,7 +730,7 @@ class OptLM:
             self.act_home = self.env.disk
         else:
             raise NotImplementedError()
-
+        
         # CUDA streams
         self.load_weight_stream = torch.cuda.Stream()
         self.load_cache_stream = torch.cuda.Stream()
@@ -750,7 +755,18 @@ class OptLM:
 
         self.radix_tree = RadixTree() 
         self.chunk_pool = ChunkPool(self.env, self.config, self.policy.chunk_size) # Initialize chunk pool
-    
+
+        self.set_chunk_pool()
+        for j in range(num_layers):
+            for k in range(num_gpu_batches):
+                self.cache_home[j][k].clear()
+                self.cache_read_buf[j][k].clear()
+                self.cache_write_buf[j][k].clear()
+                self.init_cache(j, k, max_gen_len, max_prompt_len)
+        if self.policy.cpu_cache_compute:
+            self.env.cpu.init_attention_compute_workspace(self.config, self.task, self.policy, max_gen_len, max_prompt_len)
+
+
     def set_task(self, task):
         self.task = task
         for l in self.layers:
@@ -793,8 +809,9 @@ class OptLM:
                 else:
                     x.delete()
 
-    def init_cache(self, j, k):
-        self.layers[j].init_cache_one_gpu_batch(self.cache_home[j][k])
+    def init_cache(self, j, k, max_gen_len, max_prompt_len):
+        self.layers[j].init_cache_one_gpu_batch(self.cache_home[j][k], max_gen_len, max_prompt_len)
+
 
     def load_cache(self, i, j, k, overlap=True):
         # Handle corner cases
@@ -941,22 +958,17 @@ class OptLM:
         val.load_from_np((input_ids != self.config.pad_token_id))
         self.attention_mask[k].store(val)
 
-    def generate_with_prefix(self, inputs: Union[np.array, List[List[int]]]):
-        prefix_kv_ptr = []
-        prefix_len = []
-        for seq in inputs:
-            prefix_kv_ptr.append(self.radix_tree.search(seq))
-            prefix_len.append(len(prefix_kv_ptr[-1]))
-        # return type: List[List[CachePointer]]  shape:(b, num_layers)
-        return prefix_kv_ptr, prefix_len
+    def generate_with_prefix(self, inputs: Union[np.array, List[int]]):
+        prefix_kv_ptr = self.radix_tree.search(inputs)
+        return prefix_kv_ptr, len(prefix_kv_ptr)
     
     def store_prefix_cache(self):
-        common_prefix_len = self.task.common_prefix_len[0]
-        inputs = self.task.inputs
+        common_prefix_len = self.task.common_prefix_len
+        inputs = self.task.inputs[0]
         prompt_len = self.task.prompt_len
         
         kv_ptr = []
-        # cache_home 里存储的缓存形状是：(prefix_cache_shape + suffix_len + gen_len - 1, b * n_head, head_dim)
+        # cache_home 里存储的缓存形状是：(prefill_cache_shape + suffix_len + gen_len - 1, b * n_head, head_dim)
         # n_imp部分的已经持久化了，只需要持久化suffix_len部分的。
         for t_idx in range(common_prefix_len,  prompt_len):
             ptr = []
@@ -968,34 +980,29 @@ class OptLM:
                     src = self.cache_home[layer][b]
                     k_cache, v_cache = src.val
                     # 在cache_home中该token的下标是n_imp + (t_idx - common_prefix_len) 或者 common_prefix_len + (t_idx - common_prefix_len)
-                    # 如果是第二种情况，prefix_cache_shape = prompt_len 如果是第一种情况，prefix_cache_shape = n_imp + NR = n_imp + prompt_len - common_prefix_len
-                    # n_imp = prefix_cache_shape + common_prefix_len - prompt_len
-                    # 下标为prefix_cache_shape + common_prefix_len - prompt_len + idx - common_prefix_len = prefix_cache_shape - prompt_len + idx
-                    #logger.info(f"Before storing prefix cache, k_cache shape: {k_cache.shape}, v_cache shape: {v_cache.shape}, layer: {layer}, batch: {b}, token index: {t_idx}, common_prefix_len: {common_prefix_len}, prefix_cache_shape: {self.layers[layer].prefix_cache_shape}")
-                    logger.info(f"Store Prefix Cache: k_cache.data={k_cache.data[self.layers[layer].prefix_cache_shape + t_idx - prompt_len,:3,:10]}")
-                    ptr.append(self.chunk_pool.store_prefix_cache(k_cache, v_cache, self.layers[layer].prefix_cache_shape + t_idx - prompt_len))
+                    # 如果是第二种情况，prefill_cache_shape = prompt_len 如果是第一种情况，prefill_cache_shape = n_imp + NR = n_imp + prompt_len - common_prefix_len
+                    # n_imp = prefill_cache_shape + common_prefix_len - prompt_len
+                    # 下标为prefill_cache_shape + common_prefix_len - prompt_len + idx - common_prefix_len = prefill_cache_shape - prompt_len + idx
+                    #logger.info(f"Before storing prefix cache, k_cache shape: {k_cache.shape}, v_cache shape: {v_cache.shape}, layer: {layer}, batch: {b}, token index: {t_idx}, common_prefix_len: {common_prefix_len}, prefill_cache_shape: {self.layers[layer].prefill_cache_shape}")
+                    logger.info(f"Store Prefix Cache: k_cache.data={k_cache.data[self.layers[layer].prefill_cache_shape + t_idx - prompt_len,:3,:10]}")
+                    ptr.append(self.chunk_pool.store_prefix_cache(k_cache, v_cache, self.layers[layer].prefill_cache_shape + t_idx - prompt_len))
                     self.env.disk.synchronize()
-                    logger.info(f"Store prefix cache for layer {layer}, batch {b}, token index {t_idx}, cache_offset {self.layers[layer].prefix_cache_shape + t_idx - prompt_len}, pointer: {ptr[-1]}")
+                    logger.info(f"Store prefix cache for layer {layer}, batch {b}, token index {t_idx}, cache_offset {self.layers[layer].prefill_cache_shape + t_idx - prompt_len}, pointer: {ptr[-1]}")
             kv_ptr.append(ptr)
         logging.info(f"kv_ptr:{len(kv_ptr)},{len(kv_ptr[0])}")
 
-        self.radix_tree.insert(inputs[0], kv_ptr)
+        self.radix_tree.insert(inputs, kv_ptr)
         
-                
-            
     def generate(self,
-                 inputs: Union[np.array, List[List[int]]],
+                 inputs: Union[np.array, List[int]],
                  max_new_tokens: int = 32,
                  do_sample: bool = False,
                  temperature: float = 1.0,
                  stop: Optional[int] = None,
                  debug_mode: Optional[str] = None,
                  cut_gen_len: Optional[int] = None,
-                 verbose: int = 0,
-                 final: bool = False):
-        common_prefix_kv_ptr, common_prefix_len = self.generate_with_prefix(inputs)
-        logger.info(f"common_prefix_len: {common_prefix_len}") # List[List[]]
-
+                 verbose: int = 0):        
+        common_prefix_kv_ptr, common_prefix_len = self.generate_with_prefix(inputs[0])
         task = Task(
             inputs=inputs,
             prompt_len=len(inputs[0]),
@@ -1007,6 +1014,7 @@ class OptLM:
             common_prefix_kv_ptr=common_prefix_kv_ptr,
             common_prefix_len=common_prefix_len
         )
+        logger.info(f"generate: Task={task}")
         num_layers = self.num_layers
         num_gpu_batches = self.num_gpu_batches
         gpu_batch_size = self.policy.gpu_batch_size
@@ -1025,26 +1033,19 @@ class OptLM:
         # The following buffers store values used
         # for the i-th token, j-th layer, k-th gpu batch.
         num_layers, num_gpu_batches = self.num_layers, self.policy.num_gpu_batches
+
         for j in range(num_layers):
             for k in range(num_gpu_batches):
-                self.cache_home[j][k].clear()
                 self.cache_read_buf[j][k].clear()
                 self.cache_write_buf[j][k].clear()
+        
         for j in range(num_layers):
             self.weight_read_buf[j].clear()
         for k in range(num_gpu_batches):
             self.attention_mask[k].clear()
         self.hidden = array_3d(gen_len, num_layers, num_gpu_batches, ValueHolder)
 
-        # Init cache
         self.set_task(task)
-        self.set_chunk_pool()
-
-        for j in range(num_layers):
-            for k in range(num_gpu_batches):
-                self.init_cache(j, k)
-        if self.policy.cpu_cache_compute:
-            self.env.cpu.init_attention_compute_workspace(self.config, self.task, self.policy)
 
         # Generate
         if debug_mode is None:
@@ -1069,8 +1070,14 @@ class OptLM:
         else:
             raise ValueError("Invalid debug mode: {debug_mode}")
 
-        self.store_prefix_cache()
+        return self.output_ids
 
+    def finish_one_query(self, final=False):
+        self.sync()
+        self.store_prefix_cache()
+        self.sync()
+        logger.info("query finished , now sync the model")
+        num_layers, num_gpu_batches = self.num_layers, self.policy.num_gpu_batches
         if final:
             # Delete cache
             for j in range(num_layers):
@@ -1079,7 +1086,6 @@ class OptLM:
             if self.policy.cpu_cache_compute:
                 self.env.cpu.del_attention_compute_workspace()
 
-        return self.output_ids
 
     def generation_loop_normal(self):
         for i in range(self.execute_gen_len):
@@ -1340,110 +1346,6 @@ def get_filename(args):
         filename += "-compc"
     return filename
 
-
-def get_test_inputs(prompt_len, num_prompts, tokenizer):
-    prompts = ["Paris is the capital city of"]
-    input_ids = tokenizer(prompts, padding="max_length",
-                          max_length=prompt_len).input_ids
-    return (input_ids[0],) * num_prompts
-
-
-def run_flexllmgen(args):
-    print(f"<run_flexllmgen>: args.model: {args.model}")
-    if args.model == "facebook/galactica-30b":
-        tokenizer = AutoTokenizer.from_pretrained("facebook/galactica-30b", padding_side="left")
-    else:
-        #tokenizer = AutoTokenizer.from_pretrained("facebook/opt-30b", padding_side="left")
-        tokenizer = AutoTokenizer.from_pretrained("/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/hyk/param/opt-30b", padding_side="left")
-    num_prompts = args.num_gpu_batches * args.gpu_batch_size
-    prompt_len, gen_len, cut_gen_len = args.prompt_len, args.gen_len, args.cut_gen_len
-
-    # Task and policy
-    warmup_inputs = get_test_inputs(32, num_prompts, tokenizer)
-    inputs = get_test_inputs(prompt_len, num_prompts, tokenizer)
-
-    gpu = TorchDevice("cuda:0")
-    cpu = TorchDevice("cpu")
-    disk = TorchDisk(args.offload_dir)
-    env = ExecutionEnv(gpu=gpu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gpu, cpu, disk]))
-
-    policy = Policy(args.gpu_batch_size, args.num_gpu_batches,
-                    args.percent[0], args.percent[1],
-                    args.percent[2], args.percent[3],
-                    args.percent[4], args.percent[5],
-                    args.overlap, args.sep_layer, args.pin_weight,
-                    args.cpu_cache_compute, args.attn_sparsity,
-                    args.compress_weight,
-                    CompressionConfig(num_bits=4, group_size=64,
-                                      group_dim=0, symmetric=False),
-                    args.compress_cache,
-                    CompressionConfig(num_bits=4, group_size=64,
-                                      group_dim=2, symmetric=False))
-    assert not (args.compress_cache and args.attn_sparsity < 1.0), "Not implemented"
-
-    opt_config = get_opt_config(args.model)
-    cache_size = opt_config.cache_bytes(num_prompts, prompt_len + gen_len)
-    hidden_size = opt_config.hidden_bytes(num_prompts, prompt_len + gen_len)
-    print(f"model size: {opt_config.model_bytes()/GB:.3f} GB, "
-          f"cache size: {cache_size/GB:.3f} GB, "
-          f"hidden size (prefill): {hidden_size/GB:.3f} GB")
-
-    print("init weight...")
-    model = OptLM(opt_config, env, args.path, policy)
-
-    try:
-        print("warmup - generate")
-        output_ids = model.generate(
-            warmup_inputs, max_new_tokens=1, verbose=args.verbose)
-
-        print("benchmark - generate")
-        timers("generate").reset()
-        output_ids = model.generate(
-            inputs, max_new_tokens=args.gen_len,
-            debug_mode=args.debug_mode, cut_gen_len=cut_gen_len, verbose=args.verbose)
-        costs = timers("generate").costs
-    finally:
-        env.close_copy_threads()
-
-    # Log output
-    prefill_latency = costs[0]
-    prefill_throughput = num_prompts * prompt_len / prefill_latency
-    if cut_gen_len:  # project latency of cut_gen_len to gen_len
-        decode_latency = project_decode_latency(costs, prompt_len, gen_len)
-    else:
-        decode_latency = sum(costs[1:])
-    decode_throughput = num_prompts * (gen_len - 1) / max(decode_latency, 1e-10)
-    num_generated_tokens = num_prompts * gen_len
-    total_latency = prefill_latency + decode_latency
-    total_throughput = num_generated_tokens / total_latency
-    _, gpu_peak_mem = gpu.mem_stats()
-    _, cpu_peak_mem = cpu.mem_stats()
-
-    if DUMMY_WEIGHT not in args.path:
-        outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
-        show_str = "Outputs:\n" + 70 * '-' + "\n"
-        for i in [0, len(outputs)-1]:
-            show_str += f"{i}: {outputs[i]}\n"
-            show_str += "-" * 70 + "\n"
-        if args.verbose >= 2:
-            print(show_str)
-
-    gpu.print_stats()
-    cpu.print_stats()
-    projected = bool(args.debug_mode or cut_gen_len)
-
-    if args.log_file == "auto":
-        filename = get_filename(args) + ".log"
-    else:
-        filename = args.log_file
-
-    log_str = write_benchmark_log(filename,
-        opt_config.model_bytes(), cache_size, hidden_size,
-        gpu_peak_mem, projected, prefill_latency, prefill_throughput,
-        decode_latency, decode_throughput, total_latency, total_throughput)
-    if args.verbose >= 1:
-        print(log_str)
-
 def get_tokenized_inputs(prompt, max_prompt_len, tokenizer):
     prompt = [prompt] if isinstance(prompt, str) else prompt
     inputs_ids = tokenizer(prompt, max_length=max_prompt_len, truncation=True).input_ids
@@ -1456,20 +1358,10 @@ def run_prefix_flexllmgen(args):
     else:
         #tokenizer = AutoTokenizer.from_pretrained("facebook/opt-30b", padding_side="left")
         tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
-    num_prompts = args.num_gpu_batches * args.gpu_batch_size
-    prompt_len, gen_len, cut_gen_len = args.prompt_len, args.gen_len, args.cut_gen_len
-
-    prefix_prompt1 = "The capital of Guangdong is Guangzhou."
-    prefix_prompt2 = "The capital of Guangdong is Guangzhou and Shenzhen is a city next to Guangzhou."
-    first_query = "Guangzhou is the capital of"
-    second_query = "Please introduce Shenzhen"
-
-    first_input = get_tokenized_inputs(prefix_prompt1 + " " + first_query, prompt_len, tokenizer)
-    second_input = get_tokenized_inputs(prefix_prompt2 + " " + second_query, prompt_len, tokenizer)
     
-    logger.info(f"first_input: {prefix_prompt1 + first_query}, ids: {first_input}")
-    logger.info(f"second_input: {prefix_prompt2 + second_query}, ids: {second_input}")
-
+    num_prompts = args.num_gpu_batches * args.gpu_batch_size
+    max_prompt_len, gen_len, cut_gen_len = args.prompt_len, args.gen_len, args.cut_gen_len
+    
     gpu = TorchDevice("cuda:0")
     cpu = TorchDevice("cpu")
     disk = TorchDisk(args.offload_dir)
@@ -1490,18 +1382,25 @@ def run_prefix_flexllmgen(args):
     assert not (args.compress_cache and args.attn_sparsity < 1.0), "Not implemented"
 
     opt_config = get_opt_config(args.model)
-    cache_size = opt_config.cache_bytes(num_prompts, prompt_len + gen_len)
-    hidden_size = opt_config.hidden_bytes(num_prompts, prompt_len + gen_len)
+    cache_size = opt_config.cache_bytes(num_prompts, max_prompt_len + gen_len)
+    hidden_size = opt_config.hidden_bytes(num_prompts, max_prompt_len + gen_len)
     print(f"model size: {opt_config.model_bytes()/GB:.3f} GB, "
           f"cache size: {cache_size/GB:.3f} GB, "
           f"hidden size (prefill): {hidden_size/GB:.3f} GB")
+    
+    print("init weight...init_cache_home...")
 
-    # 以上各个空间按照传入的args.prompt_len, gen_len计算，实际传入输入可能小于prompt_len
+    model = OptLM(opt_config, env, args.path, policy, args.prompt_len, args.gen_len)
+    prefix_prompt1 = "The capital of Guangdong is Guangzhou."
+    prefix_prompt2 = "The capital of Guangdong is Guangzhou and Shenzhen is a city next to Guangzhou."
+    first_query = "Guangzhou is the capital of"
+    second_query = "Please introduce Shenzhen"
 
-    print("init weight...")
-
-    model = OptLM(opt_config, env, args.path, policy)
-
+    first_input = get_tokenized_inputs(prefix_prompt1 + " " + first_query, max_prompt_len, tokenizer)
+    second_input = get_tokenized_inputs(prefix_prompt2 + " " + second_query, max_prompt_len, tokenizer)
+    
+    logger.info(f"first_input: {prefix_prompt1 + first_query}, ids: {first_input}")
+    logger.info(f"second_input: {prefix_prompt2 + second_query}, ids: {second_input}")
 
     try:
         print("first query - generate")
@@ -1513,9 +1412,9 @@ def run_prefix_flexllmgen(args):
 
         # Log output
         prefill_latency = costs[0]
-        prefill_throughput = num_prompts * prompt_len / prefill_latency
+        prefill_throughput = num_prompts * max_prompt_len / prefill_latency
         if cut_gen_len:  # project latency of cut_gen_len to gen_len
-            decode_latency = project_decode_latency(costs, prompt_len, gen_len)
+            decode_latency = project_decode_latency(costs, max_prompt_len, gen_len)
         else:
             decode_latency = sum(costs[1:])
         decode_throughput = num_prompts * (gen_len - 1) / max(decode_latency, 1e-10)
@@ -1544,10 +1443,8 @@ def run_prefix_flexllmgen(args):
                 show_str += "-" * 70 + "\n"
             if args.verbose >= 2:
                 print(show_str)
-                
 
-        model.sync()
-        logger.info("first query finished ,now sync the model")
+        model.finish_one_query(False)
 
         print("=" * 50)
 
@@ -1555,15 +1452,15 @@ def run_prefix_flexllmgen(args):
         timers("generate").reset()
         output_ids = model.generate(
             second_input, max_new_tokens = args.gen_len, debug_mode=args.debug_mode, 
-            cut_gen_len=cut_gen_len, verbose=args.verbose, final=True)
+            cut_gen_len=cut_gen_len, verbose=args.verbose)
         costs = timers("generate").costs
 
         # Log output
         
         prefill_latency = costs[0]
-        prefill_throughput = num_prompts * prompt_len / prefill_latency
+        prefill_throughput = num_prompts * max_prompt_len / prefill_latency
         if cut_gen_len:  # project latency of cut_gen_len to gen_len
-            decode_latency = project_decode_latency(costs, prompt_len, gen_len)
+            decode_latency = project_decode_latency(costs, max_prompt_len, gen_len)
         else:
             decode_latency = sum(costs[1:])
         decode_throughput = num_prompts * (gen_len - 1) / max(decode_latency, 1e-10)
@@ -1594,10 +1491,10 @@ def run_prefix_flexllmgen(args):
                 print(show_str)
 
         print("=" * 50)  
+        model.finish_one_query(True)
 
     finally:
         env.close_copy_threads()
-
 
 def add_parser_arguments(parser):
     parser.add_argument("--model", type=str, default="facebook/opt-6.7b",

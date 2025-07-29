@@ -200,7 +200,7 @@ class TorchDevice:
     def delete(self, tensor):
         pass
 
-    def init_attention_compute_workspace(self, config, task, policy):
+    def init_attention_compute_workspace(self, config, task, policy, max_gen_len, max_prompt_len):
         if self.device_type != DeviceType.CPU:
             return  # Only CPU requires this fp32 workspace
 
@@ -208,7 +208,7 @@ class TorchDevice:
             b = policy.gpu_batch_size
             n_head = config.n_head
             head_dim = config.input_dim // n_head
-            max_seq_len = task.prompt_len + task.gen_len - 1
+            max_seq_len = max_gen_len + max_prompt_len - 1
             self.attention_compute_workspace = []
             self.workspace_pt = 0
 
@@ -221,7 +221,7 @@ class TorchDevice:
                 self.attention_compute_workspace.append((k_cache, v_cache))
         else:
             self.compressed_device.init_attention_compute_workspace(
-                config, task, policy)
+                config, task, policy, max_gen_len, max_prompt_len)
 
     def next_attention_compute_workspace(self):
         self.workspace_pt = (self.workspace_pt + 1) % len(
@@ -291,11 +291,12 @@ class TorchDevice:
             ids = last_token_logits.argmax(dim=1, keepdim=True)
         return TorchTensor.create_from_torch(ids, self)
 
-    def init_cache_one_gpu_batch(self, config, task, policy):
+    def init_cache_one_gpu_batch(self, config, task, policy, max_prompt_len, max_gen_len):
         num_head, hidden_size, prompt_len, gen_len, gpu_batch_size = (
-            config.n_head, config.input_dim, task.prompt_len, task.gen_len,
+            #config.n_head, config.input_dim, task.prompt_len, task.gen_len,
+            config.n_head, config.input_dim, max_prompt_len, max_gen_len,
             policy.gpu_batch_size)
-        shape = (prompt_len + gen_len - 1, gpu_batch_size * num_head, hidden_size // num_head)
+        shape = (max_prompt_len + max_gen_len - 1, gpu_batch_size * num_head, hidden_size // num_head)
         # NOTE: disable pin_memory due to high memory overhead
         pin_memory = False
         k_cache = self.allocate(shape, np.float16, pin_memory=pin_memory)
@@ -598,8 +599,6 @@ class TorchDevice:
         计算部分没有进行mask操作
         
         """
-
-        
         # decompress weights
         if w_q.device.device_type == DeviceType.COMPRESSED:
             w_q = w_q.device.decompress(w_q)
