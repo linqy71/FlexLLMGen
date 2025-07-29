@@ -198,13 +198,6 @@ void KVStore::collect_queried_key_value(
     for(int i = 0; i < this->num_key_value_heads; i++){
         std::set<uint64_t> queried_meta_offset;
 
-        // for (int attn_head = i * attn_group; attn_head < (i + 1) * attn_group; attn_head++ ) {
-        //     int num_indices = nnz[attn_head];
-        //     for (int j = 0; j < num_indices; j++) {
-        //         uint64_t meta_id = get_meta_id(ind[j], layer_id, i);
-        //         queried_meta_offset.insert(kv_meta->at(meta_id));
-        //     }
-        // }
         int num_indices = nnz[i];
         for (int j = 0; j < num_indices; j++) {
             uint64_t meta_id = get_meta_id(ind[j], layer_id, i);

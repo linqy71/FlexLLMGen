@@ -144,6 +144,8 @@ class LSHServer:
     ### layer_idx: layer index
     ### query_states: queries shape: q_len * #attn_heads * head_dim
     ### q_i: index of accesses to current prefix
+    ### returns keys and values of important tokens
+    ### Note that!! the kvs are only valid before next get_kv(), needing copy after each get_kv()
     def get_kv(self, 
         req_id: int, 
         layer_idx: int, 
@@ -172,13 +174,28 @@ class LSHServer:
         self.pinned_hashcode_multi[...,:q_len,:].copy_(q_hashcode)
         ### get results from lsh hashtables
         self.lsh_retriever.batch_retrieve_multi(layer_idx, self.pinned_hashcode_multi, q_len ,self.results_lsh_cpu, self.nnz)
-        
+        ### collect key value from kv_store
+        self.kv_store.collect_queried_key_value(0, layer_idx, self.results_lsh_cpu, self.nnz)
+        queried_key = self.kv_server.get_queried_key_cache()
+        queried_value = self.kv_server.get_queried_value_cache()
+        avg_k = self.avg_k[layer_idx][req_id].to("cpu")
+        queried_key = queried_key + avg_k
 
+        return queried_key, queried_value
+
+
+    ### for debug...
+    ### get full kv from kv_store by generating indices of range(offloaded_len)
+    ### testing, set prefix_id=0
     def get_full_kv(self, req_id, layer_idx, query_states):
         if not self.offloaded:
             return None, None
-        ### test, set prefix_id=0
-        self.kv_store.load_full_key_value(0, layer_idx)
+        ### generating indices covering offloaded_len
+        for head_id in range(self.num_key_value_heads):
+            self.nnz[head_id] = self.offload_len
+            self.results_lsh_cpu[head_id] = torch.range(self.offload_len)
+        
+        self.kv_store.collect_queried_key_value(0, layer_idx, self.results_lsh_cpu, self.nnz)
         queried_key = self.kv_store.get_queried_key_cache()
         queried_value = self.kv_store.get_queried_value_cache()
         avg_k = self.avg_k[layer_idx][req_id].to("cpu")
