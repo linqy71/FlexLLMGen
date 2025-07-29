@@ -1147,17 +1147,30 @@ def sync_general_copy(dst: TorchTensor, dst_indices: Tuple[slice],
     """synchronous copy between two tensors.
     Only supporting copy among pinned tensors on gpu, cpu, or disk.
     """
-    src_data = map_to_torch_tensor(src, src_indices)
-    dst_data = map_to_torch_tensor(dst, dst_indices)
+
 
     src_dev = src.device.device_type
     dst_dev = dst.device.device_type
-    if (src_dev == DeviceType.CUDA or
-        dst_dev == DeviceType.CUDA):
-        # Use a pinned cpu buffer as a relay
-        size = np.prod(src_data.shape)
-        tmp_cpu_buf = cpu_buf[:size].view(src_data.shape)
-        tmp_cpu_buf.copy_(src_data)
-        dst_data.copy_(tmp_cpu_buf, non_blocking=True)
+    if src_dev == DeviceType.DISK or dst_dev == DeviceType.DISK:    
+        src_data = map_to_torch_tensor(src, src_indices)
+        dst_data = map_to_torch_tensor(dst, dst_indices)
+        if (src_dev == DeviceType.CUDA or
+            dst_dev == DeviceType.CUDA):
+            # Use a pinned cpu buffer as a relay
+            size = np.prod(src_data.shape)
+            tmp_cpu_buf = cpu_buf[:size].view(src_data.shape)
+            tmp_cpu_buf.copy_(src_data)
+            dst_data.copy_(tmp_cpu_buf, non_blocking=True)
+        else:
+            dst_data.copy_(src_data)
+    elif src_dev == DeviceType.CPU and dst_dev == DeviceType.CUDA and not src_data.is_pinned():
+        # The cpu tensor is not pinned, use pin_memory as a relay
+        src = src.data[src_indices] if src_indices else src.data
+        dst = dst.data[dst_indices] if dst_indices else dst.data
+        src = src.pin_memory()
+        dst.copy_(src, non_blocking=True)
     else:
-        dst_data.copy_(src_data)
+        # The normal path
+        src = src.data[src_indices] if src_indices else src.data
+        dst = dst.data[dst_indices] if dst_indices else dst.data
+        dst.copy_(src, non_blocking=True)
