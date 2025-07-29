@@ -61,14 +61,15 @@ class TorchCompressedDevice:
             comp_config=policy.comp_cache_config, pin_memory=pin_memory)
         return k_cache, v_cache
 
-    def init_attention_compute_workspace(self, config, task, policy):
+    def init_attention_compute_workspace(self, config, task, policy, max_gen_len, max_prompt_len):
         if self.base_device.device_type != DeviceType.CPU:
             return  # Only CPU requires this fp32 workspace
 
         b = policy.gpu_batch_size
         n_head = config.n_head
         head_dim = config.input_dim // n_head
-        max_seq_len = task.prompt_len + task.gen_len - 1
+        #max_seq_len = task.prompt_len + task.gen_len - 1
+        max_seq_len = max_gen_len + max_prompt_len - 1
         shape = (max_seq_len, b * n_head, head_dim)
 
         group_size, group_dim = (
