@@ -13,6 +13,13 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 
+import logging
+
+logging.basicConfig(#filename="test.log", filemode="w",
+                    format="%(asctime)s %(name)s:%(levelname)s:%(message)s", 
+                    datefmt="%m-%d %H:%M:%S", level=logging.DEBUG)
+logger = logging.getLogger(__name__)
+
 from flexllmgen.utils import (GB, T, cpu_mem_stats, vector_gather,
     np_dtype_to_torch_dtype, torch_dtype_to_np_dtype,
     torch_dtype_to_num_bytes)
@@ -193,7 +200,7 @@ class TorchDevice:
     def delete(self, tensor):
         pass
 
-    def init_attention_compute_workspace(self, config, task, policy):
+    def init_attention_compute_workspace(self, config, task, policy, max_gen_len, max_prompt_len):
         if self.device_type != DeviceType.CPU:
             return  # Only CPU requires this fp32 workspace
 
@@ -201,7 +208,7 @@ class TorchDevice:
             b = policy.gpu_batch_size
             n_head = config.n_head
             head_dim = config.input_dim // n_head
-            max_seq_len = task.prompt_len + task.gen_len - 1
+            max_seq_len = max_gen_len + max_prompt_len - 1
             self.attention_compute_workspace = []
             self.workspace_pt = 0
 
@@ -214,7 +221,7 @@ class TorchDevice:
                 self.attention_compute_workspace.append((k_cache, v_cache))
         else:
             self.compressed_device.init_attention_compute_workspace(
-                config, task, policy)
+                config, task, policy, max_gen_len, max_prompt_len)
 
     def next_attention_compute_workspace(self):
         self.workspace_pt = (self.workspace_pt + 1) % len(
@@ -284,11 +291,12 @@ class TorchDevice:
             ids = last_token_logits.argmax(dim=1, keepdim=True)
         return TorchTensor.create_from_torch(ids, self)
 
-    def init_cache_one_gpu_batch(self, config, task, policy):
+    def init_cache_one_gpu_batch(self, config, task, policy, max_prompt_len, max_gen_len):
         num_head, hidden_size, prompt_len, gen_len, gpu_batch_size = (
-            config.n_head, config.input_dim, task.prompt_len, task.gen_len,
+            #config.n_head, config.input_dim, task.prompt_len, task.gen_len,
+            config.n_head, config.input_dim, max_prompt_len, max_gen_len,
             policy.gpu_batch_size)
-        shape = (prompt_len + gen_len - 1, gpu_batch_size * num_head, hidden_size // num_head)
+        shape = (max_prompt_len + max_gen_len - 1, gpu_batch_size * num_head, hidden_size // num_head)
         # NOTE: disable pin_memory due to high memory overhead
         pin_memory = False
         k_cache = self.allocate(shape, np.float16, pin_memory=pin_memory)
@@ -332,7 +340,7 @@ class TorchDevice:
 
         # shape: (b, 1, s, s)
         idx = torch.arange(s, device=self.dev)
-        causal_mask = (idx <= idx.view(s, 1)).view(1, 1, s, s)
+        causal_mask = (idx <= idx.view(s, 1)).view(1, 1, s, s) # 下三角矩阵
         mask = attention_mask.data.view(b, 1, 1, s) & causal_mask
 
         # shape: (b, n_head, s, s)
@@ -354,6 +362,221 @@ class TorchDevice:
         # (s, b * n_head, head_dim)
         k = k.permute(2, 0, 1)
         v = v.permute(1, 0, 2)
+        
+        if compress_cache:
+            k = self.compressed_device.compress(k, comp_config)
+            v = self.compressed_device.compress(v, comp_config)
+        else:
+            k = TorchTensor.create_from_torch(k, self)
+            v = TorchTensor.create_from_torch(v, self)
+
+        logger.info(f"mha:k.data = {k.data[:,:3,:10]}")
+
+        return TorchTensor.create_from_torch(value, self), k, v
+    
+    def get_important_token_idx(self, inputs, attention_mask, w_q, b_q,
+                w_ln, b_ln, n_head, k_cache, donate,
+                compress_cache, comp_config, important_ratio):
+        if w_q.device.device_type == DeviceType.COMPRESSED:
+            w_q = w_q.device.decompress(w_q)
+        '''
+            b, s, h = inputs.shape,包含整个inputs的token
+            取q的前三个头参数。计算得到q向量shape: (b * n_probe_head, s, head_dim)
+            传入的k缓存shape:(common_prefix_len, b * n_probe_head, head_dim)
+            调整shape计算attn_weights (b * n_probe_head, s, common_prefix_len)
+            mask和softmax后计算在dim=1上的和得到attn_sum(b * n_probe_head, common_prefix_len)
+            对attn_sum在dim=1上求topk,得到每个头的重要token下标(b * n_probe_head, n_important)
+            计算平均jaccard指数,超过threshold返回第1个头的重要token下标集
+            没超过返回range(common_prefix_len)表示后续要使用所有token的KV缓存
+
+            注意力掩码部分没理清,是乱写的0.0
+        '''
+        if compress_cache:
+            # shape: (common_prefix_len, b * n_probe_head, head_dim)
+            k = k_cache.device.decompress(k_cache)
+        else:
+            # shape: (common_prefix_len, b * n_probe_head, head_dim)
+            k = k_cache.data
+
+        n_probe_head = 3
+        b, s, h = inputs.shape
+        head_dim = h // n_head
+        scaling = head_dim ** -0.5
+        
+        common_prefix_len = k_cache.shape[0]
+        n_important = int(common_prefix_len * important_ratio)
+        
+        hidden = F.layer_norm(inputs.data, (h,), weight=w_ln.data, bias=b_ln.data)
+
+        # w_q_probe = w_q.data.view(h, n_head, head_dim)[:, :n_probe_head, :].reshape(h, n_probe_head * head_dim)
+        # b_q_probe = b_q.data.view(n_head, head_dim)[:n_probe_head, :].reshape(n_probe_head * head_dim)
+
+        w_q_probe = w_q.data[:n_probe_head * head_dim,:]
+        b_q_probe = b_q.data[:n_probe_head * head_dim]
+        
+        logger.info(f"IMP_Token: w_q_probe's shape={w_q_probe.data.shape},b_q_probe's shape={b_q_probe.shape},hidden's shape={b_q.data.shape}")
+
+        # shape: (b * n_probe_head, s, head_dim)
+        q = F.linear(hidden, w_q_probe, bias=b_q_probe) * scaling
+        # shape: (b, s, n_probe_head, head_dim)
+        q = q.view(b, s, n_probe_head, head_dim)
+        # shape: (b * n_probe_head, s, head_dim)
+        q = q.permute(0, 2, 1, 3).reshape(b * n_probe_head, s, head_dim)
+
+        # origin k_cache shape: (common_prefix_len, b * n_probe_head, head_dim)
+        # shape:(b * n_probe_head, head_dim, common_prefix_len)
+        k = k.permute(1, 2, 0).reshape(b * n_probe_head, head_dim, common_prefix_len)
+
+        # shape: (b * n_probe_head, s, common_prefix_len)
+        attn_weights = torch.bmm(q, k)
+        
+        mask = attention_mask.data[:, :common_prefix_len].view(b, 1, 1, common_prefix_len)
+        #logger.info(f"IMP_Token mask={mask}")
+        # expand to (b, n_probe_head, s, common_prefix_len)
+        mask = mask.expand(b, n_probe_head, s, common_prefix_len)
+        # reshape to match attn_weights: (b * n_probe_head, s, common_prefix_len)
+        mask = mask.reshape(b * n_probe_head, s, common_prefix_len)
+
+        attn_weights = torch.where(mask, attn_weights, -1e4)   
+        attn_weights = F.softmax(attn_weights, dim=2)
+
+        attn_sum = attn_weights.sum(dim = 1)
+        _, topk_idx = torch.topk(attn_sum, k=n_important, dim=1)
+        topk_idx = topk_idx.view(b, n_probe_head, n_important)
+
+        S_imp = [[] for _ in range(b)]
+        for i in range(b):
+            for j in range(n_probe_head):
+                idx_set = { int(x) for x in topk_idx[i,j]}
+                S_imp[i].append(idx_set)
+
+        logger.info(f"IMP_Token Set:{S_imp}")
+
+        thresold = ((n_important/common_prefix_len) / (2 - n_important/common_prefix_len)) ** 0.6
+        
+        logger.info(f"IMP_Token: thresold={thresold}")
+
+        imp_token_idx = []
+        for i in range(b):
+            jaccard = 0
+            for l in range(n_probe_head):
+                for r in range(l+1, n_probe_head):
+                    jaccard += len(S_imp[i][l] & S_imp[i][r])/len(S_imp[i][l] | S_imp[i][r])
+            comb = (n_probe_head * (n_probe_head - 1)) / 2
+            jaccard /= comb
+            if jaccard >= thresold:
+                imp_token_idx.append(sorted(S_imp[0][0]))
+            else:
+                imp_token_idx.append(list(range(common_prefix_len))) #表示加载全部kv
+
+        k_cache.delete()
+
+        return imp_token_idx
+        
+    def mha_prefill(self, inputs, attention_mask, w_q, b_q, w_k, b_k, w_v, b_v,
+                w_out, b_out, w_ln, b_ln, n_head, k_cache, v_cache, donate,
+                compress_cache, comp_config, common_prefix_len, imp_token_idx):
+        """Multi-head attention (prefill with prefix cache)."""
+        # decompress weights
+        if w_q.device.device_type == DeviceType.COMPRESSED:
+            w_q = w_q.device.decompress(w_q)
+            w_k = w_k.device.decompress(w_k)
+            w_v = w_v.device.decompress(w_v)
+            w_out = w_out.device.decompress(w_out)
+        if compress_cache:
+            # shape: (n_imp, b * n_head, head_dim)
+            k = k_cache.device.decompress(k_cache)
+            v = v_cache.device.decompress(v_cache)
+        else:
+            # shape: (n_imp, b * n_head, head_dim)
+            k = k_cache.data
+            v = v_cache.data
+        
+        '''
+        整个序列计算q向量(b, s, h)
+        计算非前缀部分的k_new,v_new向量(b, suffix_len, h)   suffix_len = s - common_prefix_len
+        获取前缀部分的kv缓存: (n_imp, b * n_head, head_dim), 把两部分拼接在一起(n_imp + suffix_len, b * n_head, head_dim)
+        
+        计算attn_weights(b * n_head, s, n_imp + suffix_len)
+        mask和softmax后计算attn_values(b * n_head, s, head_dim)
+
+        调整维度后和inputs.data相加返回。同时返回拼接后的kv_cache向量(n_imp + suffix_len, b * n_head, head_dim)
+        '''
+
+        b, s, h = inputs.shape
+        head_dim = h // n_head
+        scaling = head_dim ** -0.5
+
+        n_imp = k_cache.shape[0] # 重要token的数量
+        suffix_len = s - common_prefix_len 
+
+        hidden = F.layer_norm(inputs.data, (h,), weight=w_ln.data, bias=b_ln.data)
+
+        suffix_hidden = hidden[:, common_prefix_len:, :]  # hidden for suffix tokens
+        # shape: (b, s, h)
+        q = F.linear(hidden, w_q.data, bias=b_q.data) * scaling
+        # shape: (b, suffix_len, h)
+        k_new = F.linear(suffix_hidden, w_k.data, bias=b_k.data)
+        v_new = F.linear(suffix_hidden, w_v.data, bias=b_v.data)
+
+        # shape: (b, s, n_head, head_dim)
+        q = q.view(b, s, n_head, head_dim)
+        # shape: (b, suffix_len, n_head, head_dim)
+        k_new = k_new.view(b, suffix_len, n_head, head_dim)
+        v_new = v_new.view(b, suffix_len, n_head, head_dim)
+        # shape: (b * n_head, s, head_dim)
+        q = q.permute(0, 2, 1, 3).reshape(b * n_head, s, head_dim)
+
+        # shape: (suffix_len, b * n_head, head_dim)
+        k_new = k_new.permute(1, 0, 2, 3).reshape(suffix_len, b * n_head, head_dim)
+        v_new = v_new.permute(1, 0, 2, 3).reshape(suffix_len, b * n_head, head_dim)
+
+        # origin k_cache shape: (n_imp + suffix_len, b * n_head, head_dim)
+        k = torch.cat((k, k_new), dim=0)
+        v = torch.cat((v, v_new), dim=0)
+        # shape: (b * n_head, head_dim, n_imp + suffix_len)
+        k = k.permute(1, 2, 0).reshape(b * n_head, head_dim, n_imp + suffix_len)
+        # shape: (b * n_head, n_imp + suffix_len, head_dim)
+        v = v.permute(1, 0, 2).reshape(b * n_head, n_imp + suffix_len, head_dim)
+        
+        # shape: (b * n_head, s, n_imp + suffix_len)
+        attn_weights = torch.bmm(q, k)
+
+        L = n_imp + suffix_len
+        # prefix_mask = torch.ones(b, n_imp, dtype=torch.bool, device=attention_mask.device) 
+        # suffix_mask = attention_mask.data[:, common_prefix_len:]
+        # pad_mask = torch.cat([prefix_mask, suffix_mask], dim=1)
+        # pad_mask = pad_mask.view(b, 1, 1, L)   
+
+        idx = torch.arange(s, device=self.dev)
+        causal_mask = (idx <= idx.view(s, 1))
+        
+        token_idxs = imp_token_idx  +  list(range(common_prefix_len, s))
+        causal_mask = causal_mask[:, token_idxs]
+        #logger.info(f"mha_prefil:token_idxs = {token_idxs}, causal_mask={causal_mask}")
+        causal_mask = causal_mask.view(1, 1, s, L) 
+        #logger.info(f"mha_prefill: causal_mask.shape = {causal_mask.shape}")
+        #mask = pad_mask & causal_mask
+        mask = causal_mask
+
+        attn_weights = attn_weights.view(b, n_head, s, L)
+        attn_weights = torch.where(mask, attn_weights, -1e4)
+        attn_weights = attn_weights.view(b * n_head, s, L)
+        attn_weights = F.softmax(attn_weights, dim=2)
+        # shape: (b, n_head, s, head_dim)
+        value = torch.bmm(attn_weights, v).view(b, n_head, s, head_dim)
+        # shape: (b, s, h)
+        value = value.transpose(1, 2).reshape(b, s, h)
+        value = F.linear(value, w_out.data, bias=b_out.data)
+
+        value.add_(inputs.data)
+
+        if donate[0]: inputs.delete()
+        if donate[1]: attention_mask.delete()
+
+        # (n_imp + suffix_len, b * n_head, head_dim)
+        k = k.permute(2, 0, 1)
+        v = v.permute(1, 0, 2)
 
         if compress_cache:
             k = self.compressed_device.compress(k, comp_config)
@@ -362,12 +585,20 @@ class TorchDevice:
             k = TorchTensor.create_from_torch(k, self)
             v = TorchTensor.create_from_torch(v, self)
 
+        #logger.info(f"mha_prefill:k.data = {k.data[:,:3,:10]}")
+
         return TorchTensor.create_from_torch(value, self), k, v
+        
 
     def mha_gen(self, inputs, attention_mask, w_q, b_q, w_k, b_k, w_v, b_v,
                 w_out, b_out, w_ln, b_ln, n_head, k_cache, v_cache, donate,
-                attn_sparsity, compress_cache, comp_config):
-        """Multi-head attention (decoding phase)."""
+                attn_sparsity, compress_cache, comp_config, pos):
+        """Multi-head attention (decoding phase).
+        新增pos参数表示该层当前KVcache的第一维的长度.
+        
+        计算部分没有进行mask操作
+        
+        """
         # decompress weights
         if w_q.device.device_type == DeviceType.COMPRESSED:
             w_q = w_q.device.decompress(w_q)
@@ -376,7 +607,9 @@ class TorchDevice:
             w_out = w_out.device.decompress(w_out)
 
         b, tgt_s, h = inputs.shape
-        src_s = attention_mask.shape[1]
+        # src_s = attention_mask.shape[1]
+        src_s = pos
+        logger.info(f"mha_gen: src_s = {src_s}, mask.shape={attention_mask.shape[1]}")
         head_dim = h // n_head
         scaling = head_dim ** -0.5
 
@@ -417,6 +650,7 @@ class TorchDevice:
                 v = v.permute(1, 0, 2).reshape(b * n_head, src_s, head_dim)
 
                 if k.is_cuda:
+                    #logger.info(f"mha_gen: k.dtype{k.dtype}, v.dtype{v.dtype}, q.dtype{q.dtype}")
                     value = self._attention_value(q, k, v, attention_mask.data,
                         b, src_s, tgt_s, n_head, head_dim)
                 else:
@@ -472,10 +706,10 @@ class TorchDevice:
         # shape: (b * n_head, 1, s)
         attn_weights = torch.bmm(q, k)
         # shape: (b, 1, 1, s)
-        mask = mask.view(b, 1, 1, src_s)
+        #mask = mask.view(b, 1, 1, src_s)
         # shape: (b * n_head, 1, s)
         attn_weights = attn_weights.view(b, n_head, 1, src_s)
-        attn_weights = torch.where(mask, attn_weights, -1e4)
+        #attn_weights = torch.where(mask, attn_weights, -1e4)
         attn_weights = attn_weights.view(b * n_head, 1, src_s)
         attn_weights = F.softmax(attn_weights, dim=2)
         return attn_weights
@@ -892,15 +1126,51 @@ def copy_worker_func(queue, cuda_id):
             dst, dst_indices, src, src_indices = item
             src_data = map_to_torch_tensor(src, src_indices)
             dst_data = map_to_torch_tensor(dst, dst_indices)
-
+            # logger.info(f"Copying src_indices = {src_indices}, src_data.shape = {src_data.shape}, "
+            #             f"dst_indices = {dst_indices}, dst_data.shape = {dst_data.shape}")
             if (src.device.device_type == DeviceType.CUDA or
                 dst.device.device_type == DeviceType.CUDA):
                 # Use a pinned cpu buffer as a relay
                 size = np.prod(src_data.shape)
+                # logger.info(f"Copying src_data.shape = {src_data.shape}, "
+                #             f"dst_data.shape = {dst_data.shape}, size = {size}")
                 tmp_cpu_buf = cpu_buf[:size].view(src_data.shape)
                 tmp_cpu_buf.copy_(src_data)
-                dst_data.copy_(tmp_cpu_buf)
+                dst_data.copy_(tmp_cpu_buf) # dst不是pinned memory,所以不用non_blocking
             else:
                 dst_data.copy_(src_data)
 
             queue.task_done()
+
+def sync_general_copy(dst: TorchTensor, dst_indices: Tuple[slice],
+                 src: TorchTensor, src_indices: Tuple[slice],cpu_buf):
+    """synchronous copy between two tensors.
+    Only supporting copy among pinned tensors on gpu, cpu, or disk.
+    """
+
+
+    src_dev = src.device.device_type
+    dst_dev = dst.device.device_type
+    if src_dev == DeviceType.DISK or dst_dev == DeviceType.DISK:    
+        src_data = map_to_torch_tensor(src, src_indices)
+        dst_data = map_to_torch_tensor(dst, dst_indices)
+        if (src_dev == DeviceType.CUDA or
+            dst_dev == DeviceType.CUDA):
+            # Use a pinned cpu buffer as a relay
+            size = np.prod(src_data.shape)
+            tmp_cpu_buf = cpu_buf[:size].view(src_data.shape)
+            tmp_cpu_buf.copy_(src_data)
+            dst_data.copy_(tmp_cpu_buf, non_blocking=True)
+        else:
+            dst_data.copy_(src_data)
+    elif src_dev == DeviceType.CPU and dst_dev == DeviceType.CUDA and not src_data.is_pinned():
+        # The cpu tensor is not pinned, use pin_memory as a relay
+        src = src.data[src_indices] if src_indices else src.data
+        dst = dst.data[dst_indices] if dst_indices else dst.data
+        src = src.pin_memory()
+        dst.copy_(src, non_blocking=True)
+    else:
+        # The normal path
+        src = src.data[src_indices] if src_indices else src.data
+        dst = dst.data[dst_indices] if dst_indices else dst.data
+        dst.copy_(src, non_blocking=True)
