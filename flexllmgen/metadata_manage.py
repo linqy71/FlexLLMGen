@@ -107,7 +107,7 @@ class RadixTree:
                     child.mapping_list = [x-common_len for x in child.mapping_list if x >= common_len]
 
                     current.children[next_token] = new_node
-                    new_node.children[child.tokens[0]] = child
+                    new_node.children[child.tokens[0].token_id] = child
 
                     remaining = remaining[common_len:]
                     current = new_node
