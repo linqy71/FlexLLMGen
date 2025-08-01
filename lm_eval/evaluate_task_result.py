@@ -2,7 +2,7 @@ import argparse
 import json
 import os
 
-from lm_eval import evaluator, tasks, simple_evaluate
+from lm_eval import evaluator, tasks
 from tasks import EvalHarnessAdaptor
 
 def json_to_key(obj):
@@ -17,13 +17,11 @@ if __name__ == '__main__':
                         description = 'What the program does',
                         epilog = 'Text at the bottom of help')
 
-    parser.add_argument('--result-file', type=str, default='flexgen_results.jsonl')
+    parser.add_argument('--result-file', type=str, default='result.jsonl')
     parser.add_argument('--task-name', type=str, default='hellaswag')
     parser.add_argument('--model-type', type=str, default='opt')
     parser.add_argument('--debug', action='store_true', default=False)
     parser.add_argument('--num-fewshot', type=int, default=0)
-    parser.add_argument('--is-prefix-caching-test', action='store_true')
-    parser.add_argument('--limit', type=int, default=None, help='Limit the number of samples to evaluate')
     args = parser.parse_args()
     
     if args.model_type == 'opt':
@@ -46,8 +44,7 @@ if __name__ == '__main__':
         def __init__(self, args):
             
             self.results = {}
-            self.is_prefix_caching_test = args.is_prefix_caching_test
-
+            
             with open(args.result_file, 'r') as f:
                 
                 for line in f:
@@ -61,19 +58,6 @@ if __name__ == '__main__':
                     
                     self.results[json_to_key(request)] = result
             
-            if self.is_prefix_caching_test:
-                # For prefix caching, we can't rely on exact prompt matching.
-                # We'll create a list of (prompt, result) tuples for suffix matching.
-                self.prefixed_results = []
-                with open(args.result_file, 'r') as f:
-                    for line in f:
-                        if line.strip() == '':
-                            continue
-                        item = json.loads(line)
-                        self.prefixed_results.append(
-                            (item['request']['prompt'], item['result'])
-                        )
-
             print(f"{len(self.results)} items in the cache")
         
         def eval(self, batch):
@@ -84,7 +68,7 @@ if __name__ == '__main__':
             each_correct = []
 
             for i, text in enumerate(batch['text']):
-                # print("text:", text) 
+                
                 request = {
                         "best_of": 1, 
                         "echo": True, 
@@ -103,24 +87,9 @@ if __name__ == '__main__':
                 
                 correct = True
                 
-                result = None
-                if self.is_prefix_caching_test:
-                    # Find the result by checking if the original prompt ends with the current prompt text.
-                    # This handles the long, shared prefixes.
-                    # print(f"Checking for prefix match for: {text}")
-                    i= 0
-                    for p_prompt, p_result in self.prefixed_results:
-                        # if(i==0):
-                        #     i += 1
-                        #     print(f"Checking prefix: {p_prompt}")
-                        if p_prompt.endswith(text):
-                            # print(f"Found matching prefix for: {text}")
-                            result = p_result
-                            break
-                elif key in self.results:
+                if key in self.results:
                     result = self.results[key]
-
-                if result:
+                    
                     token_logprobs = result['choices'][0]['logprobs']['token_logprobs']
                     tokens = result['choices'][0]['logprobs']['tokens']
                     top_logprobs = result['choices'][0]['logprobs']['top_logprobs']
@@ -128,12 +97,7 @@ if __name__ == '__main__':
                     
                     token_ids = tokenizer.convert_tokens_to_ids(tokens)
                     
-                    if len(batch['obs']) == 1 and len(batch['text']) > 1:
-                        # This is a batch with a shared context
-                        obs = batch['obs'][0]
-                    else:
-                        obs = batch['obs'][i]
-
+                    obs = batch['obs'][i]
                     target = batch['target'][i]
                     eval_mask = batch['eval_mask'][i]
                     
@@ -164,8 +128,6 @@ if __name__ == '__main__':
                     each_correct.append( correct )
                     
                 else:
-                    # 注意这里的逻辑，根据结果文件指定了key的匹配策略，所以num_fewshot不匹配也没关系。
-                    print(f"Could not find result for prompt: {text}")
                     assert False
                 
 
@@ -181,25 +143,21 @@ if __name__ == '__main__':
 
     adaptor = EvalHarnessAdaptor(t, seq, total_batch, shrink=pe != "fixed")
 
-    # results = evaluator.evaluate(
-    #     adaptor, 
-    #     tasks.get_task_dict([args.task_name]),
-    #     limit=args.limit,
-    #     cache_requests=False,
-    #     bootstrap_iters=0,
-    #     write_out=False,
-    #     log_samples=False,
-    # )
-
-    results = simple_evaluate(
-        model=adaptor,
-        tasks=[args.task_name],
-        num_fewshot=args.num_fewshot,
-        fewshot_as_multiturn = True,
-        limit=args.limit,
-        write_out=False,
-        log_samples=False,
-    )
+    results = evaluator.evaluate(adaptor, tasks.get_task_dict([args.task_name
+                                                               #"lambada_openai",
+                                                               #"piqa",
+                                                               #"hellaswag",
+                                                               #"winogrande",
+                                                               #"mathqa",
+                                                               #"pubmedqa",
+                                                               # "boolq",
+                                                               # "cb",
+                                                               # "copa",
+                                                               # "multirc",
+                                                               # "record",
+                                                               # "wic",
+                                                               # "wsc",
+                                                               ]), False, args.num_fewshot, None)
     
     dumped = json.dumps(results, indent=2)
     print(dumped)

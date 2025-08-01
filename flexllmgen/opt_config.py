@@ -136,7 +136,8 @@ def download_opt_weights_old(model_name, path):
     path = os.path.abspath(os.path.expanduser(path))
 
     if "opt" in model_name:
-        hf_model_name = "facebook/" + model_name
+        # hf_model_name = "facebook/" + model_name
+        hf_model_name = model_name
         model_class = OPTForCausalLM
     elif "bloom" in model_name:
         hf_model_name = "bigscience/" + model_name
@@ -226,7 +227,8 @@ def download_opt_weights(model_name, path):
           f"checking the memory usage of this process.")
 
     if "opt" in model_name:
-        hf_model_name = "facebook/" + model_name
+        # hf_model_name = "facebook/" + model_name
+        hf_model_name = model_name
     elif "galactica" in model_name:
         hf_model_name = "facebook/" + model_name
 

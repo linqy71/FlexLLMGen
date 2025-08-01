@@ -1,7 +1,6 @@
 import argparse
 import json
 
-from lm_eval import simple_evaluate
 from lm_eval import evaluator, tasks
 from tasks import EvalHarnessAdaptor
 
@@ -17,7 +16,6 @@ if __name__ == '__main__':
     parser.add_argument('--output-file', type=str, default='input.jsonl')
     parser.add_argument('--task-name', type=str, default='hellaswag')
     parser.add_argument('--num-fewshot', type=int, default=0)
-    parser.add_argument('--limit', type=int, default=None, help='限制生成样本数量')
     args = parser.parse_args()
 
     seq = 1024
@@ -54,40 +52,24 @@ if __name__ == '__main__':
                 'each_correct': [True] * len(batch),
             }
             return out
-        
-        def generate(self, inputs, max_new_tokens=32, do_sample=False, 
-                     temperature=1.0, stop=None, verbose=0):
-            """
-            模拟 FlexGen 的 generate 方法（用于测试）
-            """
-            print(f"DryRunner.generate called with {len(inputs)} inputs, max_new_tokens={max_new_tokens}")
-            
-            # 返回模拟的生成结果（输入 + 一些假的生成 token）
-            results = []
-            for input_ids in inputs:
-                # 模拟生成一些 token（这里只是简单重复几个 token）
-                fake_generated = [1, 2, 3][:max_new_tokens]  # 假的生成 token
-                result = input_ids + fake_generated
-                results.append(result)
-            
-            return results
 
     t = DryRunner()
     adaptor = EvalHarnessAdaptor(t, seq, total_batch, shrink=pe != "fixed")
-
-    
-    # Call evaluate with positional arguments for lm_eval v0.4.9
-    # Parameters: lm, task_dict, limit, samples, ...
-    # results = evaluator.evaluate(
-    results = simple_evaluate(
-        model=adaptor,
-        tasks=[args.task_name],
-        num_fewshot=args.num_fewshot,
-        fewshot_as_multiturn = True,
-        limit=args.limit,
-        write_out=False,
-        log_samples=False,
-    )
+    results = evaluator.evaluate(adaptor, tasks.get_task_dict([args.task_name
+                                                            #"lambada_openai",
+                                                            #"piqa",
+                                                            #"hellaswag",
+                                                            #"winogrande",
+                                                            #"mathqa",
+                                                            #"pubmedqa",
+                                                            # "boolq",
+                                                            # "cb",
+                                                            # "copa",
+                                                            # "multirc",
+                                                            # "record",
+                                                            # "wic",
+                                                            # "wsc",
+                                                            ]), False, args.num_fewshot, None)
     print('Finished')
 
     # dumped = json.dumps(results, indent=2)
