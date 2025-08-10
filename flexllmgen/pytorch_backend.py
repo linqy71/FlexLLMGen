@@ -2,6 +2,7 @@
 from enum import Enum, auto
 from functools import partial
 from itertools import count
+import math
 import os
 import queue
 import shutil
@@ -13,11 +14,12 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 
+from flexllmgen.timer import timers
 import logging
 
 logging.basicConfig(#filename="test.log", filemode="w",
                     format="%(asctime)s %(name)s:%(levelname)s:%(message)s", 
-                    datefmt="%m-%d %H:%M:%S", level=logging.DEBUG)
+                    datefmt="%m-%d %H:%M:%S", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 from flexllmgen.utils import (GB, T, cpu_mem_stats, vector_gather,
@@ -264,6 +266,10 @@ class TorchDevice:
         past_key_values_length = mask.shape[1] - token_ids.shape[1]
         positions = positions[:, past_key_values_length:]
 
+        # logger.info(f">>> opt_input_embed: positions shape:, {positions.shape}")
+        # logger.info(f">>> positions min/max:, {positions.min().item()}, {positions.max().item()}")
+        # logger.info(f">>> w_pos.weight shape:, {w_pos.data.shape}")
+
         pos_embed = F.embedding(positions, w_pos.data)
 
         data = token_embed + pos_embed
@@ -370,7 +376,7 @@ class TorchDevice:
             k = TorchTensor.create_from_torch(k, self)
             v = TorchTensor.create_from_torch(v, self)
 
-        logger.info(f"mha:k.data = {k.data[:,:3,:10]}")
+        #logger.info(f"mha:k.data = {k.data[:,:3,:10]}")
 
         return TorchTensor.create_from_torch(value, self), k, v
     
@@ -404,7 +410,7 @@ class TorchDevice:
         scaling = head_dim ** -0.5
         
         common_prefix_len = k_cache.shape[0]
-        n_important = int(common_prefix_len * important_ratio)
+        n_important = math.ceil(common_prefix_len * important_ratio)
         
         hidden = F.layer_norm(inputs.data, (h,), weight=w_ln.data, bias=b_ln.data)
 
@@ -414,7 +420,7 @@ class TorchDevice:
         w_q_probe = w_q.data[:n_probe_head * head_dim,:]
         b_q_probe = b_q.data[:n_probe_head * head_dim]
         
-        logger.info(f"IMP_Token: w_q_probe's shape={w_q_probe.data.shape},b_q_probe's shape={b_q_probe.shape},hidden's shape={b_q.data.shape}")
+        #logger.info(f"IMP_Token: w_q_probe's shape={w_q_probe.data.shape},b_q_probe's shape={b_q_probe.shape},hidden's shape={b_q.data.shape}")
 
         # shape: (b * n_probe_head, s, head_dim)
         q = F.linear(hidden, w_q_probe, bias=b_q_probe) * scaling
@@ -450,11 +456,11 @@ class TorchDevice:
                 idx_set = { int(x) for x in topk_idx[i,j]}
                 S_imp[i].append(idx_set)
 
-        logger.info(f"IMP_Token Set:{S_imp}")
+        #logger.info(f"IMP_Token Set:{S_imp}")
 
         thresold = ((n_important/common_prefix_len) / (2 - n_important/common_prefix_len)) ** 0.6
         
-        logger.info(f"IMP_Token: thresold={thresold}")
+        #logger.info(f"IMP_Token: thresold={thresold}")
 
         imp_token_idx = []
         for i in range(b):
@@ -609,7 +615,7 @@ class TorchDevice:
         b, tgt_s, h = inputs.shape
         # src_s = attention_mask.shape[1]
         src_s = pos
-        logger.info(f"mha_gen: src_s = {src_s}, mask.shape={attention_mask.shape[1]}")
+        #logger.info(f"mha_gen: src_s = {src_s}, mask.shape={attention_mask.shape[1]}")
         head_dim = h // n_head
         scaling = head_dim ** -0.5
 
@@ -1147,8 +1153,6 @@ def sync_general_copy(dst: TorchTensor, dst_indices: Tuple[slice],
     """synchronous copy between two tensors.
     Only supporting copy among pinned tensors on gpu, cpu, or disk.
     """
-
-
     src_dev = src.device.device_type
     dst_dev = dst.device.device_type
     if src_dev == DeviceType.DISK or dst_dev == DeviceType.DISK:    
