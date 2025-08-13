@@ -81,5 +81,5 @@ else:
 
 ### 运行测试
 ```bash
-bash compare_backends.sh
+bash eval_long_tasks.sh
 ```
