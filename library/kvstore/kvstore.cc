@@ -392,8 +392,8 @@ torch::Tensor KVStore::get_queried_value_cache()
 }
 
 
-PYBIND11_MODULE(group_kvstore, m) {
-    py::class_<KVStore>(m, "GroupKVStore")
+PYBIND11_MODULE(kvstore, m) {
+    py::class_<KVStore>(m, "KVStore")
         .def(py::init<>())
         .def("alloc", &KVStore::alloc)
         .def("fill", &KVStore::fill)

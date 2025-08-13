@@ -1,6 +1,6 @@
 import torch
 from lsh import LSH
-from group_kvstore import GroupKVStore 
+from kvstore import KVStore 
 
 
 class LSHServer:
@@ -45,7 +45,7 @@ class LSHServer:
         self.prefix_to_server = {} ### record lsh_retriever and kv_store here
         self.lsh_retriever = LSH()
         self.lsh_retriever.alloc(self.K, self.L, self.num_layers, self.num_attention_heads, self.num_key_value_heads, self.batch_size, self.max_length)
-        self.kv_store = GroupKVStore()
+        self.kv_store = KVStore()
         self.kv_store.alloc(self.num_layers, self.num_attention_heads, self.num_key_value_heads, self.head_dim, max_length)
         
         self.hash_func = torch.randn((self.head_dim, self.K * self.L), device=self.device, dtype=self.dtype)
