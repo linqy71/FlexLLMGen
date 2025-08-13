@@ -52,7 +52,7 @@ class ChunkPool:
         '''
         #chunk_probe_shape = (probe_shape[0] * self.chunk_size, *probe_shape[1:])
         new_chunk = Chunk(device, full_head_shape, chunk_id=name)
-        logger.info(f"Init new chunk{new_chunk.chunk_id} with full head shape {full_head_shape} on device {device}")
+        #logger.info(f"Init new chunk{new_chunk.chunk_id} with full head shape {full_head_shape} on device {device}")
         self.pool[new_chunk.chunk_id] = new_chunk
         return new_chunk.chunk_id
 
