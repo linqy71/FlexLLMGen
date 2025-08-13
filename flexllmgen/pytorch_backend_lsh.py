@@ -395,7 +395,7 @@ class TorchDevice:
             k = TorchTensor.create_from_torch(k, self)
             v = TorchTensor.create_from_torch(v, self)
 
-        logger.info(f"mha:k.data = {k.data[:,:3,:10]}")
+        # logger.info(f"mha:k.data = {k.data[:,:3,:10]}")
 
         return TorchTensor.create_from_torch(value, self), k, v
     
@@ -559,7 +559,7 @@ class TorchDevice:
         b, tgt_s, h = inputs.shape
         # src_s = attention_mask.shape[1]
         src_s = pos
-        logger.info(f"mha_gen: src_s = {src_s}, mask.shape={attention_mask.shape[1]}")
+        # logger.info(f"mha_gen: src_s = {src_s}, mask.shape={attention_mask.shape[1]}")
         head_dim = h // n_head
         scaling = head_dim ** -0.5
 

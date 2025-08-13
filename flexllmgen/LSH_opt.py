@@ -563,7 +563,7 @@ class SelfAttention:
                     self.policy.compress_cache, self.policy.comp_cache_config, matched_prefix, 
                     imp_token_idx, self.kv_server.K, self.kv_server.L)
                 self.prefill_cache_shape = new_k_cache.shape[0]
-                logger.info(f"SelfAttention Prefix cache shape: {self.prefill_cache_shape}")
+                # logger.info(f"SelfAttention Prefix cache shape: {self.prefill_cache_shape}")
             else:
                 ### only compute prefix kv
                 h, new_k_cache, new_v_cache = self.compute.mha(h, mask, w_q, b_q,
@@ -571,14 +571,14 @@ class SelfAttention:
                     self.policy.compress_cache, self.policy.comp_cache_config, self.kv_server.K, self.kv_server.L)
                 
                 self.prefill_cache_shape = self.task.prompt_len
-                logger.info(f"SelfAttention Prefix cache shape: {self.prefill_cache_shape}")
+                # logger.info(f"SelfAttention Prefix cache shape: {self.prefill_cache_shape}")
             # 存入的cache shape可能是(s, b * n_head, head_dim) 也可能是 (n_imp + s - common_prefix_len[0], ..., ...)
             cache_write_buf.store((new_k_cache, new_v_cache))
         else:  # decoding
             imp_token_idx = self.kv_server.get_imp_idx(self.layer_id)
             mask, donate[1] = attention_mask.val.smart_copy(self.attention_compute)
             (k_cache, donate[12]), (v_cache, donate[13]) = cache_read_buf.pop()
-            logger.info(f"SelfAttention decoding prefill_cache_shape:{self.prefill_cache_shape}, i:{i}")
+            # logger.info(f"SelfAttention decoding prefill_cache_shape:{self.prefill_cache_shape}, i:{i}")
             h, new_k_cache, new_v_cache = self.compute.mha_gen(h, mask, w_q,
                 b_q, w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln, n_head,
                 k_cache, v_cache, donate, self.policy.attn_sparsity,
@@ -777,7 +777,7 @@ class OptLM:
 
         self.radix_tree = RadixTree() 
         ### default settings, note that device=cuda:0
-        self.kv_server = LSHServer(self.config, self.num_layers, K=8, L=80, batch_size=1, max_length=8192, device='cuda:0')
+        self.kv_server = LSHServer(self.config, self.num_layers, K=10, L=150, batch_size=1, max_length=8192, device='cuda:0')
         self.set_kv_server()
         
         for j in range(num_layers):
@@ -980,30 +980,7 @@ class OptLM:
             (self.policy.gpu_batch_size, self.task.prompt_len), bool)
         val.load_from_np((input_ids != self.config.pad_token_id))
         self.attention_mask[k].store(val)
-    
-    ### store to LSHServer through offload_to_lsh()
-    def store_prefix_cache(self):
-        common_prefix_len = sum(self.task.matched_prefix.values())
-        inputs = self.task.inputs[0] ### input ids
-        prompt_len = self.task.prompt_len
-        
-        ### get new_prefix_id for lsh
-        new_prefix_id = self.radix_tree.insert(inputs)
-        for layer_id in range(self.num_layers):
-            if isinstance(self.layers[layer_id], TransformerLayer) == False and \
-                isinstance(self.layers[layer_id], SelfAttention) == False :
-                continue ### do nothing
-            ### only supports batch_size=1
-            assert(self.policy.num_gpu_batches == 1)
-            ### k_cache shape: len, b*n_head, head_dim
-            k_cache, v_cache = self.cache_home[layer_id][0].val
-            ### pick the [common_prefix_len : prompt_len] part, for the [:common_prefix_len] part has been persisted
-            k_cache_data = k_cache.data[common_prefix_len:prompt_len]
-            v_cache_data = v_cache.data[common_prefix_len:prompt_len]
-            ### layer_idx:int, request_id: int, seq_len:int, prefix_id: int, key_states: torch.Tensor, value_states: torch.Tensor
-            self.kv_server.offload_to_lsh(layer_id, 0, prompt_len - common_prefix_len, new_prefix_id, k_cache_data, v_cache_data)
 
-        
     def generate(self,
                  inputs: Union[np.array, List[int]],
                  max_new_tokens: int = 32,
@@ -1019,6 +996,8 @@ class OptLM:
         if len(matched_prefix) == 0:
             prefix_only = True
             new_prefix_id = self.radix_tree.insert(inputs[0])
+        elif len(matched_prefix) == 1:
+            new_prefix_id = list(matched_prefix.keys())[0]
         task = Task(
             inputs=inputs,
             prompt_len=len(inputs[0]),
@@ -1093,8 +1072,11 @@ class OptLM:
 
     def finish_one_query(self, final=False):
         self.sync()
-        self.store_prefix_cache()
-        self.sync()
+        
+        ### if kv not persisted, persist
+        if self.kv_server.persisted == False:
+            self.kv_server.query_group_persist(self.task.new_prefix_id)
+        self.kv_server.reset(switch=False)
         logger.info("query finished , now sync the model")
         num_layers, num_gpu_batches = self.num_layers, self.policy.num_gpu_batches
         if final:
@@ -1417,7 +1399,7 @@ def run_prefix_flexllmgen(args):
       "Guangzhou was captured by the British during the First Opium War and no longer enjoyed a monopoly after the war; " + \
       "consequently it lost trade to other ports such as Hong Kong and Shanghai, but continued to serve as a major entrepot."
     first_query = "Guangzhou is the capital of"
-    second_query = "Please introduce Shenzhen"
+    second_query = "Please introduce Shenzhen."
 
     prefix_input = get_tokenized_inputs(prefix, max_prompt_len, tokenizer)
     ### feed prefix --------------
@@ -1477,54 +1459,54 @@ def run_prefix_flexllmgen(args):
             if args.verbose >= 2:
                 print(show_str)
 
-        # model.finish_one_query(False)
+        model.finish_one_query(False)
 
-        # print("=" * 50)
+        print("=" * 50)
 
-        # print("second query - generate")
-        # timers("generate").reset()
-        # output_ids = model.generate(
-        #     second_input, max_new_tokens = args.gen_len, debug_mode=args.debug_mode, 
-        #     cut_gen_len=cut_gen_len, verbose=args.verbose)
-        # costs = timers("generate").costs
+        print("second query - generate")
+        timers("generate").reset()
+        output_ids = model.generate(
+            second_input, max_new_tokens = args.gen_len, debug_mode=args.debug_mode, 
+            cut_gen_len=cut_gen_len, verbose=args.verbose)
+        costs = timers("generate").costs
 
-        # # Log output
+        # Log output
         
-        # prefill_latency = costs[0]
-        # prefill_throughput = num_prompts * max_prompt_len / prefill_latency
-        # if cut_gen_len:  # project latency of cut_gen_len to gen_len
-        #     decode_latency = project_decode_latency(costs, max_prompt_len, gen_len)
-        # else:
-        #     decode_latency = sum(costs[1:])
-        # decode_throughput = num_prompts * (gen_len - 1) / max(decode_latency, 1e-10)
-        # num_generated_tokens = num_prompts * gen_len
-        # total_latency = prefill_latency + decode_latency
-        # total_throughput = num_generated_tokens / total_latency
-        # _, gpu_peak_mem = gpu.mem_stats()
-        # _, cpu_peak_mem = cpu.mem_stats()
-        # log_str = (f"model size: {opt_config.model_bytes()/GB:.3f} GB\t"
-        #         f"cache size: {cache_size/GB:.3f} GB\t"
-        #         f"hidden size (p): {hidden_size/GB:.3f} GB\n"
-        #         f"peak gpu mem: {gpu_peak_mem / GB:.3f} GB\t"
-        #         f"prefill latency: {prefill_latency:.3f} s\t"
-        #         f"prefill throughput: {prefill_throughput:.3f} token/s\n"
-        #         f"decode latency: {decode_latency:.3f} s\t"
-        #         f"decode throughput: {decode_throughput:.3f} token/s\n"
-        #         f"total latency: {total_latency:.3f} s\t"
-        #         f"total throughput: {total_throughput:.3f} token/s")
-        # print(log_str)
+        prefill_latency = costs[0]
+        prefill_throughput = num_prompts * max_prompt_len / prefill_latency
+        if cut_gen_len:  # project latency of cut_gen_len to gen_len
+            decode_latency = project_decode_latency(costs, max_prompt_len, gen_len)
+        else:
+            decode_latency = sum(costs[1:])
+        decode_throughput = num_prompts * (gen_len - 1) / max(decode_latency, 1e-10)
+        num_generated_tokens = num_prompts * gen_len
+        total_latency = prefill_latency + decode_latency
+        total_throughput = num_generated_tokens / total_latency
+        _, gpu_peak_mem = gpu.mem_stats()
+        _, cpu_peak_mem = cpu.mem_stats()
+        log_str = (f"model size: {opt_config.model_bytes()/GB:.3f} GB\t"
+                f"cache size: {cache_size/GB:.3f} GB\t"
+                f"hidden size (p): {hidden_size/GB:.3f} GB\n"
+                f"peak gpu mem: {gpu_peak_mem / GB:.3f} GB\t"
+                f"prefill latency: {prefill_latency:.3f} s\t"
+                f"prefill throughput: {prefill_throughput:.3f} token/s\n"
+                f"decode latency: {decode_latency:.3f} s\t"
+                f"decode throughput: {decode_throughput:.3f} token/s\n"
+                f"total latency: {total_latency:.3f} s\t"
+                f"total throughput: {total_throughput:.3f} token/s")
+        print(log_str)
 
-        # if DUMMY_WEIGHT not in args.path:
-        #     outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
-        #     show_str = "Outputs:\n" + 70 * '-' + "\n"
-        #     for i in range(0, len(outputs)):
-        #         show_str += f"{i}: {outputs[i]}\n"
-        #         show_str += "-" * 70 + "\n"
-        #     if args.verbose >= 2:
-        #         print(show_str)
+        if DUMMY_WEIGHT not in args.path:
+            outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
+            show_str = "Outputs:\n" + 70 * '-' + "\n"
+            for i in range(0, len(outputs)):
+                show_str += f"{i}: {outputs[i]}\n"
+                show_str += "-" * 70 + "\n"
+            if args.verbose >= 2:
+                print(show_str)
 
-        # print("=" * 50)  
-        # model.finish_one_query(True)
+        print("=" * 50)  
+        model.finish_one_query(True)
 
     finally:
         env.close_copy_threads()
@@ -1540,7 +1522,7 @@ def add_parser_arguments(parser):
     parser.add_argument("--offload-dir", type=str, default="/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/lqy/llm_infer/FlexLLMGen/flexllmgen_offload_dir",
         help="The directory to offload tensors. ")
     parser.add_argument("--prompt-len", type=int, default=512)
-    parser.add_argument("--gen-len", type=int, default=5)
+    parser.add_argument("--gen-len", type=int, default=32)
     parser.add_argument("--cut-gen-len", type=int,
         help="Cut generation length for fast debugging.")
     parser.add_argument("--debug-mode", type=str,
