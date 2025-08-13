@@ -35,6 +35,11 @@ class Task:
     common_prefix_len: int # 每个请求的prefix长度
     common_prefix_kv_ptr: List[List[CachePointer]] # shape(prefix_len, num_layers)
 
+    ### for lsh, dict: prefix_id, max_common_len
+    matched_prefix: dict
+    prefix_only: bool
+    new_prefix_id: int
+
 @dataclasses.dataclass(frozen=True)
 class ExecutionEnv:
     """Hardware environment."""

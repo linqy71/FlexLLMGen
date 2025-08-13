@@ -21,7 +21,7 @@ class LSH{
         void fastfill(int layer_id, int request_id, torch::Tensor hash_code_pt);
         void copy(torch::Tensor query_pt);
         void clear();
-        void batch_retrieve_multi(int layer_id, torch::Tensor query_pt, int num_queries, torch::Tensor results_pt, torch::Tensor nnz_pt);
+        void batch_retrieve_multi(int layer_id, torch::Tensor query_pt, int num_queries, torch::Tensor results_pt, torch::Tensor nnz_pt, int max_index);
         void batch_retrieve(int layer_id, torch::Tensor query_pt, torch::Tensor results_pt, torch::Tensor nnz_pt);
         torch::Tensor get_table_start(int layer_id);
         torch::Tensor get_table_end(int layer_id);
@@ -43,5 +43,5 @@ class LSH{
         std::vector<int*> table_end;
         std::vector<int*> table;
         int retrieve(int layer_id, int head_id, const int* __restrict query, int* __restrict results);
-        int retrieve_multi(int layer_id, int head_id, int* __restrict query, int num_queries, int* __restrict results);
+        int retrieve_multi(int layer_id, int head_id, int* __restrict query, int num_queries, int* __restrict results, int max_index);
 };

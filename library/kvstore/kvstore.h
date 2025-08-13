@@ -48,6 +48,7 @@ class KVStore{
         DTYPE* queried_value;
         
         std::string store_path;
+        bool persisted;
 
         std::unordered_map<uint64_t, uint64_t>* kv_meta; // metaid -> pos
 };

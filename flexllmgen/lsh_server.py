@@ -2,14 +2,12 @@ import torch
 from lsh import LSH
 from group_kvstore import GroupKVStore 
 
-from flexllmgen.pytorch_backend import (TorchDevice, TorchDisk, TorchLink,
-    TorchMixedDevice, DeviceType, general_copy, fix_recursive_import)
-
 
 class LSHServer:
 
     def __init__(self,
         config,
+        num_layers: int,
         K: int = 10, 
         L: int = 150, 
         batch_size: int = 1,
@@ -20,7 +18,7 @@ class LSHServer:
         self.config = config  ### OptConfig or LlamaConfig
         self.K = K
         self.L = L
-        self.num_layers = config.num_hidden_layers
+        self.num_layers = num_layers
         self.batch_size = batch_size
         if "opt" in config.name:
               self.num_key_value_heads = config.n_head
@@ -43,7 +41,8 @@ class LSHServer:
             device=self.device,
             dtype=self.dtype
         ) for _ in range(self.num_layers)]
-        
+        self.current_prefix_id = 0 ### 0 means nothing
+        self.prefix_to_server = {} ### record lsh_retriever and kv_store here
         self.lsh_retriever = LSH()
         self.lsh_retriever.alloc(self.K, self.L, self.num_layers, self.num_attention_heads, self.num_key_value_heads, self.batch_size, self.max_length)
         self.kv_store = GroupKVStore()
@@ -56,6 +55,8 @@ class LSHServer:
         ### store lsh query results; TODO: adjust shape to (b * num_key_value_heads,)
         self.nnz = torch.zeros((self.batch_size * self.num_attention_heads,)).to(torch.int32)
         self.results_lsh_cpu = torch.zeros((self.batch_size * self.num_attention_heads, self.max_length)).to(torch.int32)
+    
+        self.query_results = [(torch.zeros_like(self.nnz), torch.zeros_like(self.results_lsh_cpu)) for _ in range(self.num_layers)]
     
         ### store hashcode of queries during prefill
         ### use pinned memory to interact with cpp codes
@@ -74,9 +75,10 @@ class LSHServer:
     
 
     ### alloc buffer for offloaded tokens, seq_len is # of offloaded tokens
+    ### called in offload_to_lsh()
     def alloc_buffer(self, seq_len):
-        self.sorted_hash_values_buffer =  torch.zeros((self.num_key_value_heads, self.L, seq_len), dtype=torch.int16, device="cpu")
-        self.sorted_hash_indices_buffer =  torch.zeros((self.num_key_value_heads, self.L, seq_len), dtype=torch.int32, device="cpu")
+        self.sorted_hash_values_buffer = torch.zeros((self.num_key_value_heads, self.L, seq_len), dtype=torch.int16, device="cpu")
+        self.sorted_hash_indices_buffer = torch.zeros((self.num_key_value_heads, self.L, seq_len), dtype=torch.int32, device="cpu")
     
     ### offload key and value to lsh
     ### layer_idx: current layer index
@@ -87,11 +89,12 @@ class LSHServer:
         layer_idx:int,
         request_id: int,
         seq_len:int,
+        prefix_id: int,
         key_states: torch.Tensor,
         value_states: torch.Tensor):
-      
+
         ### important : key_states, shape: len, kv_h, head_dim
-        offload_key = key_states[:seq_len].transpose(0,1).contiguous() ## shape: len, head_dim, #kvh
+        offload_key = key_states[:seq_len].transpose(0,1).contiguous() ## shape: #kvh, len, dim
         offload_value = value_states[:seq_len].transpose(0,1).contiguous()
         
         avg_k = offload_key.mean(dim=1, keepdim=True)
@@ -112,6 +115,10 @@ class LSHServer:
         hash_code = hash_code.transpose(1,2).contiguous().to(torch.int16)
         self.hash_code_buffer[:,:,:offload_len].copy_(hash_code)
 
+        print("gpu ---> cpu")
+        offload_key = offload_key.cpu()
+        offload_value = offload_value.cpu()
+        
         ### offload to kv store
         self.kv_store.fill(layer_idx, offload_key, offload_value)
         
@@ -139,22 +146,35 @@ class LSHServer:
                     self.sorted_hash_values_buffer, 
                     self.sorted_hash_indices_buffer)
 
+    def record_query_results(self, layer_idx):
+        nnz, res = self.query_results[layer_idx]
+        nnz.copy_(self.nnz)
+        res.copy_(self.results_lsh_cpu)
+
+    def get_imp_idx(self, layer_idx):
+        nnz, res = self.query_results[layer_idx]
+        for head_id, n in enumerate(nnz):
+            res[head_id, n:] = -1
+        max_len = nnz.max()
+        
+        return res[:, :max_len]
+
     ### get important kv by queries through lsh
     ### req_id: requst id inside a batch
     ### layer_idx: layer index
     ### query_states: queries shape: q_len * #attn_heads * head_dim
-    ### q_i: index of accesses to current prefix
+    ### prefix_id: to query kv from which prefix
+    ### max_index: indices in query results cannot exceed this value
     ### returns keys and values of important tokens
     ### Note that!! the kvs are only valid before next get_kv(), needing copy after each get_kv()
     def get_kv(self, 
         req_id: int, 
         layer_idx: int, 
         query_states: torch.Tensor,
-        needs_persist: bool, 
-        q_i: int = 0):
-        if not self.offloaded:
+        prefix_id: int,
+        max_index: int):
+        if not self.offloaded or prefix_id == 0:
             return None, None
-        
         q_len, _, _ = query_states.shape
         query_states = query_states.transpose(0,1) # num_heads, q_len, head_dim
         ### compute hashcode of queries
@@ -165,84 +185,131 @@ class LSHServer:
         q_hashcode = torch.mv(q_hashcode, self.binary_pack).int()
         q_hashcode = q_hashcode.reshape(self.num_attention_heads, q_len, self.L)
         
-        if needs_persist:
-            self.query_group_strategy(layer_idx, q_hashcode, self.offload_len)
-
-        self.nnz.zero_()
-        self.results_lsh_cpu.zero_()
-        
+        # if needs_persist:
+        #     ### if needs persist, the lsh is newly built, no max_index concern
+        #     self.query_group_strategy(layer_idx, q_hashcode, self.offload_len, prefix_id=prefix_id)
+        # print(q_hashcode)
         self.pinned_hashcode_multi[...,:q_len,:].copy_(q_hashcode)
         ### get results from lsh hashtables
-        self.lsh_retriever.batch_retrieve_multi(layer_idx, self.pinned_hashcode_multi, q_len ,self.results_lsh_cpu, self.nnz)
+        self.lsh_retriever.batch_retrieve_multi(layer_idx, self.pinned_hashcode_multi, q_len ,self.results_lsh_cpu, self.nnz, max_index)
+        print(self.nnz)
+        self.record_query_results(layer_idx)
         ### collect key value from kv_store
-        self.kv_store.collect_queried_key_value(0, layer_idx, self.results_lsh_cpu, self.nnz)
-        queried_key = self.kv_server.get_queried_key_cache()
-        queried_value = self.kv_server.get_queried_value_cache()
+        self.kv_store.collect_queried_key_value(prefix_id, layer_idx, self.results_lsh_cpu, self.nnz)
+        ### shape : n_head, max_length, head_dim
+        res_len = self.nnz.max().data
+        queried_key = self.kv_store.get_queried_key_cache()
+        queried_value = self.kv_store.get_queried_value_cache()
         avg_k = self.avg_k[layer_idx][req_id].to("cpu")
         queried_key = queried_key + avg_k
+        queried_key = queried_key.transpose(0,1).contiguous()
+        queried_value = queried_value.transpose(0,1).contiguous()
 
-        return queried_key, queried_value
-
+        return queried_key[:res_len], queried_value[:res_len]
 
     ### for debug...
     ### get full kv from kv_store by generating indices of range(offloaded_len)
-    ### testing, set prefix_id=0
-    def get_full_kv(self, req_id, layer_idx, query_states):
+    def get_full_kv(self, req_id, layer_idx, query_states, prefix_id):
         if not self.offloaded:
             return None, None
         ### generating indices covering offloaded_len
         for head_id in range(self.num_key_value_heads):
             self.nnz[head_id] = self.offload_len
-            self.results_lsh_cpu[head_id] = torch.range(self.offload_len)
+            self.results_lsh_cpu[head_id][:self.offload_len].copy_(torch.arange(self.offload_len))
         
-        self.kv_store.collect_queried_key_value(0, layer_idx, self.results_lsh_cpu, self.nnz)
+        self.kv_store.collect_queried_key_value(prefix_id, layer_idx, self.results_lsh_cpu, self.nnz)
         queried_key = self.kv_store.get_queried_key_cache()
         queried_value = self.kv_store.get_queried_value_cache()
         avg_k = self.avg_k[layer_idx][req_id].to("cpu")
         queried_key = queried_key + avg_k
+        res_len, _ = self.nnz.max()
+        # queried_key = queried_key.transpose(0,1).continuous()
+        # queried_value = queried_value.transpose(0,1).continuous()
 
-        return queried_key, queried_value
+        return queried_key[:res_len], queried_value[:res_len]
 
-    ### arrange tokens into groups according to first req's query results
-    def query_group_strategy(self, layer_idx, q_hashcode, offload_len):
-        _, q_len, _ = q_hashcode.shape
+    def query_based_persist(self, prefix_id):
+        offload_len = self.offload_len
         
-        # To record token_ids for each head
-        new_token_orders = [[] for _ in range(self.num_key_value_heads)]
-        seen_token_ids = [set() for _ in range(self.num_key_value_heads)]
-        
-        ### query results per token query
-        for i in range(q_len):
-            self.pinned_hashcode.copy_(q_hashcode[..., i, :])
-            self.lsh_retriever.batch_retrieve(layer_idx, self.pinned_hashcode, self.results_lsh_cpu, self.nnz)
-            
+        for layer_id in range(self.num_layers):
+            # To record token_ids for each head
+            new_token_orders = [[] for _ in range(self.num_key_value_heads)]
+            seen_token_ids = [set() for _ in range(self.num_key_value_heads)]
+            nnz, res = self.query_results[layer_id]
             for head_id in range(self.num_key_value_heads):
-                n = self.nnz[head_id].item()
+                n = nnz[head_id].item()
                 if n == 0:
                     continue
-                ind = self.results_lsh_cpu[head_id][:n].view(-1).tolist()
-                
+                ind = res[head_id][:n].view(-1).tolist()
                 # Add new unseen tokens to the order
                 for token_id in ind:
                     if token_id not in seen_token_ids[head_id]:
                         seen_token_ids[head_id].add(token_id)
                         new_token_orders[head_id].append(token_id)
-
-            self.results_lsh_cpu.zero_()
-            self.nnz.zero_()
+            # Add remaining tokens (never seen) in ascending order
+            all_token_ids = set(range(offload_len))
+            for head_id in range(self.num_key_value_heads):
+                remaining_ids = sorted(all_token_ids - seen_token_ids[head_id])
+                # print(len(remaining_ids))
+                new_token_orders[head_id].extend(remaining_ids)
+            
+            self.kv_store.write_to_storage("/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/lqy/llm_infer/tmp_store",
+                                        prefix_id, layer_id, new_token_orders)
         
-        # Add remaining tokens (never seen) in ascending order
-        all_token_ids = set(range(offload_len))
-        for head_id in range(self.num_key_value_heads):
-            remaining_ids = sorted(all_token_ids - seen_token_ids[head_id])
-            # print(len(remaining_ids))
-            new_token_orders[head_id].extend(remaining_ids)
 
-        # Save strategy
-        self.persist_strategy[layer_idx] = new_token_orders
+    ### arrange tokens into groups according to first req's query results
+    # def query_group_strategy(self, layer_idx, q_hashcode, offload_len, prefix_id):
+    #     _, q_len, _ = q_hashcode.shape
         
-        self.kv_store.write_to_storage("/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/lqy/llm_infer/tmp_store",
-                                        0, layer_idx, new_token_orders)
+    #     # To record token_ids for each head
+    #     new_token_orders = [[] for _ in range(self.num_key_value_heads)]
+    #     seen_token_ids = [set() for _ in range(self.num_key_value_heads)]
+        
+    #     ### query results per token query
+    #     for i in range(q_len):
+    #         self.pinned_hashcode.copy_(q_hashcode[..., i, :])
+    #         self.lsh_retriever.batch_retrieve(layer_idx, self.pinned_hashcode, self.results_lsh_cpu, self.nnz)
+            
+    #         for head_id in range(self.num_key_value_heads):
+    #             n = self.nnz[head_id].item()
+    #             if n == 0:
+    #                 continue
+    #             ind = self.results_lsh_cpu[head_id][:n].view(-1).tolist()
+                
+    #             # Add new unseen tokens to the order
+    #             for token_id in ind:
+    #                 if token_id not in seen_token_ids[head_id]:
+    #                     seen_token_ids[head_id].add(token_id)
+    #                     new_token_orders[head_id].append(token_id)
+
+    #         self.results_lsh_cpu.zero_()
+    #         self.nnz.zero_()
+    #     # Add remaining tokens (never seen) in ascending order
+    #     all_token_ids = set(range(offload_len))
+    #     for head_id in range(self.num_key_value_heads):
+    #         remaining_ids = sorted(all_token_ids - seen_token_ids[head_id])
+    #         # print(len(remaining_ids))
+    #         new_token_orders[head_id].extend(remaining_ids)
+
+    #     # Save strategy
+    #     self.persist_strategy[layer_idx] = new_token_orders
+        
+    #     self.kv_store.write_to_storage("/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/lqy/llm_infer/tmp_store",
+    #                                     prefix_id, layer_idx, new_token_orders)
+
+    def reset(self):
+        assert(self.current_prefix_id != 0)
+        if self.current_prefix_id not in self.prefix_to_server:
+            self.prefix_to_server[self.current_prefix_id] = (self.lsh_retriever, self.kv_store)
+        
+        self.lsh_retriever = LSH()
+        self.lsh_retriever.alloc(self.K, self.L, self.num_layers, self.num_attention_heads, self.num_key_value_heads, self.batch_size, self.max_length)
+        self.kv_store = GroupKVStore()
+        self.kv_store.alloc(self.num_layers, self.num_attention_heads, self.num_key_value_heads, self.head_dim, self.max_length)
+        
+        self.nnz.zero_()
+        self.results_lsh_cpu.zero_()
+        self.hash_code_buffer.zero_()
 
     ### TODO ----- handle recover
     # def persist_kv_store_meta(self, prefix_id):

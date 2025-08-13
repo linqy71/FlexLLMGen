@@ -14,6 +14,7 @@
 KVStore::KVStore(){
     this->allocated = false;
     this->kv_meta = new std::unordered_map<uint64_t, uint64_t>();
+    this->persisted = false;
 }
 
 KVStore::~KVStore(){
@@ -175,6 +176,7 @@ void KVStore::write_to_storage(
     }
     file.flush();
     file.close();
+    this->persisted = true;
 }
 
 
@@ -195,6 +197,26 @@ void KVStore::collect_queried_key_value(
     std::vector<std::pair<uint64_t, int>> content; // offset, length in bytes
     size_t entry_size = 2 * this->head_dim * sizeof(DTYPE);
 
+    //handle persisted=false case; collect kv from memory
+    if (this->persisted == false) {
+      int stride = this->max_length * this->head_dim;
+      DTYPE* key = this->key_cache[layer_id];
+      DTYPE* value = this->value_cache[layer_id];
+      for (int i = 0; i < this->num_key_value_heads; i++) {
+        int num_indices = nnz[i];
+        auto queried_key_ptr = this->queried_key + i * stride;
+        auto queried_value_ptr = this->queried_value + i * stride;
+        auto key_ptr = key + i * stride;
+        auto value_ptr = value + i * stride;
+        for (int j = 0; j < num_indices; j++) {
+          auto cur_ind = ind[j];
+          memcpy(queried_key_ptr + j * this->head_dim, key_ptr + cur_ind * this->head_dim, this->head_dim * sizeof(DTYPE));
+          memcpy(queried_value_ptr + j * this->head_dim, value_ptr + cur_ind * this->head_dim, this->head_dim * sizeof(DTYPE));
+        }
+      }
+      return;
+    }
+    
     for(int i = 0; i < this->num_key_value_heads; i++){
         std::set<uint64_t> queried_meta_offset;
 
@@ -348,14 +370,14 @@ void KVStore::load_key_value(
 
 torch::Tensor KVStore::to_tensor(DTYPE* start, int length){
     // auto options = torch::TensorOptions().dtype(torch::kFloat32);
-    auto options = torch::TensorOptions().dtype(torch::kBFloat16);
+    auto options = torch::TensorOptions().dtype(torch::kFloat16);
     torch::Tensor tensor = torch::from_blob(start, {length, this->head_dim}, options);
     return tensor;
 }
 
 torch::Tensor KVStore::get_queried_key_cache()
 {
-    auto options = torch::TensorOptions().dtype(torch::kBFloat16);
+    auto options = torch::TensorOptions().dtype(torch::kFloat16);
     // auto options = torch::TensorOptions().dtype(torch::kFloat32);
     torch::Tensor tensor = torch::from_blob(this->queried_key, {this->num_key_value_heads, this->max_length, this->head_dim}, options);
     return tensor;
@@ -363,7 +385,7 @@ torch::Tensor KVStore::get_queried_key_cache()
 
 torch::Tensor KVStore::get_queried_value_cache()
 {
-    auto options = torch::TensorOptions().dtype(torch::kBFloat16);
+    auto options = torch::TensorOptions().dtype(torch::kFloat16);
     // auto options = torch::TensorOptions().dtype(torch::kFloat32);
     torch::Tensor tensor = torch::from_blob(this->queried_value, {this->num_key_value_heads, this->max_length, this->head_dim}, options);
     return tensor;

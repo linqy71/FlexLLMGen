@@ -2,6 +2,7 @@ import dataclasses
 from typing import List,Dict
 import unittest
 from itertools import count
+from collections import defaultdict
 
 """ 
 maintain token's longest common prefix
@@ -37,9 +38,10 @@ class RadixToken:
         return next(cls.token_count)
 
 class RadixTreeNode:
-    def __init__(self,tokens:List[RadixToken], mapping_list=None):
+    def __init__(self, prefix_id, tokens:List[RadixToken], mapping_list=None):
         # tokens始终保留原来的顺序,重排只需要修改mapping_list,要获取重排后的顺序使用mapping_list
         # 即 tokens[mapping_list[i]] 表示按照重要性排序后的, 第i个token
+        self.prefix_id = prefix_id
         self.tokens = tokens
         if mapping_list is not None:
             self.mapping_list = mapping_list
@@ -49,7 +51,7 @@ class RadixTreeNode:
         self.children:Dict[int,RadixTreeNode] = {} 
     
     def __repr__(self):
-        return f"Node(token={self.tokens}, mapping_list={self.mapping_list})"
+        return f"Node(prefix_id={self.prefix_id}, token={self.tokens}, mapping_list={self.mapping_list})"
     
     def sort_by_importance(self):
         self.mapping_list.sort(key=lambda i: self.tokens[i].importance, reverse=True)
@@ -58,19 +60,20 @@ class RadixTreeNode:
         return [self.tokens[i] for i in self.mapping_list]
     
     @classmethod
-    def create_from_token_id(cls,tokens:List[int], kv_ptr=None):
+    def create_from_token_id(cls, prefix_id, tokens:List[int], kv_ptr=None):
         if kv_ptr is None:
             tokens = [RadixToken(token_id=x) for x in tokens]
         else:
             tokens = [RadixToken(token_id=tokens[i], kv_ptr=kv_ptr[i]) for i in range(len(tokens))]
-        return cls(tokens)
+        return cls(prefix_id, tokens)
 
 
     
 class RadixTree:
     def __init__(self):
         # root is an empty node
-        self.root = RadixTreeNode(tokens=[])
+        self.root = RadixTreeNode(prefix_id=0, tokens=[])
+        self.max_prefix_id = 0
     
     # 计算两个序列的最长公共前缀长度
     @staticmethod
@@ -83,11 +86,14 @@ class RadixTree:
     
     # 插入新的序列,同时插入新节点的kv_ptr
     # kv_ptr:List[List[CachePointer]]  kv_ptr[i]表示NR中第i个token在每一层的缓存的位置
+    # 返回new_prefix_id, 表示需要将新的prefix映射到lsh
     def insert(self, key:List[int], kv_ptr = None):
         if len(key) == 0:
             return
         current = self.root
         remaining = key
+
+        new_prefix_id = 0
 
         while remaining:
             next_token = remaining[0]
@@ -99,22 +105,27 @@ class RadixTree:
                     remaining = remaining[common_len:]
                     current = child
                 else:
-                    # split node
-                    new_node = RadixTreeNode(tokens=child.tokens[:common_len])
+                    # split node, remaining the same prefix_id
+                    new_node = RadixTreeNode(prefix_id=child.prefix_id, tokens=child.tokens[:common_len])
                     new_node.mapping_list = [x for x in child.mapping_list if x < common_len]
                     
                     child.tokens = child.tokens[common_len:]
                     child.mapping_list = [x-common_len for x in child.mapping_list if x >= common_len]
 
                     current.children[next_token] = new_node
-                    new_node.children[child.tokens[0]] = child
+                    new_node.children[child.tokens[0].token_id] = child
 
                     remaining = remaining[common_len:]
                     current = new_node
             else:
-                new_node = RadixTreeNode.create_from_token_id(remaining, kv_ptr)
+                self.max_prefix_id += 1
+                new_prefix_id = self.max_prefix_id
+                new_node = RadixTreeNode.create_from_token_id(self.max_prefix_id, remaining, kv_ptr)
                 current.children[next_token] = new_node
                 break
+
+        return new_prefix_id
+
 
     # 查询最长公共前缀，返回最长公共前缀的kv_ptr
     def search(self, key:List[int]):
@@ -137,6 +148,28 @@ class RadixTree:
                 break
         # type = List[List[CachePointer]]
         return ans
+
+    # 查询最长公共前缀，返回最长公共前缀的prefix_id和对应prefix长度
+    # 每个prefix_id代表对应的tokens被映射到一个LSH，每个prefix_id可能包含多个node
+    # 每个prefix_id对应的max_common_len用于确保在LSH中查询时不会查询到超过max_common_len的token
+    def match(self, key:List[int]):
+        current = self.root
+        remaining = key
+        matched_prefix = defaultdict(int)
+        while remaining:
+            next_token = remaining[0]
+            if next_token in current.children:
+                child = current.children[next_token]
+                common_len = self.common_prefix_length(remaining,child.tokens)
+                matched_prefix[child.prefix_id] += common_len
+                if common_len != len(child.tokens):
+                    break
+                remaining = remaining[common_len:]
+                current = child
+            else:
+                break
+        # type = List[List[CachePointer]]
+        return matched_prefix
 
     def delete(self, key:List):
         pass
@@ -178,6 +211,10 @@ if __name__ == "__main__":
 
     prefix_kv_ptr = []
     inputs=[[1,5,5],[1,5,7,2]]
+    # for seq in inputs:
+    #     prefix_kv_ptr.append(tree.search(seq))
+    # print(prefix_kv_ptr)
+
     for seq in inputs:
-        prefix_kv_ptr.append(tree.search(seq))
-    print(prefix_kv_ptr)
+        print(tree.match(seq))
+    

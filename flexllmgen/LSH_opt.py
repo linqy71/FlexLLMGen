@@ -17,7 +17,7 @@ from transformers import AutoTokenizer
 
 from flexllmgen.compression import CompressionConfig
 from flexllmgen.opt_config import OptConfig, get_opt_config, download_opt_weights
-from flexllmgen.pytorch_backend import (TorchDevice, TorchDisk, TorchLink,
+from flexllmgen.pytorch_backend_lsh import (TorchDevice, TorchDisk, TorchLink,
     TorchMixedDevice, DeviceType, general_copy, fix_recursive_import)
 from flexllmgen.timer import timers
 from flexllmgen.utils import (Task, ExecutionEnv, GB, T, ValueHolder,
@@ -26,10 +26,12 @@ from flexllmgen.utils import (Task, ExecutionEnv, GB, T, ValueHolder,
     read_benchmark_log)
 
 from flexllmgen.metadata_manage import RadixTree, RadixTreeNode, RadixToken, CachePointer
-from flexllmgen.kv_cache_manage import ChunkPool
+from flexllmgen.lsh_server import LSHServer
 fix_recursive_import()
 
 DUMMY_WEIGHT = "_DUMMY_"  # Use dummy weights for benchmark purposes
+
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
 import logging
 
@@ -161,7 +163,7 @@ class InputEmbed:
     def set_task(self, task):
         self.task = task
 
-    def set_chunk_pool(self, chunk_pool):
+    def set_kv_server(self, kv_server):
         pass
 
     def init_weight(self, weight_home, path):
@@ -228,7 +230,7 @@ class OutputEmbed:
     def set_task(self, task):
         self.task = task
 
-    def set_chunk_pool(self, chunk_pool):
+    def set_kv_server(self, kv_server):
         pass
     
     def init_weight(self, weight_home, path):
@@ -302,8 +304,8 @@ class SelfAttention:
     def set_task(self, task):
         self.task = task
     
-    def set_chunk_pool(self, chunk_pool):
-        self.chunk_pool = chunk_pool
+    def set_kv_server(self, kv_server):
+        self.kv_server = kv_server
 
     def init_weight(self, weight_home, path):
         h, dtype = (self.config.input_dim, self.config.dtype)
@@ -362,30 +364,34 @@ class SelfAttention:
         cache = device.init_cache_one_gpu_batch(self.config, self.task, self.policy, max_prompt_len, max_gen_len)
         cache_home.store(cache)
 
-    def load_probe_cache(self, cache_read_buf, i, j):
-        if self.policy.compress_cache:
-            dst = self.attention_compute.compressed_device
-        else:
-            dst = self.attention_compute
-        # 首先确定shape,分配空间,然后从chunk_pool中获取数据
+    def alloc_prefix_kv(self, matched_prefix):
         n_head = self.config.n_head
-        n_probe_head = 3
         batch_size = self.policy.gpu_batch_size
         head_dim = self.config.input_dim // n_head
-        
-        probe_cache_shape = (self.task.common_prefix_len, batch_size * n_probe_head, head_dim)
+
+        total_common_len = sum(matched_prefix.values())
+        dst = self.attention_compute
+        shape = (total_common_len, batch_size * n_head, head_dim)
 
         pin_memory = True if dst.device_type == DeviceType.CPU else False
-        k_cache = dst.allocate(probe_cache_shape, np.float16, pin_memory=pin_memory)
 
-        # 第0个batch的第j个token的第i层的kv_ptr
-        for t_idx in range(self.task.common_prefix_len):
-            kv_ptr = self.task.common_prefix_kv_ptr[t_idx][j]
-            chunk_id, offset = kv_ptr.chunk_id, kv_ptr.offset
-            logger.info(f"In load_probe_cache token:{t_idx} layer:{j}: kv_ptr = {kv_ptr}")
-            self.chunk_pool.get_probe_cache(k_cache, t_idx, chunk_id, offset)
-        
-        cache_read_buf.store((k_cache,True))
+        k_cache = dst.allocate(shape, np.float16, pin_memory=pin_memory)
+        v_cache = dst.allocate(shape, np.float16, pin_memory=pin_memory)
+
+        return k_cache, v_cache
+    
+    ### fetch important kv from lsh server , copy after each get_kv()
+    ### todo: manage the shape of k_cache_data
+    ### dst: TorchTensor, src: torch.Tensor
+    ### copy src[0:length] to dst[start:start+length]
+    def copy_prefix(self, dst, src, start):
+        ### copy
+        assert(dst.device.device_type == DeviceType.CPU or DeviceType.CUDA)
+        length = src.shape[0]
+        dst = dst.data[start: start + length]
+        dst.copy_(src, non_blocking=False)
+        return length
+
 
     def get_prefix_kv(self, imp_token_idx, layer):
         n_head = self.config.n_head
@@ -411,8 +417,6 @@ class SelfAttention:
 
     def load_cache(self, cache_home, cache_read_buf, i, j):
         if i == 0:  # prefill, no cache
-            if self.task.common_prefix_len > 0:
-                self.load_probe_cache(cache_read_buf, i, j)
             return
 
         k_home, v_home = cache_home.val
@@ -478,15 +482,23 @@ class SelfAttention:
         else:
             raise ValueError(f"Invalid path: {path}")
 
+    ### prefix_only: instead of store to cache_home, store by lsh_server
+    ### not prefix_only: store important_kv+non_prefix_kv to cache_home
     def store_cache(self, cache_home, cache_write_buf, i):
         # shape: (s, b * n_head, head_dim)
         k_home, v_home = cache_home.val
         k_new, v_new = cache_write_buf.pop()
+        seq_len, _, _ = k_new.shape
+
+        if self.task.prefix_only:
+            print(f"offloading prefix {self.task.new_prefix_id} to LSH")
+            self.kv_server.offload_to_lsh(self.layer_id, 0, seq_len, self.task.new_prefix_id, k_new.data, v_new.data)
+            return
 
         if i == self.task.gen_len - 1:  # last token, no need to store cache
             return
 
-        if i == 0:  # prefill
+        if i == 0:  # prefix prefill
             # prefill阶段整个cache存入
             indices = (slice(0, k_new.shape[0]),
                        slice(0, k_new.shape[1]))
@@ -522,45 +534,55 @@ class SelfAttention:
 
         if i == 0:  # prefill
             mask, donate[1] = attention_mask.val.smart_copy(self.compute)
-            if self.task.common_prefix_len > 0:
-                (k_cache, donate[12]) = cache_read_buf.pop()
+            if not self.task.prefix_only:
+                ### should get important kv first
+                matched_prefix = self.task.matched_prefix
+                ### alloc common_prefix_len space, not n_imp space
+                k_cache, v_cache = self.alloc_prefix_kv(matched_prefix)
 
-                imp_token_idx = self.compute.get_important_token_idx(h, mask, w_q, b_q, 
-                    w_ln, b_ln, n_head, k_cache, donate, self.policy.compress_cache, 
-                    self.policy.comp_cache_config, self.policy.important_ratio)
-                
-                imp_token_idx = imp_token_idx[0] # 解开batch维度
-
-                logger.info(f"Get Important token indices: {imp_token_idx}")
-
-                k_cache, v_cache = self.get_prefix_kv(imp_token_idx, j)
-
-                logger.info(f"Prefix KV cache shape: {k_cache}, {v_cache}, common_prefix_len: {self.task.common_prefix_len}")
-                logger.info(f"Prefix KV cache: {k_cache.data[:,:3,:10]}")
-
-                h, new_k_cache, new_v_cache = self.compute.mha_prefill(h, mask, w_q, b_q,
+                cur_pos = 0
+                for prefix_id, max_common_len in matched_prefix.items():
+                    ## j is layer_id
+                    ## get query_states from compute
+                    query_states = self.compute.get_suffix_query_states(h, mask, w_q, b_q, 
+                        w_ln, b_ln, n_head, k_cache, donate, self.policy.compress_cache, 
+                        self.policy.comp_cache_config, matched_prefix)
+                    k_cache_data, v_cache_data = self.kv_server.get_kv(0, self.layer_id, query_states, prefix_id, max_common_len)
+                    # print(k_cache_data)
+                    
+                    # k_cache_data, v_cache_data = self.kv_server.get_full_kv(0, j, query_states, prefix_id)
+                    length = self.copy_prefix(k_cache, k_cache_data, cur_pos)
+                    length = self.copy_prefix(v_cache, v_cache_data, cur_pos)
+                    cur_pos += length
+                n_imp = cur_pos
+                print(f"get {n_imp} important tokens")
+                ### kv_server的layer统一用layer_id管理
+                imp_token_idx = self.kv_server.get_imp_idx(self.layer_id)
+                h, new_k_cache, new_v_cache = self.compute.mha_prefill_with_kv(h, mask, w_q, b_q,
                     w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln, n_head, k_cache, v_cache, donate,
-                    self.policy.compress_cache, self.policy.comp_cache_config, self.task.common_prefix_len, imp_token_idx)
-                
+                    self.policy.compress_cache, self.policy.comp_cache_config, matched_prefix, 
+                    imp_token_idx, self.kv_server.K, self.kv_server.L)
                 self.prefill_cache_shape = new_k_cache.shape[0]
                 logger.info(f"SelfAttention Prefix cache shape: {self.prefill_cache_shape}")
             else:
+                ### only compute prefix kv
                 h, new_k_cache, new_v_cache = self.compute.mha(h, mask, w_q, b_q,
                     w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln, n_head, donate,
-                    self.policy.compress_cache, self.policy.comp_cache_config)
+                    self.policy.compress_cache, self.policy.comp_cache_config, self.kv_server.K, self.kv_server.L)
                 
                 self.prefill_cache_shape = self.task.prompt_len
                 logger.info(f"SelfAttention Prefix cache shape: {self.prefill_cache_shape}")
             # 存入的cache shape可能是(s, b * n_head, head_dim) 也可能是 (n_imp + s - common_prefix_len[0], ..., ...)
             cache_write_buf.store((new_k_cache, new_v_cache))
         else:  # decoding
+            imp_token_idx = self.kv_server.get_imp_idx(self.layer_id)
             mask, donate[1] = attention_mask.val.smart_copy(self.attention_compute)
             (k_cache, donate[12]), (v_cache, donate[13]) = cache_read_buf.pop()
             logger.info(f"SelfAttention decoding prefill_cache_shape:{self.prefill_cache_shape}, i:{i}")
             h, new_k_cache, new_v_cache = self.compute.mha_gen(h, mask, w_q,
                 b_q, w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln, n_head,
                 k_cache, v_cache, donate, self.policy.attn_sparsity,
-                self.policy.compress_cache, self.policy.comp_cache_config,pos=self.prefill_cache_shape + i)
+                self.policy.compress_cache, self.policy.comp_cache_config,pos=self.prefill_cache_shape + i, imp_token_idx=imp_token_idx)
             cache_write_buf.store((new_k_cache, new_v_cache))
 
         hidden.val = h
@@ -581,7 +603,7 @@ class MLP:
     def set_task(self, task):
         self.task = task
     
-    def set_chunk_pool(self, chunk_pool):
+    def set_kv_server(self, kv_server):
         pass
 
     def init_weight(self, weight_home, path):
@@ -654,9 +676,9 @@ class TransformerLayer:
         self.attention.set_task(task)
         self.mlp.set_task(task)
     
-    def set_chunk_pool(self, chunk_pool):
-        self.attention.set_chunk_pool(chunk_pool)
-        #self.mlp.set_chunk_pool(chunk_pool)
+    def set_kv_server(self, kv_server):
+        self.attention.set_kv_server(kv_server)
+        #self.mlp.set_kv_server(chunk_pool)
 
     def init_weight(self, weight_home, path):
         home1, home2 = ValueHolder(), ValueHolder()
@@ -754,9 +776,10 @@ class OptLM:
         self.init_all_weights() # 权重全部读入weights_home
 
         self.radix_tree = RadixTree() 
-        self.chunk_pool = ChunkPool(self.env, self.config, self.policy.chunk_size) # Initialize chunk pool
-
-        self.set_chunk_pool()
+        ### default settings, note that device=cuda:0
+        self.kv_server = LSHServer(self.config, self.num_layers, K=8, L=80, batch_size=1, max_length=8192, device='cuda:0')
+        self.set_kv_server()
+        
         for j in range(num_layers):
             for k in range(num_gpu_batches):
                 self.cache_home[j][k].clear()
@@ -772,9 +795,9 @@ class OptLM:
         for l in self.layers:
             l.set_task(task)
 
-    def set_chunk_pool(self):
+    def set_kv_server(self):
         for l in self.layers:
-            l.set_chunk_pool(self.chunk_pool)
+            l.set_kv_server(self.kv_server)
 
     def init_weight(self, j):
         expanded_path = os.path.abspath(os.path.expanduser(
@@ -843,7 +866,7 @@ class OptLM:
             i -= 1
             if i == -1:
                 return
-        if i == self.task.gen_len - 1:  # last token, no need to store cache
+        if i == self.task.gen_len - 1 and i != 0:  # last token, no need to store cache
             self.cache_write_buf[j][k].pop()
             return
 
@@ -957,41 +980,29 @@ class OptLM:
             (self.policy.gpu_batch_size, self.task.prompt_len), bool)
         val.load_from_np((input_ids != self.config.pad_token_id))
         self.attention_mask[k].store(val)
-
-    def generate_with_prefix(self, inputs: Union[np.array, List[int]]):
-        prefix_kv_ptr = self.radix_tree.search(inputs)
-        return prefix_kv_ptr, len(prefix_kv_ptr)
     
+    ### store to LSHServer through offload_to_lsh()
     def store_prefix_cache(self):
-        common_prefix_len = self.task.common_prefix_len
-        inputs = self.task.inputs[0]
+        common_prefix_len = sum(self.task.matched_prefix.values())
+        inputs = self.task.inputs[0] ### input ids
         prompt_len = self.task.prompt_len
         
-        kv_ptr = []
-        # cache_home 里存储的缓存形状是：(prefill_cache_shape + suffix_len + gen_len - 1, b * n_head, head_dim)
-        # n_imp部分的已经持久化了，只需要持久化suffix_len部分的。
-        for t_idx in range(common_prefix_len,  prompt_len):
-            ptr = []
-            for layer in range (self.num_layers):
-                if isinstance(self.layers[layer], SelfAttention) == False:
-                    ptr.append(None)# 如果不是注意力层就append一个None。
-                    continue
-                for b in range(self.policy.num_gpu_batches):
-                    src = self.cache_home[layer][b]
-                    k_cache, v_cache = src.val
-                    # 在cache_home中该token的下标是n_imp + (t_idx - common_prefix_len) 或者 common_prefix_len + (t_idx - common_prefix_len)
-                    # 如果是第二种情况，prefill_cache_shape = prompt_len 如果是第一种情况，prefill_cache_shape = n_imp + NR = n_imp + prompt_len - common_prefix_len
-                    # n_imp = prefill_cache_shape + common_prefix_len - prompt_len
-                    # 下标为prefill_cache_shape + common_prefix_len - prompt_len + idx - common_prefix_len = prefill_cache_shape - prompt_len + idx
-                    #logger.info(f"Before storing prefix cache, k_cache shape: {k_cache.shape}, v_cache shape: {v_cache.shape}, layer: {layer}, batch: {b}, token index: {t_idx}, common_prefix_len: {common_prefix_len}, prefill_cache_shape: {self.layers[layer].prefill_cache_shape}")
-                    logger.info(f"Store Prefix Cache: k_cache.data={k_cache.data[self.layers[layer].prefill_cache_shape + t_idx - prompt_len,:3,:10]}")
-                    ptr.append(self.chunk_pool.store_prefix_cache(k_cache, v_cache, self.layers[layer].prefill_cache_shape + t_idx - prompt_len))
-                    self.env.disk.synchronize()
-                    logger.info(f"Store prefix cache for layer {layer}, batch {b}, token index {t_idx}, cache_offset {self.layers[layer].prefill_cache_shape + t_idx - prompt_len}, pointer: {ptr[-1]}")
-            kv_ptr.append(ptr)
-        logging.info(f"kv_ptr:{len(kv_ptr)},{len(kv_ptr[0])}")
+        ### get new_prefix_id for lsh
+        new_prefix_id = self.radix_tree.insert(inputs)
+        for layer_id in range(self.num_layers):
+            if isinstance(self.layers[layer_id], TransformerLayer) == False and \
+                isinstance(self.layers[layer_id], SelfAttention) == False :
+                continue ### do nothing
+            ### only supports batch_size=1
+            assert(self.policy.num_gpu_batches == 1)
+            ### k_cache shape: len, b*n_head, head_dim
+            k_cache, v_cache = self.cache_home[layer_id][0].val
+            ### pick the [common_prefix_len : prompt_len] part, for the [:common_prefix_len] part has been persisted
+            k_cache_data = k_cache.data[common_prefix_len:prompt_len]
+            v_cache_data = v_cache.data[common_prefix_len:prompt_len]
+            ### layer_idx:int, request_id: int, seq_len:int, prefix_id: int, key_states: torch.Tensor, value_states: torch.Tensor
+            self.kv_server.offload_to_lsh(layer_id, 0, prompt_len - common_prefix_len, new_prefix_id, k_cache_data, v_cache_data)
 
-        self.radix_tree.insert(inputs, kv_ptr)
         
     def generate(self,
                  inputs: Union[np.array, List[int]],
@@ -1001,8 +1012,13 @@ class OptLM:
                  stop: Optional[int] = None,
                  debug_mode: Optional[str] = None,
                  cut_gen_len: Optional[int] = None,
-                 verbose: int = 0):        
-        common_prefix_kv_ptr, common_prefix_len = self.generate_with_prefix(inputs[0])
+                 verbose: int = 0):
+        matched_prefix = self.radix_tree.match(inputs[0])
+        prefix_only = False
+        new_prefix_id = 0
+        if len(matched_prefix) == 0:
+            prefix_only = True
+            new_prefix_id = self.radix_tree.insert(inputs[0])
         task = Task(
             inputs=inputs,
             prompt_len=len(inputs[0]),
@@ -1011,8 +1027,11 @@ class OptLM:
             do_sample=do_sample,
             temperature=temperature,
             stop=stop,
-            common_prefix_kv_ptr=common_prefix_kv_ptr,
-            common_prefix_len=common_prefix_len
+            common_prefix_kv_ptr=None,
+            common_prefix_len=None,
+            matched_prefix=matched_prefix,
+            prefix_only=prefix_only,
+            new_prefix_id = new_prefix_id
         )
         logger.info(f"generate: Task={task}")
         num_layers = self.num_layers
@@ -1391,16 +1410,30 @@ def run_prefix_flexllmgen(args):
     print("init weight...init_cache_home...")
 
     model = OptLM(opt_config, env, args.path, policy, args.prompt_len, args.gen_len)
-    prefix_prompt1 = "The capital of Guangdong is Guangzhou."
-    prefix_prompt2 = "The capital of Guangdong is Guangzhou and Shenzhen is a city next to Guangzhou."
+    prefix = "Guangzhou is the capital and largest city of Guangdong province in southern China." + \
+      "Located on the Pearl River about 120 km (75 mi) northwest of Hong Kong and 145 km (90 mi) north of Macau, " + \
+      "Guangzhou has a history of over 2,200 years and was a major terminus of the Silk Road." + \
+      "The port of Guangzhou serves as a transportation hub for China's fourth largest city and surrounding areas, including Hong Kong." + \
+      "Guangzhou was captured by the British during the First Opium War and no longer enjoyed a monopoly after the war; " + \
+      "consequently it lost trade to other ports such as Hong Kong and Shanghai, but continued to serve as a major entrepot."
     first_query = "Guangzhou is the capital of"
     second_query = "Please introduce Shenzhen"
 
-    first_input = get_tokenized_inputs(prefix_prompt1 + " " + first_query, max_prompt_len, tokenizer)
-    second_input = get_tokenized_inputs(prefix_prompt2 + " " + second_query, max_prompt_len, tokenizer)
+    prefix_input = get_tokenized_inputs(prefix, max_prompt_len, tokenizer)
+    ### feed prefix --------------
+    output_ids= model.generate(
+            prefix_input, max_new_tokens=1, debug_mode=args.debug_mode, 
+            cut_gen_len=cut_gen_len, verbose=args.verbose)
+    ### offload to lsh server
+    model.sync()
+    # model.store_prefix_cache()
+
+    ### first query: 1. match in radix tree; 2. pick important token; 3. persist
+    first_input = get_tokenized_inputs(prefix + first_query, max_prompt_len, tokenizer)
+    second_input = get_tokenized_inputs(prefix + second_query, max_prompt_len, tokenizer)
     
-    logger.info(f"first_input: {prefix_prompt1 + first_query}, ids: {first_input}")
-    logger.info(f"second_input: {prefix_prompt2 + second_query}, ids: {second_input}")
+    logger.info(f"first_input: {prefix + first_query}")
+    logger.info(f"second_input: {prefix + second_query}")
 
     try:
         print("first query - generate")
@@ -1444,70 +1477,70 @@ def run_prefix_flexllmgen(args):
             if args.verbose >= 2:
                 print(show_str)
 
-        model.finish_one_query(False)
+        # model.finish_one_query(False)
 
-        print("=" * 50)
+        # print("=" * 50)
 
-        print("second query - generate")
-        timers("generate").reset()
-        output_ids = model.generate(
-            second_input, max_new_tokens = args.gen_len, debug_mode=args.debug_mode, 
-            cut_gen_len=cut_gen_len, verbose=args.verbose)
-        costs = timers("generate").costs
+        # print("second query - generate")
+        # timers("generate").reset()
+        # output_ids = model.generate(
+        #     second_input, max_new_tokens = args.gen_len, debug_mode=args.debug_mode, 
+        #     cut_gen_len=cut_gen_len, verbose=args.verbose)
+        # costs = timers("generate").costs
 
-        # Log output
+        # # Log output
         
-        prefill_latency = costs[0]
-        prefill_throughput = num_prompts * max_prompt_len / prefill_latency
-        if cut_gen_len:  # project latency of cut_gen_len to gen_len
-            decode_latency = project_decode_latency(costs, max_prompt_len, gen_len)
-        else:
-            decode_latency = sum(costs[1:])
-        decode_throughput = num_prompts * (gen_len - 1) / max(decode_latency, 1e-10)
-        num_generated_tokens = num_prompts * gen_len
-        total_latency = prefill_latency + decode_latency
-        total_throughput = num_generated_tokens / total_latency
-        _, gpu_peak_mem = gpu.mem_stats()
-        _, cpu_peak_mem = cpu.mem_stats()
-        log_str = (f"model size: {opt_config.model_bytes()/GB:.3f} GB\t"
-                f"cache size: {cache_size/GB:.3f} GB\t"
-                f"hidden size (p): {hidden_size/GB:.3f} GB\n"
-                f"peak gpu mem: {gpu_peak_mem / GB:.3f} GB\t"
-                f"prefill latency: {prefill_latency:.3f} s\t"
-                f"prefill throughput: {prefill_throughput:.3f} token/s\n"
-                f"decode latency: {decode_latency:.3f} s\t"
-                f"decode throughput: {decode_throughput:.3f} token/s\n"
-                f"total latency: {total_latency:.3f} s\t"
-                f"total throughput: {total_throughput:.3f} token/s")
-        print(log_str)
+        # prefill_latency = costs[0]
+        # prefill_throughput = num_prompts * max_prompt_len / prefill_latency
+        # if cut_gen_len:  # project latency of cut_gen_len to gen_len
+        #     decode_latency = project_decode_latency(costs, max_prompt_len, gen_len)
+        # else:
+        #     decode_latency = sum(costs[1:])
+        # decode_throughput = num_prompts * (gen_len - 1) / max(decode_latency, 1e-10)
+        # num_generated_tokens = num_prompts * gen_len
+        # total_latency = prefill_latency + decode_latency
+        # total_throughput = num_generated_tokens / total_latency
+        # _, gpu_peak_mem = gpu.mem_stats()
+        # _, cpu_peak_mem = cpu.mem_stats()
+        # log_str = (f"model size: {opt_config.model_bytes()/GB:.3f} GB\t"
+        #         f"cache size: {cache_size/GB:.3f} GB\t"
+        #         f"hidden size (p): {hidden_size/GB:.3f} GB\n"
+        #         f"peak gpu mem: {gpu_peak_mem / GB:.3f} GB\t"
+        #         f"prefill latency: {prefill_latency:.3f} s\t"
+        #         f"prefill throughput: {prefill_throughput:.3f} token/s\n"
+        #         f"decode latency: {decode_latency:.3f} s\t"
+        #         f"decode throughput: {decode_throughput:.3f} token/s\n"
+        #         f"total latency: {total_latency:.3f} s\t"
+        #         f"total throughput: {total_throughput:.3f} token/s")
+        # print(log_str)
 
-        if DUMMY_WEIGHT not in args.path:
-            outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
-            show_str = "Outputs:\n" + 70 * '-' + "\n"
-            for i in range(0, len(outputs)):
-                show_str += f"{i}: {outputs[i]}\n"
-                show_str += "-" * 70 + "\n"
-            if args.verbose >= 2:
-                print(show_str)
+        # if DUMMY_WEIGHT not in args.path:
+        #     outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
+        #     show_str = "Outputs:\n" + 70 * '-' + "\n"
+        #     for i in range(0, len(outputs)):
+        #         show_str += f"{i}: {outputs[i]}\n"
+        #         show_str += "-" * 70 + "\n"
+        #     if args.verbose >= 2:
+        #         print(show_str)
 
-        print("=" * 50)  
-        model.finish_one_query(True)
+        # print("=" * 50)  
+        # model.finish_one_query(True)
 
     finally:
         env.close_copy_threads()
 
 def add_parser_arguments(parser):
-    parser.add_argument("--model", type=str, default="facebook/opt-6.7b",
+    parser.add_argument("--model", type=str, default="facebook/opt-30b",
         help="The model name.")
     parser.add_argument("--tokenizer-path", type=str, default="/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/hyk/param/opt-30b",
                         help="The path to the tokenizer.")
     parser.add_argument("--path", type=str, default="/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/hyk/opt_weights",
         help="The path to the model weights. If there are no cached weights, "
              "FlexLLMGen will automatically download them from HuggingFace.")
-    parser.add_argument("--offload-dir", type=str, default="/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/hyk/my_FlexLLMGen/flexllmgen_offload_dir",
+    parser.add_argument("--offload-dir", type=str, default="/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/lqy/llm_infer/FlexLLMGen/flexllmgen_offload_dir",
         help="The directory to offload tensors. ")
     parser.add_argument("--prompt-len", type=int, default=512)
-    parser.add_argument("--gen-len", type=int, default=32)
+    parser.add_argument("--gen-len", type=int, default=5)
     parser.add_argument("--cut-gen-len", type=int,
         help="Cut generation length for fast debugging.")
     parser.add_argument("--debug-mode", type=str,
@@ -1524,7 +1557,7 @@ def add_parser_arguments(parser):
          "the percentage of activations on GPU, "
          "the percentage of activations on CPU")
     parser.add_argument("--sep-layer", type=str2bool, nargs='?',
-        const=True, default=True)
+        const=True, default=False)
     parser.add_argument("--pin-weight", type=str2bool, nargs="?",
         const=True, default=True)
     parser.add_argument("--cpu-cache-compute", action="store_true")
@@ -1540,7 +1573,7 @@ def add_parser_arguments(parser):
     parser.add_argument("--verbose", type=int, default=2)
 
     parser.add_argument("--overlap", type=str2bool, nargs='?',
-        const=True, default=True)
+        const=True, default=False)
 
 
 if __name__ == "__main__":
