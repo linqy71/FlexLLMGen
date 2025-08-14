@@ -361,7 +361,7 @@ class TorchDevice:
         # shape: (b * n_head, s, s)
         attn_weights = torch.bmm(q, k)
 
-        self.transform_kernel(attn_weights, q, k, scaling, K, L)
+        # self.transform_kernel(attn_weights, q, k, scaling, K, L)
 
         # shape: (b, 1, s, s)
         idx = torch.arange(s, device=self.dev)
@@ -416,7 +416,7 @@ class TorchDevice:
         hidden = F.layer_norm(inputs.data, (h,), weight=w_ln.data, bias=b_ln.data)
         hidden = hidden[:, common_prefix_len:, :]
         # shape: (b, s, h)
-        q = F.linear(hidden, w_q.data, bias=b_q.data) * scaling
+        q = F.linear(hidden, w_q.data, bias=b_q.data)
         q = q.view(b, s - common_prefix_len, n_head, head_dim)
         return q[0]
 
@@ -492,7 +492,7 @@ class TorchDevice:
         attn_weights = torch.bmm(q, k) * scaling
         l = n_imp + suffix_len
 
-        self.transform_kernel(attn_weights, q, k, scaling, K, L)
+        # self.transform_kernel(attn_weights, q, k, scaling, K, L)
 
         idx = torch.arange(s, device=self.dev)
         # shape: s, s

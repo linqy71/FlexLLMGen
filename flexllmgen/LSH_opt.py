@@ -558,6 +558,7 @@ class SelfAttention:
                 print(f"get {n_imp} important tokens")
                 ### kv_server的layer统一用layer_id管理
                 imp_token_idx = self.kv_server.get_imp_idx(self.layer_id)
+                # print(imp_token_idx[:3])
                 h, new_k_cache, new_v_cache = self.compute.mha_prefill_with_kv(h, mask, w_q, b_q,
                     w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln, n_head, k_cache, v_cache, donate,
                     self.policy.compress_cache, self.policy.comp_cache_config, matched_prefix, 
@@ -777,7 +778,7 @@ class OptLM:
 
         self.radix_tree = RadixTree() 
         ### default settings, note that device=cuda:0
-        self.kv_server = LSHServer(self.config, self.num_layers, K=10, L=150, batch_size=1, max_length=8192, device='cuda:0')
+        self.kv_server = LSHServer(self.config, self.num_layers, K=8, L=100, batch_size=1, max_length=8192, device='cuda:0')
         self.set_kv_server()
         
         for j in range(num_layers):
@@ -1397,7 +1398,9 @@ def run_prefix_flexllmgen(args):
       "Guangzhou has a history of over 2,200 years and was a major terminus of the Silk Road." + \
       "The port of Guangzhou serves as a transportation hub for China's fourth largest city and surrounding areas, including Hong Kong." + \
       "Guangzhou was captured by the British during the First Opium War and no longer enjoyed a monopoly after the war; " + \
-      "consequently it lost trade to other ports such as Hong Kong and Shanghai, but continued to serve as a major entrepot."
+      "consequently it lost trade to other ports such as Hong Kong and Shanghai, but continued to serve as a major entrepot." + \
+      "Guangzhou is at the center of the Guangdong–Hong Kong–Macau Greater Bay Area, the most populous built-up metropolitan area " +\
+      "in the world, which extends into the neighboring cities of Foshan, Dongguan, Zhongshan, Shenzhen and part of Jiangmen, Huizhou, Zhuhai and Macau."
     first_query = "Guangzhou is the capital of"
     second_query = "Please introduce Shenzhen."
 
