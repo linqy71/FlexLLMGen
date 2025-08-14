@@ -8,6 +8,7 @@ import queue
 import shutil
 import time
 import threading
+import math
 from typing import Optional, Union, Tuple
 
 import torch
@@ -37,6 +38,33 @@ def fix_recursive_import():
     general_copy_compressed = compression.general_copy_compressed
     TorchCompressedDevice = compression.TorchCompressedDevice
 
+def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+    t = torch.arange(end, device=freqs.device, dtype=torch.float32)
+    freqs = torch.outer(t, freqs)
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
+    return freqs_cis
+
+
+def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
+    ndim = x.ndim
+    assert 0 <= 1 < ndim
+    assert freqs_cis.shape == (x.shape[1], x.shape[-1])
+    shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
+    return freqs_cis.view(*shape)
+
+### from https://github.com/meta-llama/llama3/blob/main/llama/model.py
+def apply_rotary_emb(
+    xq: torch.Tensor,
+    xk: torch.Tensor,
+    freqs_cis: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
+    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
+    freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
+    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
+    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
+    return xq_out.type_as(xq), xk_out.type_as(xk)
 
 class DeviceType(Enum):
     CPU = auto()
@@ -233,6 +261,10 @@ class TorchDevice:
     def del_attention_compute_workspace(self):
         self.attention_compute_workspace = None
 
+    def gen_torch_tensor(self, data):
+        data = data.to(device=self.dev)
+        return TorchTensor.create_from_torch(data, self)
+
     def gen_attention_mask(self, token_ids, pad_token_id, donate):
         data = token_ids.data.ne(pad_token_id)
         if donate[0]: token_ids.delete()
@@ -244,6 +276,19 @@ class TorchDevice:
              torch.ones((bs, 1), dtype=attention_mask.dtype, device=self.dev)), dim=1)
         if donate[0]: attention_mask.delete()
         return TorchTensor.create_from_torch(data, self)
+    
+    def llama_input_embed(self, inputs, w_token, donate):
+        ## inputs: inpuit_ids; w_token: emb weights
+        # decompress weights
+        if w_token.device.device_type == DeviceType.COMPRESSED:
+            w_token = w_token.device.decompress(w_token)
+        
+        token_ids = inputs.data
+        if donate[0]: inputs.delete()
+        
+        token_embed = F.embedding(token_ids, w_token.data)
+        
+        return TorchTensor.create_from_torch(token_embed, self)
 
     def opt_input_embed(self, inputs, attention_mask, w_token, w_pos, pad_token_id, donate):
         # decompress weights
@@ -275,6 +320,69 @@ class TorchDevice:
         data = token_embed + pos_embed
         return TorchTensor.create_from_torch(data, self)
 
+    def topp_temperature_decode(self, logits, temperature=0.6, top_p=0.9):
+        """
+        Perform Top-p (nucleus) sampling with temperature decoding in PyTorch.
+        
+        Args:
+            logits (torch.Tensor): Input logits of shape [b, 1, vocab_size].
+            temperature (float): Temperature for scaling logits.
+            top_p (float): Probability threshold for nucleus sampling.
+        
+        Returns:
+            torch.Tensor: Decoded indices of shape [b, 1].
+        """
+        # Apply temperature scaling
+        logits = logits / temperature
+
+        # Compute probabilities using softmax
+        probs = torch.softmax(logits, dim=-1)
+        
+        # Sort probabilities and corresponding indices in descending order
+        sorted_probs, sorted_indices = torch.sort(probs, dim=-1, descending=True)
+
+        # Compute cumulative probabilities
+        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+
+        # Create a mask for tokens that exceed the top-p threshold
+        mask = cumulative_probs > top_p
+        # Shift the mask to preserve at least one token
+        mask[:, :, 1:] = mask[:, :, :-1].clone()
+        mask[:, :, 0] = False
+
+        # Mask out probabilities beyond the top-p threshold
+        sorted_probs.masked_fill_(mask, 0.0)
+        sorted_probs /= sorted_probs.sum(dim=-1, keepdim=True)  # Re-normalize probabilities
+
+        # Sample from the filtered probability distribution
+        sampled_indices = torch.multinomial(sorted_probs.squeeze(1), num_samples=1)
+
+        # Map back to original indices
+        final_indices = sorted_indices.gather(dim=-1, index=sampled_indices.unsqueeze(-1))
+
+        return final_indices.squeeze(-1)
+
+    def llama_output_embed(self, inputs, norm, w_lm, eps, donate, temperature=0.6, topp=0.9):
+        # decompress weights
+        if w_lm.device.device_type == DeviceType.COMPRESSED:
+            w_lm = w_lm.device.decompress(w_lm)
+            norm = norm.device.decompress(norm)
+        
+        b, s, h = inputs.shape
+        
+        hidden = F.rms_norm(inputs.data, (h,), weight=norm.data, eps=eps)
+        if donate[0]: inputs.delete()
+        
+        logits = F.linear(hidden, w_lm.data)
+        last_token_logits = logits[:, -1:, :]
+        
+        if temperature < 0.1:
+            ids = last_token_logits.argmax(dim=-1)
+        else :
+            ids = self.topp_temperature_decode(last_token_logits, temperature, topp)
+        
+        return TorchTensor.create_from_torch(ids, self)
+
     def opt_output_embed(self, inputs, w_ln, b_ln, w_token, donate,
                          do_sample, temperature):
         # decompress weights
@@ -297,6 +405,18 @@ class TorchDevice:
             ids = last_token_logits.argmax(dim=1, keepdim=True)
         return TorchTensor.create_from_torch(ids, self)
 
+    def init_cache_one_gpu_batch_llama(self, config, task, policy):
+        num_head, num_key_value_heads, hidden_size, prompt_len, gen_len, gpu_batch_size = (
+            config.n_head, config.num_key_value_heads, config.input_dim, task.prompt_len, task.gen_len,
+            policy.gpu_batch_size)
+        shape = (prompt_len + gen_len - 1, gpu_batch_size, num_key_value_heads, hidden_size // num_head)
+        # NOTE: disable pin_memory due to high memory overhead
+        pin_memory = False
+        k_cache = self.allocate(shape, np.float16, pin_memory=pin_memory)
+        v_cache = self.allocate(shape, np.float16, pin_memory=pin_memory)
+        return k_cache, v_cache
+
+    def init_cache_one_gpu_batch(self, config, task, policy):
     def init_cache_one_gpu_batch(self, config, task, policy, max_prompt_len, max_gen_len):
         num_head, hidden_size, prompt_len, gen_len, gpu_batch_size = (
             #config.n_head, config.input_dim, task.prompt_len, task.gen_len,
@@ -308,6 +428,73 @@ class TorchDevice:
         k_cache = self.allocate(shape, np.float16, pin_memory=pin_memory)
         v_cache = self.allocate(shape, np.float16, pin_memory=pin_memory)
         return k_cache, v_cache
+
+    def gqa(self, inputs, attention_mask, i_n, w_q, w_k, w_v, w_out, eps,
+            freqs_cis, n_head, n_kv_head, donate, compress_cache, comp_config):
+        """Group query attention (prefill phase)"""
+        # decompress weights
+        if w_q.device.device_type == DeviceType.COMPRESSED:
+            i_n = i_n.device.decompress(i_n)
+            w_q = w_q.device.decompress(w_q)
+            w_k = w_k.device.decompress(w_k)
+            w_v = w_v.device.decompress(w_v)
+            w_out = w_out.device.decompress(w_out)
+
+        b, s, h = inputs.shape
+        head_dim = h // n_head
+        
+        freqs_cis = freqs_cis[:s].to(self.dev)
+
+        # input_layernorm
+        hidden = F.rms_norm(inputs.data, (h,), weight=i_n.data, eps=eps)
+        
+        # shape: (b, s, h)
+        q = F.linear(hidden, w_q.data)
+        k = F.linear(hidden, w_k.data)
+        v = F.linear(hidden, w_v.data)
+        # shape: (b, s, n_head, head_dim)
+        q = q.view(b, s, n_head, head_dim)
+        k = k.view(b, s, n_kv_head, head_dim)
+        v = v.view(b, s, n_kv_head, head_dim)
+        
+        # RotaryEmbedding
+        q, k = apply_rotary_emb(q, k, freqs_cis)
+
+        ori_k, ori_v = k.transpose(0, 1), v.transpose(0,1)
+        # Expand kv heads to match attention heads if needed
+        repeat_kv = n_head // n_kv_head
+        if repeat_kv > 1:
+            k = k.repeat_interleave(repeat_kv, dim=2)
+            v = v.repeat_interleave(repeat_kv, dim=2)
+        
+        # shape: (b, n_head, s, head_dim)
+        q = q.transpose(1, 2)
+        # shape: (b, n_head, s, head_dim)
+        k = k.transpose(1, 2) 
+        # shape: (b, n_head, s, head_dim)
+        v = v.transpose(1, 2)
+
+        scores = torch.matmul(q, k.transpose(2, 3)) / math.sqrt(head_dim)
+        # if attention_mask.data is not None:
+        #     scores = scores + attention_mask.data  # (b, n_head, s, s)
+
+        scores = F.softmax(scores.float(), dim=-1).type_as(q)
+        output = torch.matmul(scores, v)  # (b, n_head, s, head_dim)
+        output = output.transpose(1, 2).contiguous().view(b, s, -1)
+        out = F.linear(output, w_out.data)
+
+        out.add_(inputs.data)
+
+        if donate[0]: inputs.delete()
+        if donate[1]: attention_mask.delete()
+
+        if compress_cache:
+            k = self.compressed_device.compress(ori_k, comp_config)
+            v = self.compressed_device.compress(ori_v, comp_config)
+        else:
+            k = TorchTensor.create_from_torch(ori_k, self)
+            v = TorchTensor.create_from_torch(ori_v, self)
+        return TorchTensor.create_from_torch(out, self), k, v
 
     def mha(self, inputs, attention_mask, w_q, b_q, w_k, b_k, w_v, b_v,
             w_out, b_out, w_ln, b_ln, n_head, donate, compress_cache, comp_config):
@@ -611,6 +798,126 @@ class TorchDevice:
             w_k = w_k.device.decompress(w_k)
             w_v = w_v.device.decompress(w_v)
             w_out = w_out.device.decompress(w_out)
+        if compress_cache:
+            # shape: (n_imp, b * n_head, head_dim)
+            k = k_cache.device.decompress(k_cache)
+            v = v_cache.device.decompress(v_cache)
+        else:
+            # shape: (n_imp, b * n_head, head_dim)
+            k = k_cache.data
+            v = v_cache.data
+        
+        '''
+        整个序列计算q向量(b, s, h)
+        计算非前缀部分的k_new,v_new向量(b, suffix_len, h)   suffix_len = s - common_prefix_len
+        获取前缀部分的kv缓存: (n_imp, b * n_head, head_dim), 把两部分拼接在一起(n_imp + suffix_len, b * n_head, head_dim)
+        
+        计算attn_weights(b * n_head, s, n_imp + suffix_len)
+        mask和softmax后计算attn_values(b * n_head, s, head_dim)
+
+        调整维度后和inputs.data相加返回。同时返回拼接后的kv_cache向量(n_imp + suffix_len, b * n_head, head_dim)
+        '''
+
+        b, s, h = inputs.shape
+        head_dim = h // n_head
+        scaling = head_dim ** -0.5
+
+        n_imp = k_cache.shape[0] # 重要token的数量
+        suffix_len = s - common_prefix_len 
+
+        hidden = F.layer_norm(inputs.data, (h,), weight=w_ln.data, bias=b_ln.data)
+
+        suffix_hidden = hidden[:, common_prefix_len:, :]  # hidden for suffix tokens
+        # shape: (b, s, h)
+        q = F.linear(hidden, w_q.data, bias=b_q.data) * scaling
+        # shape: (b, suffix_len, h)
+        k_new = F.linear(suffix_hidden, w_k.data, bias=b_k.data)
+        v_new = F.linear(suffix_hidden, w_v.data, bias=b_v.data)
+
+        # shape: (b, s, n_head, head_dim)
+        q = q.view(b, s, n_head, head_dim)
+        # shape: (b, suffix_len, n_head, head_dim)
+        k_new = k_new.view(b, suffix_len, n_head, head_dim)
+        v_new = v_new.view(b, suffix_len, n_head, head_dim)
+        # shape: (b * n_head, s, head_dim)
+        q = q.permute(0, 2, 1, 3).reshape(b * n_head, s, head_dim)
+
+        # shape: (suffix_len, b * n_head, head_dim)
+        k_new = k_new.permute(1, 0, 2, 3).reshape(suffix_len, b * n_head, head_dim)
+        v_new = v_new.permute(1, 0, 2, 3).reshape(suffix_len, b * n_head, head_dim)
+
+        # origin k_cache shape: (n_imp + suffix_len, b * n_head, head_dim)
+        k = torch.cat((k, k_new), dim=0)
+        v = torch.cat((v, v_new), dim=0)
+        # shape: (b * n_head, head_dim, n_imp + suffix_len)
+        k = k.permute(1, 2, 0).reshape(b * n_head, head_dim, n_imp + suffix_len)
+        # shape: (b * n_head, n_imp + suffix_len, head_dim)
+        v = v.permute(1, 0, 2).reshape(b * n_head, n_imp + suffix_len, head_dim)
+        
+        # shape: (b * n_head, s, n_imp + suffix_len)
+        attn_weights = torch.bmm(q, k)
+
+        L = n_imp + suffix_len
+        # prefix_mask = torch.ones(b, n_imp, dtype=torch.bool, device=attention_mask.device) 
+        # suffix_mask = attention_mask.data[:, common_prefix_len:]
+        # pad_mask = torch.cat([prefix_mask, suffix_mask], dim=1)
+        # pad_mask = pad_mask.view(b, 1, 1, L)   
+
+        idx = torch.arange(s, device=self.dev)
+        causal_mask = (idx <= idx.view(s, 1))
+        
+        token_idxs = imp_token_idx  +  list(range(common_prefix_len, s))
+        causal_mask = causal_mask[:, token_idxs]
+        #logger.info(f"mha_prefil:token_idxs = {token_idxs}, causal_mask={causal_mask}")
+        causal_mask = causal_mask.view(1, 1, s, L) 
+        #logger.info(f"mha_prefill: causal_mask.shape = {causal_mask.shape}")
+        #mask = pad_mask & causal_mask
+        mask = causal_mask
+
+        attn_weights = attn_weights.view(b, n_head, s, L)
+        attn_weights = torch.where(mask, attn_weights, -1e4)
+        attn_weights = attn_weights.view(b * n_head, s, L)
+        attn_weights = F.softmax(attn_weights, dim=2)
+        # shape: (b, n_head, s, head_dim)
+        value = torch.bmm(attn_weights, v).view(b, n_head, s, head_dim)
+        # shape: (b, s, h)
+        value = value.transpose(1, 2).reshape(b, s, h)
+        value = F.linear(value, w_out.data, bias=b_out.data)
+
+        value.add_(inputs.data)
+
+        if donate[0]: inputs.delete()
+        if donate[1]: attention_mask.delete()
+
+        # (n_imp + suffix_len, b * n_head, head_dim)
+        k = k.permute(2, 0, 1)
+        v = v.permute(1, 0, 2)
+
+        if compress_cache:
+            k = self.compressed_device.compress(k, comp_config)
+            v = self.compressed_device.compress(v, comp_config)
+        else:
+            k = TorchTensor.create_from_torch(k, self)
+            v = TorchTensor.create_from_torch(v, self)
+
+        #logger.info(f"mha_prefill:k.data = {k.data[:,:3,:10]}")
+
+        return TorchTensor.create_from_torch(value, self), k, v
+        
+
+
+    def gqa_gen(self, inputs, attention_mask, i_n, w_q, w_k, w_v, w_out, eps,
+            freqs_cis, n_head, n_kv_head, k_cache, v_cache, donate,
+            compress_cache, comp_config):
+        """Grouped-query attention (decoding phase)."""
+        
+        # decompress weights
+        if w_q.device.device_type == DeviceType.COMPRESSED:
+            i_n = i_n.device.decompress(i_n)
+            w_q = w_q.device.decompress(w_q)
+            w_k = w_k.device.decompress(w_k)
+            w_v = w_v.device.decompress(w_v)
+            w_out = w_out.device.decompress(w_out)
 
         b, tgt_s, h = inputs.shape
         # src_s = attention_mask.shape[1]
@@ -806,6 +1113,26 @@ class TorchDevice:
         value = torch.cat([value_gpu, value_cpu.cuda().half()], dim=0)
         return value
 
+    def llama_mlp(self, inputs, pos_n, gate, up, down, eps, donate):
+        if gate.device.device_type == DeviceType.COMPRESSED:
+            pos_n = pos_n.device.decompress(pos_n)
+            gate = gate.device.decompress(gate)
+            up = gate.device.decompress(up)
+            down = gate.device.decompress(down)
+        
+        b, s, h = inputs.shape
+        out = F.rms_norm(inputs.data, (h,), weight=pos_n.data, eps=eps)
+        
+        up_out = F.linear(out, up.data) ## up
+        gate_out = F.linear(out, gate.data) ## gate
+        gate_out = F.silu(gate_out)
+        out = gate_out * up_out
+        out = F.linear(out, down.data) ## down
+        
+        out.add_(inputs.data)
+        if donate[0]: inputs.delete()
+        return TorchTensor.create_from_torch(out, self)
+
     def mlp(self, inputs, wi, bi, wo, bo, w_ln, b_ln, donate):
         # decompress weights
         if wi.device.device_type == DeviceType.COMPRESSED:
@@ -904,6 +1231,15 @@ class TorchDisk:
         if os.path.exists(tensor.data) and tensor.delete_file:
             os.remove(tensor.data)
 
+    def init_cache_one_gpu_batch_llama(self, config, task, policy):
+        n_head, num_key_value_heads, hidden_size, prompt_len, gen_len, gpu_batch_size = (
+            config.n_head, config.num_key_value_heads, config.input_dim, task.prompt_len, task.gen_len,
+            policy.gpu_batch_size)
+        shape = (prompt_len + gen_len - 1, gpu_batch_size, num_key_value_heads, hidden_size // num_head)
+        k_cache = self.allocate(shape, np.float16)
+        v_cache = self.allocate(shape, np.float16)
+        return k_cache, v_cache
+
     def init_cache_one_gpu_batch(self, config, task, policy):
         num_head, hidden_size, prompt_len, gen_len, gpu_batch_size = (
             config.n_head, config.input_dim, task.prompt_len, task.gen_len,
@@ -974,6 +1310,30 @@ class TorchMixedDevice:
         for x in self.tensor.data[0]:
             if x:
                 x.delete()
+
+    def init_cache_one_gpu_batch_llama(self, config, task, policy):
+        num_head, num_key_value_heads, hidden_size, prompt_len, gen_len, gpu_batch_size = (
+            config.n_head, config.num_key_value_heads, config.input_dim, task.prompt_len, task.gen_len,
+            policy.gpu_batch_size)
+        shape = (prompt_len + gen_len - 1, gpu_batch_size, num_key_value_heads, hidden_size // num_head)
+
+        # We have to round to a multiple of `num_key_value_heads`
+        if policy.cache_disk_percent == 0:
+            len_gpu = int(shape[SEG_DIM] * policy.cache_gpu_percent / 100) // num_key_value_heads * num_key_value_heads
+            len_cpu = shape[SEG_DIM]  - len_gpu
+            len_disk = 0
+        else:
+            len_gpu = int(shape[SEG_DIM] * policy.cache_gpu_percent / 100) // num_key_value_heads * num_key_value_heads
+            len_cpu = int(shape[SEG_DIM] * policy.cache_cpu_percent / 100) // num_key_value_heads * num_key_value_heads
+            len_disk = shape[SEG_DIM] - len_gpu - len_cpu
+        lens = [len_gpu, len_cpu, len_disk]
+
+        pin_memory = False
+        k_cache = self.allocate(shape, np.float16,
+            seg_lengths=lens, pin_memory=pin_memory)
+        v_cache = self.allocate(shape, np.float16,
+            seg_lengths=lens, pin_memory=pin_memory)
+        return k_cache, v_cache
 
     def init_cache_one_gpu_batch(self, config, task, policy):
         num_head, hidden_size, prompt_len, gen_len, gpu_batch_size = (
