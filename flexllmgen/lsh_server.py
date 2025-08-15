@@ -236,6 +236,16 @@ class LSHServer:
 
         return queried_key[:res_len], queried_value[:res_len]
 
+    def sequential_persist(self, prefix_id):
+        for layer_idx in range(self.num_layers):
+            new_token_orders = [ list(range(self.offload_len)) for _ in range(self.num_key_value_heads)]
+            self.persist_strategy[layer_idx] = new_token_orders
+            self.kv_store.write_to_storage(self.kv_store_path,
+                                            prefix_id, layer_idx, new_token_orders)
+            print(f"Successfully write prefix {prefix_id} to storage in {self.kv_store_path}")
+        self.persisted = True
+
+
     def query_group_persist(self, prefix_id):
         for layer_idx in range(self.num_layers):
             # To record token_ids for each head

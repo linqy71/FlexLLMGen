@@ -727,7 +727,8 @@ class OptLM:
                  offload_dir: str,
                  policy: Policy,
                  max_prompt_len: int,
-                 max_gen_len: int):
+                 max_gen_len: int,
+                 persist_strategy: str):
         if isinstance(config, str):
             config = get_opt_config(config)
         self.config = config
@@ -737,6 +738,7 @@ class OptLM:
         self.num_gpu_batches = policy.num_gpu_batches
         self.max_prompt_len = max_prompt_len
         self.max_gen_len = max_gen_len
+        self.persist_strategy = persist_strategy
 
         layers = []
         layers.append(InputEmbed(self.config, self.env, self.policy))
@@ -1085,7 +1087,13 @@ class OptLM:
         
         ### if kv not persisted, persist
         if self.kv_server.persisted == False:
-            self.kv_server.query_group_persist(self.task.new_prefix_id)
+            if self.persist_strategy == "query":
+                self.kv_server.query_group_persist(self.task.new_prefix_id)
+            elif self.persist_strategy == "seq":
+                self.kv_server.sequential_persist(self.task.new_prefix_id)
+            else:
+                raise ValueError(f"Invalid strategy: {self.persist_strategy}")
+
         self.kv_server.reset(switch=False)
         logger.info("query finished , now sync the model")
         num_layers, num_gpu_batches = self.num_layers, self.policy.num_gpu_batches
@@ -1401,7 +1409,7 @@ def run_prefix_flexllmgen(args):
     
     print("init weight...init_cache_home...")
 
-    model = OptLM(opt_config, env, args.path, args.offload_dir, policy, args.prompt_len, args.gen_len)
+    model = OptLM(opt_config, env, args.path, args.offload_dir, policy, args.prompt_len, args.gen_len, args.strategy)
     prefix = "Guangzhou is the capital and largest city of Guangdong province in southern China." + \
       "Located on the Pearl River about 120 km (75 mi) northwest of Hong Kong and 145 km (90 mi) north of Macau, " + \
       "Guangzhou has a history of over 2,200 years and was a major terminus of the Silk Road." + \
@@ -1568,6 +1576,9 @@ def add_parser_arguments(parser):
 
     parser.add_argument("--overlap", type=str2bool, nargs='?',
         const=True, default=False)
+    
+    ## query for query_group_persist; seq for sequential_persist
+    parser.add_argument("--strategy", type=str, default="query")
 
 
 if __name__ == "__main__":
