@@ -724,6 +724,7 @@ class OptLM:
                  config: Union[str, OptConfig],
                  env: ExecutionEnv,
                  path: str,
+                 offload_dir: str,
                  policy: Policy,
                  max_prompt_len: int,
                  max_gen_len: int):
@@ -783,7 +784,10 @@ class OptLM:
 
         self.radix_tree = RadixTree() 
         ### default settings, note that device=cuda:0
-        self.kv_server = LSHServer(self.config, self.num_hidden_layers, K=8, L=100, batch_size=1, max_length=8192, device='cuda:0')
+        self.kv_store_path = os.path.join(offload_dir, "kv_store")
+        if not os.path.exists(self.kv_store_path):
+            os.makedirs(self.kv_store_path)
+        self.kv_server = LSHServer(self.config, self.num_hidden_layers, self.kv_store_path, K=8, L=100, batch_size=1, max_length=8192, device='cuda:0')
         self.set_kv_server()
         
         for j in range(num_layers):
@@ -1397,7 +1401,7 @@ def run_prefix_flexllmgen(args):
     
     print("init weight...init_cache_home...")
 
-    model = OptLM(opt_config, env, args.path, policy, args.prompt_len, args.gen_len)
+    model = OptLM(opt_config, env, args.path, args.offload_dir, policy, args.prompt_len, args.gen_len)
     prefix = "Guangzhou is the capital and largest city of Guangdong province in southern China." + \
       "Located on the Pearl River about 120 km (75 mi) northwest of Hong Kong and 145 km (90 mi) north of Macau, " + \
       "Guangzhou has a history of over 2,200 years and was a major terminus of the Silk Road." + \

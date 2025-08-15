@@ -8,12 +8,14 @@ class LSHServer:
     def __init__(self,
         config,
         num_layers: int,
+        kv_store_path: str,
         K: int = 10, 
         L: int = 150, 
         batch_size: int = 1,
         max_length: int = 8192,
         device: str = 'cuda:0',
-        dtype = torch.float16):
+        dtype = torch.float16,
+        ):
     
         self.config = config  ### OptConfig or LlamaConfig
         self.K = K
@@ -48,6 +50,7 @@ class LSHServer:
         self.lsh_retriever.alloc(self.K, self.L, self.num_layers, self.num_attention_heads, self.num_key_value_heads, self.batch_size, self.max_length)
         self.kv_store = KVStore()
         self.kv_store.alloc(self.num_layers, self.num_attention_heads, self.num_key_value_heads, self.head_dim, max_length)
+        self.kv_store_path = kv_store_path
         
         self.hash_func = torch.randn((self.head_dim, self.K * self.L), device=self.device, dtype=self.dtype)
         self.binary_pack = [int(2**i) for i in range(self.K)]
@@ -258,9 +261,9 @@ class LSHServer:
 
             # Save strategy
             self.persist_strategy[layer_idx] = new_token_orders
-            self.kv_store.write_to_storage("/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/lqy/llm_infer/tmp_store",
+            self.kv_store.write_to_storage(self.kv_store_path,
                                             prefix_id, layer_idx, new_token_orders)
-            print(f"Successfully write to storage, {prefix_id}")
+            print(f"Successfully write prefix {prefix_id} to storage in {self.kv_store_path}")
         self.persisted = True
 
     ### arrange tokens into groups according to first req's query results
