@@ -158,8 +158,14 @@ class LSHServer:
         for head_id, n in enumerate(nnz):
             res[head_id, n:] = -1
         max_len = nnz.max()
-        
-        return res[:, :max_len]
+        avg_len = nnz.sum() / len(nnz)
+        return res[:, :max_len], avg_len
+
+    def get_full_idx(self, layer_idx):
+        res = torch.zeros((self.num_key_value_heads, self.offload_len), dtype=int, device="cpu")
+        for i in range(self.num_key_value_heads):
+            res[i, :].copy_(torch.arange(0, self.offload_len))
+        return res
 
     ### get important kv by queries through lsh
     ### req_id: requst id inside a batch
@@ -214,15 +220,16 @@ class LSHServer:
         for head_id in range(self.num_key_value_heads):
             self.nnz[head_id] = self.offload_len
             self.results_lsh_cpu[head_id][:self.offload_len].copy_(torch.arange(self.offload_len))
-        
+        self.record_query_results(layer_idx)
         self.kv_store.collect_queried_key_value(prefix_id, layer_idx, self.results_lsh_cpu, self.nnz)
         queried_key = self.kv_store.get_queried_key_cache()
         queried_value = self.kv_store.get_queried_value_cache()
         avg_k = self.avg_k[layer_idx][req_id].to("cpu")
         queried_key = queried_key + avg_k
-        res_len, _ = self.nnz.max()
-        # queried_key = queried_key.transpose(0,1).continuous()
-        # queried_value = queried_value.transpose(0,1).continuous()
+        res_len = self.nnz.max().data
+        
+        queried_key = queried_key.transpose(0,1).contiguous()
+        queried_value = queried_value.transpose(0,1).contiguous()
 
         return queried_key[:res_len], queried_value[:res_len]
 

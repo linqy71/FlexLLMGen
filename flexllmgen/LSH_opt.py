@@ -548,16 +548,20 @@ class SelfAttention:
                         w_ln, b_ln, n_head, k_cache, donate, self.policy.compress_cache, 
                         self.policy.comp_cache_config, matched_prefix)
                     k_cache_data, v_cache_data = self.kv_server.get_kv(0, self.layer_id, query_states, prefix_id, max_common_len)
+                    # k_cache_data, v_cache_data = self.kv_server.get_full_kv(0, self.layer_id, query_states, prefix_id)
                     # print(k_cache_data)
                     
                     # k_cache_data, v_cache_data = self.kv_server.get_full_kv(0, j, query_states, prefix_id)
                     length = self.copy_prefix(k_cache, k_cache_data, cur_pos)
                     length = self.copy_prefix(v_cache, v_cache_data, cur_pos)
                     cur_pos += length
-                n_imp = cur_pos
-                print(f"get {n_imp} important tokens")
+                # n_imp = cur_pos
+                
                 ### kv_server的layer统一用layer_id管理
-                imp_token_idx = self.kv_server.get_imp_idx(self.layer_id)
+                imp_token_idx, avg_n_imp = self.kv_server.get_imp_idx(self.layer_id)
+                # imp_token_idx = self.kv_server.get_full_idx(self.layer_id)
+                print(f"get {avg_n_imp} important tokens")
+
                 # print(imp_token_idx[:3])
                 h, new_k_cache, new_v_cache = self.compute.mha_prefill_with_kv(h, mask, w_q, b_q,
                     w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln, n_head, k_cache, v_cache, donate,
@@ -576,7 +580,7 @@ class SelfAttention:
             # 存入的cache shape可能是(s, b * n_head, head_dim) 也可能是 (n_imp + s - common_prefix_len[0], ..., ...)
             cache_write_buf.store((new_k_cache, new_v_cache))
         else:  # decoding
-            imp_token_idx = self.kv_server.get_imp_idx(self.layer_id)
+            imp_token_idx, _ = self.kv_server.get_imp_idx(self.layer_id)
             mask, donate[1] = attention_mask.val.smart_copy(self.attention_compute)
             (k_cache, donate[12]), (v_cache, donate[13]) = cache_read_buf.pop()
             # logger.info(f"SelfAttention decoding prefill_cache_shape:{self.prefill_cache_shape}, i:{i}")
@@ -744,6 +748,7 @@ class OptLM:
         layers.append(OutputEmbed(self.config, self.env, self.policy))
         self.layers = layers
         self.num_layers = len(layers)
+        self.num_hidden_layers = self.config.num_hidden_layers
 
         if self.policy.act_gpu_percent == 100:
             self.act_home = self.env.gpu
@@ -778,7 +783,7 @@ class OptLM:
 
         self.radix_tree = RadixTree() 
         ### default settings, note that device=cuda:0
-        self.kv_server = LSHServer(self.config, self.num_layers, K=8, L=100, batch_size=1, max_length=8192, device='cuda:0')
+        self.kv_server = LSHServer(self.config, self.num_hidden_layers, K=8, L=100, batch_size=1, max_length=8192, device='cuda:0')
         self.set_kv_server()
         
         for j in range(num_layers):
@@ -1402,7 +1407,7 @@ def run_prefix_flexllmgen(args):
       "Guangzhou is at the center of the Guangdong–Hong Kong–Macau Greater Bay Area, the most populous built-up metropolitan area " +\
       "in the world, which extends into the neighboring cities of Foshan, Dongguan, Zhongshan, Shenzhen and part of Jiangmen, Huizhou, Zhuhai and Macau."
     first_query = "Guangzhou is the capital of"
-    second_query = "Please introduce Shenzhen."
+    second_query = "Shenzhen is a city near"
 
     prefix_input = get_tokenized_inputs(prefix, max_prompt_len, tokenizer)
     ### feed prefix --------------

@@ -150,8 +150,8 @@ void KVStore::write_to_storage(
         DTYPE* key_value = new DTYPE[head_entries * this->head_dim * 2]; // key + value
         memset(key_value, 0, head_entries * this->head_dim * 2 * sizeof(DTYPE));
 
-        DTYPE* head_key = k + i * seq_len * this->head_dim;
-        DTYPE* head_value = v + i * seq_len * this->head_dim;
+        DTYPE* head_key = k + i * this->max_length * this->head_dim;
+        DTYPE* head_value = v + i * this->max_length * this->head_dim;
 
         for (size_t j = 0; j < head_entries; j++) {
             int idx = head_strategy[j];
