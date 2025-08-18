@@ -1532,8 +1532,10 @@ def run_dapr_flexllmgen(args):
 
     context, questions = process_dapr()
 
-    inputs = [context +  query + "\n" for query in questions]
+    # inputs = [context +  query + "\n" for query in questions]
+    inputs = ["The capital city of France is", "The capital city of China is", "The capital city of American is"]
     inputs_ids = tokenizer(inputs, truncation=True, max_length=max_prompt_len).input_ids
+
 
     output_ids = model.generate(
         inputs=[inputs_ids[0]], max_new_tokens = 1, debug_mode=args.debug_mode, 
