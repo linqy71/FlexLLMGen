@@ -4,4 +4,4 @@ python3 -m flexllmgen.dapr_llama --model meta/llama3.1-8b  \
         --path=/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/lqy/HF_HOME/hub \
         --prompt-len 4000 \
         --gen-len 32 \
-        --offload-dir /HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/hyk/my_FlexLLMGen/flexllmgen_offload_dir > llama.log 2>&1
+        --offload-dir /ssd/nsccgz_zgchen_6/flexllmgen_offload_dir/kv_store/impress > llama.log 2>&1

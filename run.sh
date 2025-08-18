@@ -4,4 +4,4 @@ python3 -m flexllmgen.dapr_opt --model facebook/opt-30b \
         --path /HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/hyk/opt_weights  \
         --prompt-len 2016 \
         --gen-len 32 \
-        --offload-dir /HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/hyk/my_FlexLLMGen/flexllmgen_offload_dir  > test18.log 2>&1
+        --offload-dir /ssd/nsccgz_zgchen_6/flexllmgen_offload_dir/kv_store/impress  > test18.log 2>&1
