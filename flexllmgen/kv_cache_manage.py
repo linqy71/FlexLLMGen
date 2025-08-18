@@ -47,9 +47,6 @@ class ChunkPool:
         self.cpu_buf = torch.empty((1 * GB,), dtype=torch.float16, pin_memory=True)
 
     def init_new_chunk(self, device, full_head_shape, name = None):
-        '''
-        创建一个新Chunk, 返回新Chunk的id
-        '''
         #chunk_probe_shape = (probe_shape[0] * self.chunk_size, *probe_shape[1:])
         new_chunk = Chunk(device, full_head_shape, chunk_id=name)
         #logger.info(f"Init new chunk{new_chunk.chunk_id} with full head shape {full_head_shape} on device {device}")
