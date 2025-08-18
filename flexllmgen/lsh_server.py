@@ -178,7 +178,7 @@ class LSHServer:
     ### max_index: indices in query results cannot exceed this value
     ### returns keys and values of important tokens
     ### Note that!! the kvs are only valid before next get_kv(), needing copy after each get_kv()
-    def get_kv(self, 
+    def lsh_retrieve(self, 
         req_id: int, 
         layer_idx: int, 
         query_states: torch.Tensor,
@@ -201,6 +201,14 @@ class LSHServer:
         self.lsh_retriever.batch_retrieve_multi(layer_idx, self.pinned_hashcode_multi, q_len ,self.results_lsh_cpu, self.nnz, max_index)
         print(self.nnz)
         self.record_query_results(layer_idx)
+    
+    def load_kv(self, 
+        req_id: int, 
+        layer_idx: int, 
+        prefix_id: int):
+        if not self.offloaded or prefix_id == 0:
+            return None, None
+        
         ### collect key value from kv_store
         self.kv_store.collect_queried_key_value(prefix_id, layer_idx, self.results_lsh_cpu, self.nnz)
         ### shape : n_head, max_length, head_dim
