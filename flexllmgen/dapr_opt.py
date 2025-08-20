@@ -7,6 +7,7 @@ import argparse
 import dataclasses
 import os
 import pickle
+import subprocess
 import time
 from typing import Union, List, Optional
 
@@ -88,7 +89,7 @@ class Policy:
     important_ratio: float = 0.2
 
     # Config of Chunk Pool
-    chunk_size: int = 256
+    chunk_size: int = 64
     #gpu_heap_size: int = 0
     #cpu_heap_size: int = 0
 
@@ -394,7 +395,7 @@ class SelfAttention:
 
         # 第0个batch的第j个token的第i层的kv_ptr
         for t_idx in range(self.task.common_prefix_len):
-            kv_ptr = self.task.common_prefix_kv_ptr[t_idx][j]
+            kv_ptr = self.task.common_prefix_token[t_idx].kv_ptr[j]
             chunk_id, offset = kv_ptr.chunk_id, kv_ptr.offset
             #logger.info(f"In load_probe_cahe token:{t_idx} layer:{j}: kv_ptr = {kv_ptr}")
             self.chunk_pool.get_probe_cache(k_cache, t_idx, chunk_id, offset)
@@ -429,7 +430,7 @@ class SelfAttention:
         layer_continue_log = []
 
         for j in range(n_important):
-            kv_ptr = self.task.common_prefix_kv_ptr[imp_token_idx[j]][layer]
+            kv_ptr = self.task.common_prefix_token[imp_token_idx[j]].kv_ptr[layer]
             chunk_id, offset = kv_ptr.chunk_id, kv_ptr.offset
             #logger.info(f"Get prefix kv: chunk_id={chunk_id}, offset={offset}")
             self.chunk_pool.get_full_head_cache(k_cache, v_cache, j, chunk_id, offset)
@@ -446,9 +447,9 @@ class SelfAttention:
 
             last_id = chunk_id
             last_offset = offset
-        logger.info(f"Get prefix kv: layer_mx_continue:{layer_mx_continue}")
-        logger.info(f"Get prefix kv: layer_average_continue:{sum(layer_continue_log) / len(layer_continue_log)}")
-        logger.info(f"Get Prefix kv:log={layer_continue_log}")
+        # logger.info(f"Get prefix kv: layer_mx_continue:{layer_mx_continue}")
+        # logger.info(f"Get prefix kv: layer_average_continue:{sum(layer_continue_log) / len(layer_continue_log)}")
+        # logger.info(f"Get Prefix kv:log={layer_continue_log}")
         return k_cache, v_cache
 
     def load_cache(self, cache_home, cache_read_buf, i, j):
@@ -542,6 +543,10 @@ class SelfAttention:
         general_copy(k_home, indices, k_new, None)
         general_copy(v_home, indices, v_new, None)
 
+    def update_importance(self, imp_token_idx):
+        for idx in imp_token_idx:
+            self.task.common_prefix_token[idx].importance += 1
+
     def input_act_shape_and_dtype(self, batch_size, seq_len):
         return (batch_size, seq_len, self.config.input_dim), self.config.dtype
 
@@ -584,7 +589,8 @@ class SelfAttention:
 
                 imp_token_idx = imp_token_idx[0] # 解开batch维度
 
-                logger.info(f"Get Important token indices: {imp_token_idx}")
+                # logger.info(f"Get Important token indices: {imp_token_idx}")
+                self.update_importance(imp_token_idx)
 
                 end_event_atn_load = torch.cuda.Event(enable_timing=True)
                 timers("imp load and compute").start()
@@ -815,7 +821,7 @@ class OptLM:
         self.init_all_weights() # 权重全部读入weights_home
 
         self.radix_tree = RadixTree() 
-        self.chunk_pool = ChunkPool(self.env, self.config, self.policy.chunk_size) # Initialize chunk pool
+        self.chunk_pool = ChunkPool(self.env, self.config, self.policy.gpu_batch_size, self.policy.chunk_size) # Initialize chunk pool
 
         self.set_chunk_pool()
         for j in range(num_layers):
@@ -1021,8 +1027,8 @@ class OptLM:
         self.attention_mask[k].store(val)
 
     def generate_with_prefix(self, inputs: Union[np.array, List[int]]):
-        prefix_kv_ptr = self.radix_tree.search(inputs)
-        return prefix_kv_ptr, len(prefix_kv_ptr)
+        prefix_token = self.radix_tree.search(inputs)
+        return prefix_token, len(prefix_token)
     
     def store_prefix_cache(self):
         common_prefix_len = self.task.common_prefix_len
@@ -1039,7 +1045,7 @@ class OptLM:
                 for b in range(self.policy.num_gpu_batches):
                     src = self.cache_home[layer][b]
                     k_cache, v_cache = src.val
-                    ptr = self.chunk_pool.store_prefix_cache(k_cache, v_cache, self.layers[layer].prefill_cache_shape + t_idx - prompt_len) 
+                    ptr = self.chunk_pool.store_kv_cache(k_cache, v_cache, self.layers[layer].prefill_cache_shape + t_idx - prompt_len) 
                     kv_ptr[t_idx - common_prefix_len].append(ptr)               
         # cache_home 里存储的缓存形状是：(prefill_cache_shape + suffix_len + gen_len - 1, b * n_head, head_dim)
         # n_imp部分的已经持久化了，只需要持久化suffix_len部分的。
@@ -1076,7 +1082,7 @@ class OptLM:
                  debug_mode: Optional[str] = None,
                  cut_gen_len: Optional[int] = None,
                  verbose: int = 0):        
-        common_prefix_kv_ptr, common_prefix_len = self.generate_with_prefix(inputs[0])
+        common_prefix_token, common_prefix_len = self.generate_with_prefix(inputs[0])
         logger.info(f"generate: common_prefix_len={common_prefix_len}")
         task = Task(
             inputs=inputs,
@@ -1086,7 +1092,7 @@ class OptLM:
             do_sample=do_sample,
             temperature=temperature,
             stop=stop,
-            common_prefix_kv_ptr=common_prefix_kv_ptr,
+            common_prefix_token=common_prefix_token,
             common_prefix_len=common_prefix_len
         )
         #logger.info(f"generate: Task={task}")
@@ -1398,6 +1404,50 @@ class OptLM:
             else:
                 timers("generate").costs.append(self.num_layers * batch_cost)
 
+    def kv_reordering(self, cur=None):
+        if cur == None:
+            cur = self.radix_tree.root
+            new_chunk_id = self.chunk_pool.switch_to_new_chunk()
+            self.kv_reordering(cur)
+
+            self.sync()
+            #logger.info(f"KV reordering: Before Delete:{len(self.chunk_pool.pool)}")
+            keys_to_delete = [k for k in self.chunk_pool.pool if k < new_chunk_id]
+
+            for k in keys_to_delete:
+                v = self.chunk_pool.pool[k]
+                v.delete()                  
+                del self.chunk_pool.pool[k] 
+            #logger.info(f"KV reordering: Before Delete:{len(self.chunk_pool.pool)}")
+            
+            return
+        
+
+        #logger.info(f"in kv_reordering, cur={cur}")
+        if (len(cur.tokens) == 0 and len(cur.children) == 0):
+            raise ValueError("RadixTreeNode can't be empty")
+        
+        #logger.info(f"KV_reordering: Before={cur.get_all_sorted_token()}")
+        cur.sort_by_importance()
+        #logger.info(f"KV_reordering: After={cur.get_all_sorted_token()}")
+        layers = self.num_layers
+        tokens = len(cur.tokens)
+
+        for l in range(layers):
+            for t in range(tokens):
+                token = cur.get_sorted_token(t)
+                kv_ptr = token.kv_ptr[l]
+                if kv_ptr == None:
+                    continue
+                src_chunk_id, src_offset = kv_ptr.chunk_id, kv_ptr.offset
+                token.kv_ptr[l] = self.chunk_pool.store_kv_cache(src_chunk_id, None, src_offset)
+
+        for child in cur.children.values():
+            if child is None:
+                continue
+            self.kv_reordering(cur = child)
+        
+
     def __del__(self):
         self.delete_all_weights()
 
@@ -1648,10 +1698,10 @@ def run_dapr_flexllmgen(args):
 
     context, questions = process_dapr()
     
-    inputs = [context[-8520:] +  query + "\n" for query in questions]
+    inputs = [context[-8520:] +  query + "\n" for query in questions[:5]]
     inputs_ids = tokenizer(inputs, truncation=True, max_length=max_prompt_len).input_ids
     output_ids = model.generate(
-        inputs=[inputs_ids[1]], max_new_tokens = 1, debug_mode=args.debug_mode, 
+        inputs=[inputs_ids[0]], max_new_tokens = 1, debug_mode=args.debug_mode, 
         cut_gen_len=cut_gen_len, verbose=args.verbose)
     
     for i in range(len(inputs)):
@@ -1711,6 +1761,13 @@ def run_dapr_flexllmgen(args):
             print("average continue:", sum(average_continue_addr) / len(average_continue_addr))
             print("sum avg:", sum(average_continue_addr))
         print("=" * 50)
+
+        if(i == len(inputs) // 2):
+            model.radix_tree.visualize()
+            model.kv_reordering()
+        
+        subprocess.run(['sudo', 'drop_cache'], check=True)
+
 
     env.close_copy_threads()
 

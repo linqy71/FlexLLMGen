@@ -18,7 +18,7 @@ logging.basicConfig(#filename="test.log", filemode="w",
 logger = logging.getLogger(__name__)
 
 class ChunkPool:
-    def __init__(self, env, config, chunk_size:int = 4, gpu_heap_size:int = 0, cpu_heap_size:int = 0, ):
+    def __init__(self, env, config, batch_size = 1, chunk_size:int = 4, gpu_heap_size:int = 0, cpu_heap_size:int = 0, ):
         '''
         目前只用了self.pool:Dict[int, Chunk]={},通过chunk_id得到Chunk. 所有Chunk都在磁盘上
         chunk_size表明存了多少个token的一层的KV缓存
@@ -28,6 +28,7 @@ class ChunkPool:
         n_head = config.n_head
         n_probe_head = 3
         head_dim = config.input_dim // n_head
+        self.chunk_shape = (chunk_size, batch_size * n_head, head_dim)
 
         self.env = env
         self.gpu = env.gpu
@@ -35,6 +36,7 @@ class ChunkPool:
         self.disk = env.disk
         # self.gpu_heap_size = gpu_heap_size
         # self.cpu_heap_size = cpu_heap_size
+        
 
         # self.cpu_chunk = List[Chunk]
         # self.gpu_chunk = List[Chunk]
@@ -45,27 +47,44 @@ class ChunkPool:
 
         self.sync_copy_stream = torch.cuda.Stream()
         self.cpu_buf = torch.empty((1 * GB,), dtype=torch.float16, pin_memory=True)
+    
+    def switch_to_new_chunk(self, name=None):
+        new_chunk = Chunk(self.disk, self.chunk_shape, chunk_id=name)
+        
+        self.pool[new_chunk.chunk_id] = new_chunk
 
-    def init_new_chunk(self, device, full_head_shape, name = None):
+        self.current_id = new_chunk.chunk_id
+        self.current_offset = 0
+
+        return self.current_id
+
+
+    def init_new_chunk(self, device, name = None):
         '''
         创建一个新Chunk, 返回新Chunk的id
         '''
         #chunk_probe_shape = (probe_shape[0] * self.chunk_size, *probe_shape[1:])
-        new_chunk = Chunk(device, full_head_shape, chunk_id=name)
+        new_chunk = Chunk(device, self.chunk_shape, chunk_id=name)
         #logger.info(f"Init new chunk{new_chunk.chunk_id} with full head shape {full_head_shape} on device {device}")
         self.pool[new_chunk.chunk_id] = new_chunk
         return new_chunk.chunk_id
 
-    def store_prefix_cache(self, k_cache, v_cache, cache_offset):
+    def store_kv_cache(self, k_cache, v_cache, cache_offset):
         '''
         generate完后, 把新计算得到的KV存储到磁盘中
         self.current_id  self.current_offset指向当前可存储的空余位置。
         如果self.current_offset == chunk_size,就会新创建一个Chunk并令current_id=new_chunk.id  current_offset = 0
         '''
-        full_head_shape = (self.chunk_size, *k_cache.shape[1:])
+
+        if isinstance(k_cache, int):
+            src_chunk = self.pool[k_cache]
+
+            k_cache = src_chunk.full_head_k
+            v_cache = src_chunk.full_head_v
+
 
         if self.current_id == None:
-            self.current_id = self.init_new_chunk(device=self.disk, full_head_shape=full_head_shape)
+            self.current_id = self.init_new_chunk(device=self.disk)
             self.current_offset = 0
 
         tgt_chunk = self.pool[self.current_id]
@@ -98,7 +117,7 @@ class ChunkPool:
         ptr = CachePointer(self.current_id, self.current_offset)
         self.current_offset += 1
         if self.current_offset == self.chunk_size:
-            self.current_id = self.init_new_chunk(device=self.disk, full_head_shape=full_head_shape)
+            self.current_id = self.init_new_chunk(device=self.disk)
             self.current_offset = 0
         return ptr
         
@@ -176,11 +195,21 @@ class ChunkPool:
             )
         self.sync_copy_stream.synchronize()
 
+    def get_full_head_cache_impress(self, k_cache, v_cache, dst_offset, chunk_id, src_offset):
+        '''
+        1. 更新IR access_count score
+        2. 获取tgt_chunk
+        3. 根据dst src offset 进行复制
+        4. 判断是否保存在GPU。。
+        '''
+        pass
 
 class Chunk:
     chunk_id = count()
     def __init__(self, device, full_head_shape, chunk_id=None):
         self.access_count = 0
+        self.important_ratio = 0
+        self.score = 0
         self.device = device
         self.chunk_id = chunk_id or Chunk.next_chunk_name()
         # shape = (1, batch*n_probe_head, head_dim)
@@ -192,7 +221,9 @@ class Chunk:
     def next_chunk_name(cls):
         return next(cls.chunk_id)
     
-    
+    def delete(self):
+        self.full_head_v.delete()
+        self.full_head_k.delete()
 
 
 

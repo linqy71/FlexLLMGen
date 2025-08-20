@@ -49,13 +49,17 @@ class RadixTreeNode:
         self.children:Dict[int,RadixTreeNode] = {} 
     
     def __repr__(self):
-        return f"Node(token={self.tokens}, mapping_list={self.mapping_list})"
+        return f"Node(token={self.tokens})"
     
     def sort_by_importance(self):
         self.mapping_list.sort(key=lambda i: self.tokens[i].importance, reverse=True)
 
-    def get_sorted_tokens(self):
-        return [self.tokens[i] for i in self.mapping_list]
+    def get_sorted_token(self, idx):
+        return self.tokens[self.mapping_list[idx]]
+
+    def get_all_sorted_token(self):
+        return [self.tokens[i] for i in self.mapping_list]    
+
     
     @classmethod
     def create_from_token_id(cls,tokens:List[int], kv_ptr=None):
@@ -116,7 +120,6 @@ class RadixTree:
                 current.children[next_token] = new_node
                 break
 
-    # 查询最长公共前缀，返回最长公共前缀的kv_ptr
     def search(self, key:List[int]):
         current = self.root
         remaining = key
@@ -127,7 +130,8 @@ class RadixTree:
                 child = current.children[next_token]
                 common_len = self.common_prefix_length(remaining,child.tokens)
                 ans.extend(
-                    [t.kv_ptr for t in child.tokens[:common_len]]
+                    #[t.kv_ptr for t in child.tokens[:common_len]]
+                    [t for t in child.tokens[:common_len]]
                 )
                 if common_len != len(child.tokens):
                     break
@@ -174,10 +178,20 @@ if __name__ == "__main__":
         kv_ptr = kv_ptrs[i]
         tree.insert(key,kv_ptr)
         tree.root.children[1].sort_by_importance()
+    #tree.visualize()
+
+    prefix = list()
+    inputs=[[1,5,5],[1,5,7,2]]
+    seq = inputs[0]
+    prefix = tree.search(seq)
+    prefix[0].kv_ptr.chunk_id = 1000
+    print(prefix)
+    print('=' * 20)
     tree.visualize()
 
-    prefix_kv_ptr = []
-    inputs=[[1,5,5],[1,5,7,2]]
-    for seq in inputs:
-        prefix_kv_ptr.append(tree.search(seq))
-    print(prefix_kv_ptr)
+
+    # prefix_kv_ptr = []
+    # inputs=[[1,5,5],[1,5,7,2]]
+    # for seq in inputs:
+    #     prefix_kv_ptr.append(tree.search(seq))
+    # print(prefix_kv_ptr)
