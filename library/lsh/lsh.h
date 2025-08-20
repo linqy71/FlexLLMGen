@@ -3,6 +3,7 @@
 #include<cstdio>
 #include<cstring>
 #include<iostream>
+#include<fstream>
 #include<torch/extension.h>
 #include<cassert>
 #include<algorithm>
@@ -17,7 +18,8 @@ class LSH{
         ~LSH();
         void alloc(int K, int L, int num_layers, int num_attention_heads, int num_key_value_heads, int batch_size, int max_length);
         void fill(int layer_id, int request_id, torch::Tensor sorted_hash_code_pt, torch::Tensor sorted_indices_pt);
-        void fill_p(int layer_id, int request_id, int past_hashed_tokens, torch::Tensor sorted_hash_code_pt, torch::Tensor sorted_indices_pt);
+        void save_to_file(const std::string filename);
+        void load_from_file(const std::string filename);
         void fastfill(int layer_id, int request_id, torch::Tensor hash_code_pt);
         void copy(torch::Tensor query_pt);
         void clear();

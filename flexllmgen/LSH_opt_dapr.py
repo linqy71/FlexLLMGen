@@ -798,7 +798,7 @@ class OptLM:
         self.kv_store_path = os.path.join(offload_dir, "kv_store")
         if not os.path.exists(self.kv_store_path):
             os.makedirs(self.kv_store_path)
-        self.kv_server = LSHServer(self.config, self.num_hidden_layers, self.kv_store_path, K=8, L=100, batch_size=1, max_length=8192, device='cuda:0')
+        self.kv_server = LSHServer(self.config, self.num_hidden_layers, self.kv_store_path, K=10, L=100, batch_size=1, max_length=8192, device='cuda:0')
         self.set_kv_server()
         
         for j in range(num_layers):
@@ -1104,6 +1104,16 @@ class OptLM:
                 raise ValueError(f"Invalid strategy: {self.persist_strategy}")
 
         self.kv_server.reset(switch=False)
+
+        try:
+            import subprocess
+            subprocess.run(['sudo', 'drop_cache'], check=True)
+            logger.info("Successfully dropped system caches")
+        except subprocess.CalledProcessError as e:
+            logger.warning(f"Failed to drop caches: {e}")
+        except Exception as e:
+            logger.warning(f"Unexpected error when dropping caches: {e}")
+
         logger.info("query finished , now sync the model")
         num_layers, num_gpu_batches = self.num_layers, self.policy.num_gpu_batches
         if final:
@@ -1701,7 +1711,7 @@ def add_parser_arguments(parser):
     parser.add_argument("--path", type=str, default="/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/hyk/opt_weights",
         help="The path to the model weights. If there are no cached weights, "
              "FlexLLMGen will automatically download them from HuggingFace.")
-    parser.add_argument("--offload-dir", type=str, default="/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/lqy/llm_infer/FlexLLMGen/flexllmgen_offload_dir",
+    parser.add_argument("--offload-dir", type=str, default="/ssd/nsccgz_zgchen_6/flexllmgen_offload_dir",
         help="The directory to offload tensors. ")
     parser.add_argument("--prompt-len", type=int, default=5120)
     parser.add_argument("--gen-len", type=int, default=32)

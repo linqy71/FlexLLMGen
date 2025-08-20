@@ -210,72 +210,77 @@ void LSH::fill(
   }
 }
 
-void LSH::fill_p(
-    int layer_id,
-    int request_id,
-    int past_hashed_tokens,
-    torch::Tensor sorted_hash_code_pt,
-    torch::Tensor sorted_indices_pt)
-{
-  // 这里传入的sorted_hash_code_pt是多轮拼接的hashcode
-  // 因此最后一维表示当前已累积token数量
-
-  assert(layer_id >= 0);
-  assert(layer_id < this->num_layers);
-
-  assert(request_id >= 0);
-  assert(request_id < this->batch_size);
-
-  assert(sorted_hash_code_pt.size(0) == this->num_key_value_heads);
-  assert(sorted_hash_code_pt.size(1) == this->L);
-  assert(sorted_hash_code_pt.size(2) <= this->max_length);
-
-  int seq_len = sorted_hash_code_pt.size(2) - past_hashed_tokens;
-  int stride = this->num_key_value_heads * this->L * this->num_buckets;
-  int16_t *sorted_hash_code = static_cast<int16_t *>(sorted_hash_code_pt.data_ptr() + past_hashed_tokens + 1);
-
-  int *start = this->table_start[layer_id] + request_id * stride;
-  int *end = this->table_end[layer_id] + request_id * stride;
-
-#pragma omp parallel for collapse(2) schedule(static)
-  for (int j = 0; j < this->L; ++j)
-  {
-    for (int i = 0; i < this->num_key_value_heads; ++i)
-    {
-      const int16_t *v_i = sorted_hash_code + i * (this->L * seq_len);
-      int *ms_i = start + i * (this->L * num_buckets);
-      int *me_i = end + i * (this->L * num_buckets);
-      const int16_t *v_ij = v_i + j * seq_len;
-      int *ms_ij = ms_i + j * num_buckets;
-      int *me_ij = me_i + j * num_buckets;
-      for (int k = 0; k < seq_len; ++k)
-      {
-        const int v = static_cast<int>(v_ij[k]);
-        if (me_ij[v] == 0)
-        {
-          ms_ij[v] = k;
-          me_ij[v] = k + 1;
-        }
-        else
-        {
-          me_ij[v] = me_ij[v] + 1;
-        }
-      }
+// 保存到文件
+void LSH::save_to_file(const std::string filename) {
+    std::ofstream out(filename, std::ios::binary);
+    if (!out) {
+        throw std::runtime_error("Cannot open file for writing");
     }
-  }
 
-  assert(sorted_indices_pt.size(0) == this->num_key_value_heads);
-  assert(sorted_indices_pt.size(1) == this->L);
-  assert(sorted_indices_pt.size(2) == seq_len + past_hashed_tokens);
+    // 写入基本参数
+    out.write(reinterpret_cast<const char*>(&K), sizeof(K));
+    out.write(reinterpret_cast<const char*>(&L), sizeof(L));
+    out.write(reinterpret_cast<const char*>(&num_layers), sizeof(num_layers));
+    out.write(reinterpret_cast<const char*>(&num_attention_heads), sizeof(num_attention_heads));
+    out.write(reinterpret_cast<const char*>(&num_key_value_heads), sizeof(num_key_value_heads));
+    out.write(reinterpret_cast<const char*>(&batch_size), sizeof(batch_size));
+    out.write(reinterpret_cast<const char*>(&max_length), sizeof(max_length));
 
-  int *sorted_indices = static_cast<int *>(sorted_indices_pt.data_ptr() + past_hashed_tokens);
-  int *content = this->table[layer_id] + request_id * this->num_key_value_heads * this->L * this->max_length;
+    // 写入表数据
+    for (int i = 0; i < num_layers; ++i) {
+        out.write(reinterpret_cast<const char*>(table_start[i]), 
+                 batch_size * num_key_value_heads * L * num_buckets * sizeof(int));
+        out.write(reinterpret_cast<const char*>(table_end[i]), 
+                 batch_size * num_key_value_heads * L * num_buckets * sizeof(int));
+        out.write(reinterpret_cast<const char*>(table[i]), 
+                 batch_size * num_key_value_heads * L * max_length * sizeof(int));
+    }
 
-#pragma omp parallel for schedule(static, 1) num_threads(LSH_THREADS)
-  for (int i = 0; i < this->num_key_value_heads * this->L; ++i)
-  {
-    fast_memcpy_avx512(content + i * max_length + past_hashed_tokens, sorted_indices + i * seq_len, seq_len);
-  }
+    // 写入mask
+    out.write(reinterpret_cast<const char*>(mask), 
+             batch_size * num_attention_heads * max_length * sizeof(uint8_t));
+
+    out.close();
+}
+
+// 从文件加载
+void LSH::load_from_file(const std::string filename) {
+    std::ifstream in(filename, std::ios::binary);
+    if (!in) {
+        throw std::runtime_error("Cannot open file for reading");
+    }
+
+    // 读取基本参数
+    in.read(reinterpret_cast<char*>(&K), sizeof(K));
+    in.read(reinterpret_cast<char*>(&L), sizeof(L));
+    in.read(reinterpret_cast<char*>(&num_layers), sizeof(num_layers));
+    in.read(reinterpret_cast<char*>(&num_attention_heads), sizeof(num_attention_heads));
+    in.read(reinterpret_cast<char*>(&num_key_value_heads), sizeof(num_key_value_heads));
+    in.read(reinterpret_cast<char*>(&batch_size), sizeof(batch_size));
+    in.read(reinterpret_cast<char*>(&max_length), sizeof(max_length));
+
+    // 重新计算派生参数
+    num_buckets = static_cast<int>(pow(2, K));
+    num_attention_groups = static_cast<int>(num_attention_heads / num_key_value_heads);
+
+    // 分配内存
+    alloc(K, L, num_layers, num_attention_heads, num_key_value_heads, batch_size, max_length);
+
+    // 读取表数据
+    for (int i = 0; i < num_layers; ++i) {
+        in.read(reinterpret_cast<char*>(table_start[i]), 
+               batch_size * num_key_value_heads * L * num_buckets * sizeof(int));
+        in.read(reinterpret_cast<char*>(table_end[i]), 
+               batch_size * num_key_value_heads * L * num_buckets * sizeof(int));
+        in.read(reinterpret_cast<char*>(table[i]), 
+               batch_size * num_key_value_heads * L * max_length * sizeof(int));
+    }
+
+    // 读取mask
+    in.read(reinterpret_cast<char*>(mask), 
+           batch_size * num_attention_heads * max_length * sizeof(uint8_t));
+
+    in.close();
 }
 
 void LSH::copy(
@@ -493,7 +498,8 @@ PYBIND11_MODULE(lsh, m)
       .def(py::init<>())
       .def("alloc", &LSH::alloc)
       .def("fill", &LSH::fill)
-      .def("fill_p", &LSH::fill_p)
+      .def("save_to_file", &LSH::save_to_file)
+      .def("load_from_file", &LSH::load_from_file)
       .def("clear", &LSH::clear)
       .def("copy", &LSH::copy)
       .def("fastfill", &LSH::fastfill)
