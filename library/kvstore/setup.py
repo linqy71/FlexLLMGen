@@ -9,7 +9,7 @@ setup(
             name="kvstore",
             sources=["kvstore.cc"],
             include_dirs=["."],
-            extra_compile_args=["-std=c++17", "-g", "-O0"],
+            extra_compile_args=["-std=c++17", "-g", "-O0", "-D_GNU_SOURCE"],
         )
     ],
     cmdclass={

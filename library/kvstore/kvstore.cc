@@ -127,6 +127,80 @@ void KVStore::write_to_storage(
     int layer_id,
     const std::vector<std::vector<int>>& strategy 
 ) {
+
+    this->store_path = path;
+    DTYPE * k = this->key_cache[layer_id];
+    DTYPE * v = this->value_cache[layer_id];
+
+    std::string file_name = this->store_path + "/" + std::to_string(prefix_id) + ".bin";
+    int fd = open(file_name.c_str(), O_WRONLY | O_CREAT | O_DIRECT | O_APPEND, 0644);
+    if (fd == -1) {
+        perror("open");
+        return;
+    }
+    off_t current_size = lseek(fd, 0, SEEK_END);
+    
+    const size_t alignment = 512;
+    const size_t dtype_size = sizeof(DTYPE);
+
+    size_t entry_size = 2 * this->head_dim * sizeof(DTYPE); // key + value
+    size_t total_size = entry_size * this->offload_len * this->num_key_value_heads;
+    // Ensure total_size is aligned
+    if (total_size % alignment != 0) {
+        total_size = ((total_size / alignment) + 1) * alignment;
+    }
+
+    DTYPE* aligned_buffer;
+    posix_memalign((void**)&aligned_buffer, alignment, total_size);
+    memset(aligned_buffer, 0, total_size);
+
+    for (int i = 0; i < this->num_key_value_heads; i++){
+        const std::vector<int>& head_strategy = strategy[i];
+        size_t head_entries = head_strategy.size();
+
+        DTYPE* head_key = k + i * this->max_length * this->head_dim;
+        DTYPE* head_value = v + i * this->max_length * this->head_dim;
+
+        for (size_t j = 0; j < head_entries; j++) {
+            int idx = head_strategy[j];
+
+            DTYPE* cur_key = head_key + idx * this->head_dim;
+            DTYPE* cur_value = head_value + idx * this->head_dim;
+
+            // Calculate aligned offsets
+            size_t buffer_offset = i * entry_size * this->offload_len + j * entry_size;
+            DTYPE* key_dest = aligned_buffer + (buffer_offset / dtype_size);
+            DTYPE* value_dest = key_dest + this->head_dim;
+
+            // Verify alignment of destination pointers
+            assert(reinterpret_cast<uintptr_t>(key_dest) % alignment == 0);
+            assert(reinterpret_cast<uintptr_t>(value_dest) % alignment == 0);
+
+            // copy key
+            memcpy(key_dest, cur_key, this->head_dim * sizeof(DTYPE));
+            // copy value
+            memcpy(value_dest, cur_value, this->head_dim * sizeof(DTYPE));
+
+            // record meta
+            size_t file_offset = current_size + buffer_offset;
+            uint64_t meta_id = get_meta_id(idx, layer_id, i);
+            kv_meta->insert({meta_id, uint64_t(file_offset)});
+        }
+    }
+    
+    ssize_t written = write(fd, aligned_buffer, total_size);
+    free(aligned_buffer);
+    close(fd);
+    this->persisted = true;
+
+}
+
+void KVStore::write_to_file(
+    std::string path,
+    int prefix_id,
+    int layer_id,
+    const std::vector<std::vector<int>>& strategy 
+) {
     this->store_path = path;
     DTYPE * k = this->key_cache[layer_id];
     DTYPE * v = this->value_cache[layer_id];
@@ -325,6 +399,79 @@ void KVStore::load_key_value(
     int layer_id,
     int head_id)
 {
+    const size_t alignment = 4096; // Should match filesystem block size
+    const size_t dtype_size = sizeof(DTYPE);
+    size_t entry_size = 2 * this->head_dim * dtype_size; // key + value
+
+    // open with O_DIRECT
+    std::string file_name = this->store_path + "/" + std::to_string(prefix_id) + ".bin";
+    int fd = open(file_name.c_str(), O_RDONLY | O_DIRECT);
+    if (fd == -1) {
+        perror("open");
+        return;
+    }
+    
+    int count = 0;
+    for (const auto& [offset, length] : content) {
+        // Calculate aligned parameters for the read
+        size_t aligned_offset = (offset / alignment) * alignment;
+        size_t aligned_length = ((offset % alignment) + length + alignment - 1) / alignment * alignment;
+        size_t read_offset = offset - aligned_offset;
+        
+        // Allocate aligned buffer for the read
+        DTYPE* aligned_buffer;
+        if (posix_memalign((void**)&aligned_buffer, alignment, aligned_length) != 0) {
+            close(fd);
+            throw std::runtime_error("Failed to allocate aligned buffer");
+        }
+        // Perform aligned read
+        if (lseek(fd, aligned_offset, SEEK_SET) == -1) {
+            perror("lseek");
+            free(aligned_buffer);
+            continue;
+        }
+
+        ssize_t bytes_read = read(fd, aligned_buffer, aligned_length);
+        if (bytes_read == -1) {
+            perror("read");
+            free(aligned_buffer);
+            continue;
+        }
+        // Verify we got enough data
+        if (static_cast<size_t>(bytes_read) < (read_offset + length)) {
+            free(aligned_buffer);
+            throw std::runtime_error("Read returned insufficient data");
+        }
+        // Process the actual data we need (starting at read_offset, length bytes)
+        char* data_start = reinterpret_cast<char*>(aligned_buffer) + read_offset;
+        int num_entries = length / entry_size;
+
+        for (int i = 0; i < num_entries; i++) {
+            DTYPE* entry = reinterpret_cast<DTYPE*>(data_start + i * entry_size);
+            DTYPE* cur_key = entry;
+            DTYPE* cur_value = entry + this->head_dim;
+
+            // 写入 queried_key 和 queried_value 中对应 head_id 和 position
+            int key_offset = head_id * this->max_length * this->head_dim + count * this->head_dim;
+            int value_offset = head_id * this->max_length * this->head_dim + count * this->head_dim;
+
+            memcpy(this->queried_key + key_offset, cur_key, this->head_dim * sizeof(DTYPE));
+            memcpy(this->queried_value + value_offset, cur_value, this->head_dim * sizeof(DTYPE));
+
+            count++;
+        }
+        free(aligned_buffer);
+    }
+
+    close(fd);
+}
+
+void KVStore::load_key_value_from_file(
+    std::vector<std::pair<uint64_t, int>>& content,
+    int prefix_id,
+    int layer_id,
+    int head_id)
+{
     std::string file_name = this->store_path + "/" + std::to_string(prefix_id) + ".bin";
     std::ifstream file(file_name, std::ios::binary);
     if (!file.is_open()) {
@@ -400,6 +547,7 @@ PYBIND11_MODULE(kvstore, m) {
         .def("persist_meta", &KVStore::persist_meta)
         .def("recover_meta", &KVStore::recover_meta)
         .def("write_to_storage", &KVStore::write_to_storage)
+        .def("write_to_file", &KVStore::write_to_storage)
         .def("collect_queried_key_value", &KVStore::collect_queried_key_value)
         .def("get_queried_key_cache", &KVStore::get_queried_key_cache)
         .def("get_queried_value_cache", &KVStore::get_queried_value_cache)
