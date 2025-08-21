@@ -1149,7 +1149,7 @@ def copy_worker_func(queue, cuda_id):
             queue.task_done()
 
 def sync_general_copy(dst: TorchTensor, dst_indices: Tuple[slice],
-                 src: TorchTensor, src_indices: Tuple[slice],cpu_buf):
+                 src: TorchTensor, src_indices: Tuple[slice], cpu_buf):
     """synchronous copy between two tensors.
     Only supporting copy among pinned tensors on gpu, cpu, or disk.
     """
@@ -1158,6 +1158,7 @@ def sync_general_copy(dst: TorchTensor, dst_indices: Tuple[slice],
     if src_dev == DeviceType.DISK or dst_dev == DeviceType.DISK:    
         src_data = map_to_torch_tensor(src, src_indices)
         dst_data = map_to_torch_tensor(dst, dst_indices)
+
         if (src_dev == DeviceType.CUDA or
             dst_dev == DeviceType.CUDA):
             # Use a pinned cpu buffer as a relay
@@ -1167,7 +1168,7 @@ def sync_general_copy(dst: TorchTensor, dst_indices: Tuple[slice],
             dst_data.copy_(tmp_cpu_buf, non_blocking=True)
         else:
             dst_data.copy_(src_data)
-    elif src_dev == DeviceType.CPU and dst_dev == DeviceType.CUDA and not src_data.is_pinned():
+    elif src_dev == DeviceType.CPU and dst_dev == DeviceType.CUDA and not src.data.is_pinned():
         # The cpu tensor is not pinned, use pin_memory as a relay
         src = src.data[src_indices] if src_indices else src.data
         dst = dst.data[dst_indices] if dst_indices else dst.data

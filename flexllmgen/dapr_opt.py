@@ -90,8 +90,8 @@ class Policy:
 
     # Config of Chunk Pool
     chunk_size: int = 64
-    #gpu_heap_size: int = 0
-    #cpu_heap_size: int = 0
+    gpu_heap_size: int = 512
+    cpu_heap_size: int = 512
 
     @property
     def w_disk_percent(self):
@@ -420,33 +420,43 @@ class SelfAttention:
         k_cache = dst.allocate(shape, np.float16, pin_memory=pin_memory)
         v_cache = dst.allocate(shape, np.float16, pin_memory=pin_memory)
 
-        global io_bytes
-        io_bytes += n_important
-
-        global cur_continue_addr, last_id, last_offset, average_continue_addr, sum_continue_addr
-
-        layer_continue_addr = 1
-        layer_mx_continue = 0
-        layer_continue_log = []
-
+        req = defaultdict(list)
         for j in range(n_important):
             kv_ptr = self.task.common_prefix_token[imp_token_idx[j]].kv_ptr[layer]
             chunk_id, offset = kv_ptr.chunk_id, kv_ptr.offset
-            #logger.info(f"Get prefix kv: chunk_id={chunk_id}, offset={offset}")
-            self.chunk_pool.get_full_head_cache(k_cache, v_cache, j, chunk_id, offset)
+            req[chunk_id].append((offset, j))
+
+        for chunk_id, store_ptr in req.items():
+            self.chunk_pool.get_full_head_cache_impress(k_cache, v_cache, chunk_id, store_ptr)
+
+
+        # global io_bytes
+        # io_bytes += n_important
+
+        # global cur_continue_addr, last_id, last_offset, average_continue_addr, sum_continue_addr
+
+        # layer_continue_addr = 1
+        # layer_mx_continue = 0
+        # layer_continue_log = []
+
+        # for j in range(n_important):
+        #     kv_ptr = self.task.common_prefix_token[imp_token_idx[j]].kv_ptr[layer]
+        #     chunk_id, offset = kv_ptr.chunk_id, kv_ptr.offset
+        #     #logger.info(f"Get prefix kv: chunk_id={chunk_id}, offset={offset}")
+        #     self.chunk_pool.get_full_head_cache(k_cache, v_cache, j, chunk_id, offset)
 
             
-            if last_id == chunk_id and last_offset + 1 == offset:
-                layer_continue_addr += 1
-                layer_mx_continue = max(layer_mx_continue, layer_continue_addr)
-            else:
-                if layer_continue_addr != 1:
-                    layer_continue_log.append(layer_continue_addr)
-                    average_continue_addr.append(layer_continue_addr)
-                layer_continue_addr = 1
+        #     if last_id == chunk_id and last_offset + 1 == offset:
+        #         layer_continue_addr += 1
+        #         layer_mx_continue = max(layer_mx_continue, layer_continue_addr)
+        #     else:
+        #         if layer_continue_addr != 1:
+        #             layer_continue_log.append(layer_continue_addr)
+        #             average_continue_addr.append(layer_continue_addr)
+        #         layer_continue_addr = 1
 
-            last_id = chunk_id
-            last_offset = offset
+        #     last_id = chunk_id
+        #     last_offset = offset
         # logger.info(f"Get prefix kv: layer_mx_continue:{layer_mx_continue}")
         # logger.info(f"Get prefix kv: layer_average_continue:{sum(layer_continue_log) / len(layer_continue_log)}")
         # logger.info(f"Get Prefix kv:log={layer_continue_log}")
@@ -821,7 +831,7 @@ class OptLM:
         self.init_all_weights() # 权重全部读入weights_home
 
         self.radix_tree = RadixTree() 
-        self.chunk_pool = ChunkPool(self.env, self.config, self.policy.gpu_batch_size, self.policy.chunk_size) # Initialize chunk pool
+        self.chunk_pool = ChunkPool(self.env, self.config, self.policy.gpu_batch_size, self.policy.chunk_size, self.policy.gpu_heap_size, self.policy.cpu_heap_size) # Initialize chunk pool
 
         self.set_chunk_pool()
         for j in range(num_layers):
@@ -1157,6 +1167,7 @@ class OptLM:
         self.sync()
         self.store_prefix_cache()
         self.sync()
+        self.chunk_pool.sync()
         logger.info("query finished , now sync the model")
         num_layers, num_gpu_batches = self.num_layers, self.policy.num_gpu_batches
         if final:
@@ -1166,6 +1177,8 @@ class OptLM:
                     self.delete_cache(j, k)
             if self.policy.cpu_cache_compute:
                 self.env.cpu.del_attention_compute_workspace()
+            
+            self.chunk_pool.close_copy_threads()
 
 
     def generation_loop_normal(self):
@@ -1412,14 +1425,16 @@ class OptLM:
 
             self.sync()
             #logger.info(f"KV reordering: Before Delete:{len(self.chunk_pool.pool)}")
-            keys_to_delete = [k for k in self.chunk_pool.pool if k < new_chunk_id]
+            keys_to_delete = [k for k in self.chunk_pool.chunk_table if k < new_chunk_id]
 
             for k in keys_to_delete:
-                v = self.chunk_pool.pool[k]
+                v = self.chunk_pool.chunk_table[k]
                 v.delete()                  
-                del self.chunk_pool.pool[k] 
+                del self.chunk_pool.chunk_table[k] 
             #logger.info(f"KV reordering: Before Delete:{len(self.chunk_pool.pool)}")
             
+            self.chunk_pool.cpu_cache.clear()
+            self.chunk_pool.gpu_cache.clear()
             return
         
 
@@ -1698,7 +1713,7 @@ def run_dapr_flexllmgen(args):
 
     context, questions = process_dapr()
     
-    inputs = [context[-8520:] +  query + "\n" for query in questions[:5]]
+    inputs = [context[-8192:] +  query + "\n" for query in questions]
     inputs_ids = tokenizer(inputs, truncation=True, max_length=max_prompt_len).input_ids
     output_ids = model.generate(
         inputs=[inputs_ids[0]], max_new_tokens = 1, debug_mode=args.debug_mode, 
@@ -1752,20 +1767,22 @@ def run_dapr_flexllmgen(args):
 
         print("imp load :",timers("imp load and compute").elapsed("average"))
         print("imp sum:",timers("imp load and compute").elapsed("sum"))
-        print("store cache:",timers("cache store").costs)
+        #print("store cache:",timers("cache store").costs)
         print("generate:", timers("generate").costs)
         print("generate sum:", timers("generate").elapsed("sum"))
-        print("total io token:", io_bytes)
-        print("total continue token", cur_continue_addr)
-        if i!=0:
-            print("average continue:", sum(average_continue_addr) / len(average_continue_addr))
-            print("sum avg:", sum(average_continue_addr))
+        # print("total io token:", io_bytes)
+        # print("total continue token", cur_continue_addr)
+        # if i!=0:
+        #     print("average continue:", sum(average_continue_addr) / len(average_continue_addr))
+        #     print("sum avg:", sum(average_continue_addr))
         print("=" * 50)
 
         if(i == len(inputs) // 2):
-            model.radix_tree.visualize()
             model.kv_reordering()
-        
+
+
+        logger.info(f"gpu_cache:{len(model.chunk_pool.gpu_cache._heap._pos)}")
+        logger.info(f"cpu_cache:{len(model.chunk_pool.cpu_cache._heap._pos)}")
         subprocess.run(['sudo', 'drop_cache'], check=True)
 
 

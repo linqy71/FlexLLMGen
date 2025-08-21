@@ -1,10 +1,12 @@
 from itertools import count
-from typing import Dict, List
+import queue
+import threading
+from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
 from flexllmgen.utils import ValueHolder
-from flexllmgen.pytorch_backend import TorchTensor,TorchDevice,TorchDisk, general_copy, sync_general_copy
+from flexllmgen.pytorch_backend import TorchTensor,TorchDevice,TorchDisk, general_copy, sync_general_copy, DeviceType, map_to_torch_tensor 
 from flexllmgen.utils import (GB, T, cpu_mem_stats, vector_gather,
     np_dtype_to_torch_dtype, torch_dtype_to_np_dtype,
     torch_dtype_to_num_bytes)
@@ -17,8 +19,43 @@ logging.basicConfig(#filename="test.log", filemode="w",
                     datefmt="%m-%d %H:%M:%S", level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
+class Chunk:
+    def __init__(self, device, cache_shape, chunk_id=None):
+        self.device = device
+        self.full_head_k = device.allocate(shape=cache_shape, dtype=np.float16, pin_memory=True)
+        self.full_head_v = device.allocate(shape=cache_shape, dtype=np.float16, pin_memory=True)
+    
+    def delete(self):
+        self.full_head_v.delete()
+        self.full_head_k.delete()
+
+class ChunkMeta:
+    def __init__(self, chunk_size, chunk_id:int, disk_ref:Chunk):
+        self.chunk_id = chunk_id
+        self.chunk_size = chunk_size
+
+        self.ir_avg = 0
+        self.access_count = 0
+        self.score = 0
+
+        self.loc = 0
+
+        self.disk_ref:Chunk = disk_ref
+        
+    def update_on_access(self, hits:int):
+        instant_ir = hits / self.chunk_size
+        self.ir_avg = (self.ir_avg * self.access_count + instant_ir)/(self.access_count + 1)
+        self.access_count += 1
+        self.score += instant_ir
+    
+    def delete(self):
+        self.disk_ref.delete()
+
+
 class ChunkPool:
-    def __init__(self, env, config, batch_size = 1, chunk_size:int = 4, gpu_heap_size:int = 0, cpu_heap_size:int = 0, ):
+    chunk_id = count()
+
+    def __init__(self, env, config, batch_size = 1, chunk_size:int = 4, gpu_cache_size:int = 512, cpu_cache_size:int = 512):
         '''
         目前只用了self.pool:Dict[int, Chunk]={},通过chunk_id得到Chunk. 所有Chunk都在磁盘上
         chunk_size表明存了多少个token的一层的KV缓存
@@ -28,66 +65,94 @@ class ChunkPool:
         n_head = config.n_head
         n_probe_head = 3
         head_dim = config.input_dim // n_head
+
         self.chunk_shape = (chunk_size, batch_size * n_head, head_dim)
 
         self.env = env
         self.gpu = env.gpu
         self.cpu = env.cpu
         self.disk = env.disk
-        # self.gpu_heap_size = gpu_heap_size
-        # self.cpu_heap_size = cpu_heap_size
-        
 
-        # self.cpu_chunk = List[Chunk]
-        # self.gpu_chunk = List[Chunk]
-        self.pool:Dict[int, Chunk]={}
+        self.gpu_cache_size = gpu_cache_size
+        self.cpu_cache_size = cpu_cache_size
+        
+        self.cpu_cache = ScoredCache(device=self.cpu, cache_shape=self.chunk_shape, capacity=cpu_cache_size)
+        self.gpu_cache = ScoredCache(device=self.gpu, cache_shape=self.chunk_shape, capacity=gpu_cache_size)
+
+        self.chunk_table:Dict[int, ChunkMeta] = {}
 
         self.current_id = None
         self.current_offset = None
 
-        self.sync_copy_stream = torch.cuda.Stream()
         self.cpu_buf = torch.empty((1 * GB,), dtype=torch.float16, pin_memory=True)
-    
-    def switch_to_new_chunk(self, name=None):
-        new_chunk = Chunk(self.disk, self.chunk_shape, chunk_id=name)
-        
-        self.pool[new_chunk.chunk_id] = new_chunk
 
-        self.current_id = new_chunk.chunk_id
+    @classmethod
+    def next_chunk_id(cls):
+        return next(cls.chunk_id)
+    
+    def init_new_chunk(self):
+        chunk_id = ChunkPool.next_chunk_id()    
+
+        disk_ref = Chunk(device=self.disk, cache_shape=self.chunk_shape, chunk_id=chunk_id)
+        chunk_meta = ChunkMeta(chunk_size=self.chunk_size, chunk_id=chunk_id, disk_ref=disk_ref)
+
+        self.chunk_table[chunk_id] = chunk_meta
+
+        return chunk_id
+    
+    def delete_chunk(self, chunk_id):
+        pass
+    
+    def get_chunk_data(self, chunk_id):
+        if chunk_id not in self.chunk_table:
+            return None
+        
+        chunk_data = (self.gpu_cache.get_cache(chunk_id=chunk_id) or
+                    self.cpu_cache.get_cache(chunk_id=chunk_id) or
+                    self.chunk_table[chunk_id].disk_ref)
+
+        return chunk_data
+
+    def update_score(self, chunk_id:int, hits:int):
+        chunk_meta = self.chunk_table[chunk_id]
+
+        chunk_meta.update_on_access(hits)
+
+        score = chunk_meta.score
+
+        chunk_data = self.get_chunk_data(chunk_id)
+        
+        if self.gpu_cache.insert_cache(chunk_id, score, chunk_data):
+            return
+        if self.cpu_cache.insert_cache(chunk_id, score, chunk_data):
+            return
+
+    def switch_to_new_chunk(self, name=None):
+        new_chunk_id = self.init_new_chunk()
+
+        self.current_id = new_chunk_id
         self.current_offset = 0
 
         return self.current_id
-
-
-    def init_new_chunk(self, device, name = None):
-        '''
-        创建一个新Chunk, 返回新Chunk的id
-        '''
-        #chunk_probe_shape = (probe_shape[0] * self.chunk_size, *probe_shape[1:])
-        new_chunk = Chunk(device, self.chunk_shape, chunk_id=name)
-        #logger.info(f"Init new chunk{new_chunk.chunk_id} with full head shape {full_head_shape} on device {device}")
-        self.pool[new_chunk.chunk_id] = new_chunk
-        return new_chunk.chunk_id
-
+    
     def store_kv_cache(self, k_cache, v_cache, cache_offset):
         '''
         generate完后, 把新计算得到的KV存储到磁盘中
         self.current_id  self.current_offset指向当前可存储的空余位置。
         如果self.current_offset == chunk_size,就会新创建一个Chunk并令current_id=new_chunk.id  current_offset = 0
         '''
-
         if isinstance(k_cache, int):
-            src_chunk = self.pool[k_cache]
+            src_chunk = self.get_chunk_data(k_cache)
 
             k_cache = src_chunk.full_head_k
             v_cache = src_chunk.full_head_v
 
 
         if self.current_id == None:
-            self.current_id = self.init_new_chunk(device=self.disk)
+            self.current_id = self.init_new_chunk()
             self.current_offset = 0
 
-        tgt_chunk = self.pool[self.current_id]
+        tgt_chunk = self.chunk_table[self.current_id].disk_ref
 
         full_head_k = tgt_chunk.full_head_k
         full_head_v = tgt_chunk.full_head_v
@@ -114,13 +179,14 @@ class ChunkPool:
             src=v_cache,
             src_indices=full_head_src_indices
         )
+
         ptr = CachePointer(self.current_id, self.current_offset)
         self.current_offset += 1
         if self.current_offset == self.chunk_size:
-            self.current_id = self.init_new_chunk(device=self.disk)
+            self.current_id = self.init_new_chunk()
             self.current_offset = 0
-        return ptr
-        
+
+        return ptr     
 
     def get_probe_cache(self, k_cache, cache_offset:int, chunk_id:int, offset:int):
         '''
@@ -129,10 +195,10 @@ class ChunkPool:
         cache_offset的作用是标识现在已经复制了几个token，从而得到要复制到k_cache中的(cache_offset:cache_offset + 1,:,:)
         从chunk内完整的k缓存(chunk_size, b * n_head, head_dim)中切出需要的部分
         '''
-        src_chunk = self.pool[chunk_id]
+        src_chunk = self.get_chunk_data(chunk_id)
 
-        src_chunk.access_count += 1
-        
+        # logger.info(f"ChunkPool_get_probe: use chunk on device={src_chunk.device}")
+
         src_cache = src_chunk.full_head_k
         
         src_indices = (
@@ -159,7 +225,7 @@ class ChunkPool:
         和get_probe_cache是类似的方法。
         为了同步且不干扰别的流, 新创建了一个CUDA Stream
         '''
-        src_chunk = self.pool[chunk_id]
+        src_chunk = self.disk_pool[chunk_id]
 
         src_chunk.access_count += 1
         
@@ -177,7 +243,47 @@ class ChunkPool:
             slice(0, k_cache.shape[1]),                 
             slice(0, k_cache.shape[2])                  
         )
-        with torch.cuda.stream(self.sync_copy_stream):
+        sync_general_copy(
+            dst=k_cache,
+            dst_indices=dst_indices,
+            src=full_head_k,
+            src_indices=src_indices,
+            cpu_buf=self.cpu_buf
+        )
+
+        sync_general_copy(
+            dst=v_cache,
+            dst_indices=dst_indices,
+            src=full_head_v,
+            src_indices=src_indices,
+            cpu_buf=self.cpu_buf
+        )
+
+    def get_full_head_cache_impress(self, k_cache, v_cache, chunk_id, store_ptr):
+        '''
+        1. 更新IR access_count score
+        2. 获取tgt_chunk
+        3. 根据dst src offset 进行复制
+        4. 判断是否保存在GPU。。
+        '''
+        src_chunk = self.get_chunk_data(chunk_id)
+
+        # logger.info(f"ChunkPool_get_full: use chunk on device={src_chunk.device}")
+
+        hits = len(store_ptr)
+        full_head_k = src_chunk.full_head_k
+        full_head_v = src_chunk.full_head_v
+        for src_offset, dst_offset in store_ptr:
+            src_indices = (
+                slice(src_offset, src_offset + 1), 
+                slice(0, full_head_k.shape[1]),            
+                slice(0, full_head_k.shape[2])             
+            )
+            dst_indices = (
+                slice(dst_offset, dst_offset + 1),  
+                slice(0, k_cache.shape[1]),                 
+                slice(0, k_cache.shape[2])                  
+            )
             sync_general_copy(
                 dst=k_cache,
                 dst_indices=dst_indices,
@@ -193,38 +299,232 @@ class ChunkPool:
                 src_indices=src_indices,
                 cpu_buf=self.cpu_buf
             )
-        self.sync_copy_stream.synchronize()
 
-    def get_full_head_cache_impress(self, k_cache, v_cache, dst_offset, chunk_id, src_offset):
-        '''
-        1. 更新IR access_count score
-        2. 获取tgt_chunk
-        3. 根据dst src offset 进行复制
-        4. 判断是否保存在GPU。。
-        '''
-        pass
+            self.update_score(chunk_id, hits)
+        
+    def close_copy_threads(self):
+        self.gpu_cache.close_copy_threads()
+        self.cpu_cache.close_copy_threads()
+    
+    def sync(self):
+        self.gpu_cache.synchronize()
+        self.cpu_cache.synchronize()
+        
 
-class Chunk:
-    chunk_id = count()
-    def __init__(self, device, full_head_shape, chunk_id=None):
-        self.access_count = 0
-        self.important_ratio = 0
-        self.score = 0
+class ScoredCache:
+    def __init__(self, device:TorchDevice, cache_shape, capacity:int=512):
         self.device = device
-        self.chunk_id = chunk_id or Chunk.next_chunk_name()
-        # shape = (1, batch*n_probe_head, head_dim)
-        # shape = (chunk_size, batch * n_heads, head_dim)
-        self.full_head_k = device.allocate(shape=full_head_shape, dtype=np.float16, pin_memory=True)
-        self.full_head_v = device.allocate(shape=full_head_shape, dtype=np.float16, pin_memory=True)
-    
-    @classmethod
-    def next_chunk_name(cls):
-        return next(cls.chunk_id)
-    
-    def delete(self):
-        self.full_head_v.delete()
-        self.full_head_k.delete()
+        self.capacity = capacity
+        self.cache_shape = cache_shape
 
+        self.cache_space = [Chunk(device, cache_shape) for i in range(capacity)]
 
+        self._lock = threading.Lock()
+
+        # self._pos = {}  # (chunk, (status, heap_idx))
+        self._heap = IndexMinHeap(capacity) # (score, cache_idx)
+
+        # start insert or replace  1.heap.pop 2. heap.push and status = 0 3.thread copy
+        # finish insert update status in heap = 1
+        # Copy threads
+        cuda_id = 0
+        num_copy_threads = 2
+
+        self.copy_queue = queue.Queue()
+        self.copy_threads = [
+            threading.Thread(
+                target=self.chunk_copy_worker_func, args=(self.copy_queue, cuda_id)
+            ) for _ in range(num_copy_threads)
+        ]
+        for t in self.copy_threads:
+            t.start()
+
+    def submit_copy(self, *args):
+        #logger.info(f"ChunkCache submit copy:args={args}")
+        self.copy_queue.put_nowait(args)
+
+    def synchronize(self):
+        self.copy_queue.join()
+
+    def close_copy_threads(self):
+        for _ in range(len(self.copy_threads)):
+            self.copy_queue.put_nowait(None)
+        for t in self.copy_threads:
+            t.join()
+        self.copy_queue.join()
+        self.copy_queue = None
+
+    def chunk_copy_worker_func(self, queue, cuda_id):
+        cpu_buf = torch.empty((1 * GB,), dtype=torch.float16, pin_memory=True)
+        copy_stream = torch.cuda.Stream()
+        with torch.cuda.stream(copy_stream):
+            while True:
+                item = queue.get()
+                if item is None:
+                    queue.task_done()
+                    return
+
+                src_chunk, src_chunk_id, dst_cache_idx = item
+                dst_chunk = self.cache_space[dst_cache_idx]
+
+                #logger.info(f"ChunkCache Copy: src_chunk_id={src_chunk_id}, dst_cache_idx={dst_cache_idx}")
+
+                src = src_chunk.full_head_k
+                dst = dst_chunk.full_head_k
+                sync_general_copy(dst, None, src, None, cpu_buf)
+
+                src = src_chunk.full_head_v
+                dst = dst_chunk.full_head_v
+                sync_general_copy(dst, None, src, None, cpu_buf)
+
+                if src_chunk_id in self._heap._pos:
+                    self._heap.update_cache_status(chunk_id=src_chunk_id, tgt_status=1)
+
+                #logger.info(f"ChunkCache Copy: src_chunk_id={src_chunk_id}, dst_cache_idx={dst_cache_idx} finished")
+                    
+                queue.task_done()
+
+    def has_cache(self, chunk_id):
+        with self._lock:
+            return self._heap.has_cache(chunk_id)
+
+    def get_cache(self, chunk_id):
+        with self._lock:
+            if self._heap.has_cache(chunk_id):
+                status, heap_idx = self._heap._pos[chunk_id]
+                if status == 1:
+                    cache_idx = self._heap.get_cache_idx(heap_idx)
+                    return self.cache_space[cache_idx]
+        return None            
+
+    def insert_cache(self, chunk_id, score, chunk_data):
+        with self._lock:
+            if self._heap.has_cache(chunk_id):
+                self._heap.update_score(chunk_id, score)
+                return True
+            
+            min_score, _, _ = self._heap.peek_min()
+            if len(self._heap) >= self.capacity and score <= min_score:
+                return False
+
+            heap_idx, cache_idx = self._heap.push(score, chunk_id)
+            
+            # logger.info(f"ScoredCache insert_cache:chunk_type={self.device} push chunk={chunk_id}, cache_idx={cache_idx}, heap_idx={heap_idx}")\
+
+        self.submit_copy(chunk_data, chunk_id, cache_idx)
+        return True    
+    
+    def clear(self):
+        self._heap.clear()
+
+    def __del__(self):
+        for x in self.cache_space:
+            x.delete()
+
+        if self.copy_queue:
+            self.close_copy_threads()
+
+class IndexMinHeap:
+    def __init__(self, capacity:int=512):
+        self._heap = []  # list of (score, cache_id, chunk_id)
+        self._pos = {}  # chunk_id -> status, heap_idx
+        self.capacity = capacity
+    
+    def has_cache(self, chunk_id):
+        return chunk_id in self._pos
+    
+    def get_cache_idx(self, heap_idx):
+        return self._heap[heap_idx][1]
+
+    def update_cache_status(self, chunk_id, tgt_status):
+        _, heap_idx = self._pos[chunk_id]
+        self._pos[chunk_id] = tgt_status, heap_idx
+    
+    def _swap(self, i, j):
+        self._heap[i], self._heap[j] = self._heap[j], self._heap[i]
+        sj, cj = self._pos[self._heap[i][2]]
+        si, ci = self._pos[self._heap[j][2]]
+        
+        self._pos[self._heap[i][2]] = si, ci
+        self._pos[self._heap[j][2]] = sj, cj
+
+    def _sift_up(self, idx):
+        while idx > 0:
+            parent = (idx - 1) >> 1
+            if self._heap[idx][0] < self._heap[parent][0]:
+                self._swap(idx, parent)
+                idx = parent
+            else:
+                break
+
+    def _sift_down(self, idx):
+        n = len(self._heap)
+        while True:
+            left = idx * 2 + 1
+            right = left + 1
+            smallest = idx
+            if left < n and self._heap[left][0] < self._heap[smallest][0]:
+                smallest = left
+            if right < n and self._heap[right][0] < self._heap[smallest][0]:
+                smallest = right
+            if smallest == idx:
+                break
+            self._swap(idx, smallest)
+            idx = smallest
+
+    def push(self, score, chunk_id):
+        if len(self._heap) >= self.capacity:
+            _, min_cache_idx, min_chunk_id = self.pop_min()
+            cache_idx = min_cache_idx
+            self._pos.pop(min_chunk_id)
+        else:
+            cache_idx = len(self._heap)
+
+        idx = len(self._heap)
+        self._pos[chunk_id] = 0, idx
+        self._heap.append((score, cache_idx, chunk_id))
+
+        self._sift_up(idx)
+
+        return idx, cache_idx
+
+    def pop_min(self):
+        if not self._heap:
+            return None, None, None
+        min_score, min_cache_id, min_chunk_id = self._heap[0]
+        last = self._heap.pop()
+        if self._heap:
+            self._heap[0] = last
+            status, _ = self._pos[last[2]]
+            self._pos[last[2]] = status, 0
+            self._sift_down(0)
+        return min_score, min_cache_id, min_chunk_id
+
+    def update_score(self, chunk_id, new_score):
+        """原地修改 chunk 的 score(自动上浮或下沉)。"""
+        status, idx = self._pos[chunk_id]
+        if idx is None:
+            return
+        
+        old_score, cache_idx, chunk_id = self._heap[idx]
+        self._heap[idx] = (new_score, cache_idx, chunk_id)
+        if new_score < old_score:
+            self._sift_up(idx)
+        else:
+            self._sift_down(idx)
+    
+    def peek_min(self):
+        if not self._heap:
+            return None, None, None
+        min_score, min_cache_id, min_chunk_id = self._heap[0]
+        return min_score, min_cache_id, min_chunk_id
+
+    def __len__(self):
+        return len(self._heap)
+
+    def clear(self):
+        self._heap.clear()
+        self._pos.clear()
+        
 
 
