@@ -1151,6 +1151,16 @@ class OptLM:
         self.sync()
         self.store_prefix_cache()
         self.sync()
+        
+        try:
+            import subprocess
+            subprocess.run(['sudo', 'drop_cache'], check=True)
+            logger.info("Successfully dropped system caches")
+        except subprocess.CalledProcessError as e:
+            logger.warning(f"Failed to drop caches: {e}")
+        except Exception as e:
+            logger.warning(f"Unexpected error when dropping caches: {e}")
+        
         logger.info("query finished , now sync the model")
         num_layers, num_gpu_batches = self.num_layers, self.policy.num_gpu_batches
         if final:
@@ -1648,7 +1658,7 @@ def run_dapr_flexllmgen(args):
 
     context, questions = process_dapr()
     
-    inputs = [context[-8520:] +  query + "\n" for query in questions]
+    inputs = [context[:4096] +  query + "\n" for query in questions]
     inputs_ids = tokenizer(inputs, truncation=True, max_length=max_prompt_len).input_ids
     output_ids = model.generate(
         inputs=[inputs_ids[1]], max_new_tokens = 1, debug_mode=args.debug_mode, 
@@ -1721,14 +1731,14 @@ def run_dapr_flexllmgen(args):
 
 
 def add_parser_arguments(parser):
-    parser.add_argument("--model", type=str, default="facebook/opt-6.7b",
+    parser.add_argument("--model", type=str, default="facebook/opt-30b",
         help="The model name.")
     parser.add_argument("--tokenizer-path", type=str, default="/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/hyk/param/opt-30b",
                         help="The path to the tokenizer.")
     parser.add_argument("--path", type=str, default="/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/hyk/opt_weights",
         help="The path to the model weights. If there are no cached weights, "
              "FlexLLMGen will automatically download them from HuggingFace.")
-    parser.add_argument("--offload-dir", type=str, default="/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/hyk/my_FlexLLMGen/flexllmgen_offload_dir",
+    parser.add_argument("--offload-dir", type=str, default="/ssd/nsccgz_zgchen_6/lqy/flexllmgen_offload_dir/impress",
         help="The directory to offload tensors. ")
     parser.add_argument("--prompt-len", type=int, default=2048)
     parser.add_argument("--gen-len", type=int, default=32)

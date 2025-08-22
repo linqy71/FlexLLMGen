@@ -36,9 +36,9 @@ class Task:
     common_prefix_kv_ptr: List[List[CachePointer]] # shape(prefix_len, num_layers)
 
     ### for lsh, dict: prefix_id, max_common_len
-    matched_prefix: dict
-    prefix_only: bool
-    new_prefix_id: int
+    matched_prefix: dict = None
+    prefix_only: bool = None
+    new_prefix_id: int = None
 
 @dataclasses.dataclass(frozen=True)
 class ExecutionEnv:
