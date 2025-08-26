@@ -38,8 +38,6 @@ class ChunkMeta:
         self.access_count = 0
         self.score = 0
 
-        self.loc = 0
-
         self.disk_ref:Chunk = disk_ref
         
     def update_on_access(self, hits:int):
@@ -225,9 +223,11 @@ class ChunkPool:
         和get_probe_cache是类似的方法。
         为了同步且不干扰别的流, 新创建了一个CUDA Stream
         '''
-        src_chunk = self.disk_pool[chunk_id]
+        #src_chunk = self.disk_pool[chunk_id]
 
-        src_chunk.access_count += 1
+        #src_chunk.access_count += 1
+
+        src_chunk = self.get_chunk_data(chunk_id)
         
         full_head_k = src_chunk.full_head_k
         full_head_v = src_chunk.full_head_v
@@ -300,7 +300,7 @@ class ChunkPool:
                 cpu_buf=self.cpu_buf
             )
 
-            self.update_score(chunk_id, hits)
+        self.update_score(chunk_id, hits)
         
     def close_copy_threads(self):
         self.gpu_cache.close_copy_threads()
@@ -324,11 +324,10 @@ class ScoredCache:
         # self._pos = {}  # (chunk, (status, heap_idx))
         self._heap = IndexMinHeap(capacity) # (score, cache_idx)
 
-        # start insert or replace  1.heap.pop 2. heap.push and status = 0 3.thread copy
-        # finish insert update status in heap = 1
+
         # Copy threads
-        cuda_id = 0
-        num_copy_threads = 2
+        cuda_id = 7
+        num_copy_threads = 4
 
         self.copy_queue = queue.Queue()
         self.copy_threads = [
@@ -376,9 +375,13 @@ class ScoredCache:
                 src = src_chunk.full_head_v
                 dst = dst_chunk.full_head_v
                 sync_general_copy(dst, None, src, None, cpu_buf)
-
-                if src_chunk_id in self._heap._pos:
-                    self._heap.update_cache_status(chunk_id=src_chunk_id, tgt_status=1)
+                
+                #logger.info(f"Chunk_Copy: finish copy src_chunk_id={src_chunk_id}, dst_cache_idx={dst_cache_idx}")
+                with self._lock:
+                    if src_chunk_id in self._heap._pos:
+                        #logger.info(f"Chunk_Copy: Before update status chunk_id={src_chunk_id}, state={self._heap._pos[src_chunk_id]}, heap={self._heap._heap}")
+                        self._heap.update_cache_status(chunk_id=src_chunk_id, tgt_status=1)
+                        #logger.info(f"Chunk_Copy: After update status chunk_id={src_chunk_id}, state={self._heap._pos[src_chunk_id]}, heap={self._heap._heap}")
 
                 #logger.info(f"ChunkCache Copy: src_chunk_id={src_chunk_id}, dst_cache_idx={dst_cache_idx} finished")
                     
@@ -408,11 +411,9 @@ class ScoredCache:
                 return False
 
             heap_idx, cache_idx = self._heap.push(score, chunk_id)
-            
-            # logger.info(f"ScoredCache insert_cache:chunk_type={self.device} push chunk={chunk_id}, cache_idx={cache_idx}, heap_idx={heap_idx}")\
-
-        self.submit_copy(chunk_data, chunk_id, cache_idx)
-        return True    
+            #logger.info(f"ScoredCache submit_copy: chunk_type={self.device} push chunk={chunk_id}, cache_idx={cache_idx}, heap_idx={heap_idx}, pos_state={self._heap._pos[chunk_id]}")
+            self.submit_copy(chunk_data, chunk_id, cache_idx)
+            return True    
     
     def clear(self):
         self._heap.clear()
@@ -427,7 +428,7 @@ class ScoredCache:
 class IndexMinHeap:
     def __init__(self, capacity:int=512):
         self._heap = []  # list of (score, cache_id, chunk_id)
-        self._pos = {}  # chunk_id -> status, heap_idx
+        self._pos = {}  # chunk_id -> state, heap_idx
         self.capacity = capacity
     
     def has_cache(self, chunk_id):
@@ -441,16 +442,22 @@ class IndexMinHeap:
         self._pos[chunk_id] = tgt_status, heap_idx
     
     def _swap(self, i, j):
-        self._heap[i], self._heap[j] = self._heap[j], self._heap[i]
-        sj, cj = self._pos[self._heap[i][2]]
-        si, ci = self._pos[self._heap[j][2]]
+        ci, cj = self._heap[i][2], self._heap[j][2]
         
-        self._pos[self._heap[i][2]] = si, ci
-        self._pos[self._heap[j][2]] = sj, cj
+        # 获取当前状态
+        state_i, _ = self._pos[ci]
+        state_j, _ = self._pos[cj]
+        
+        # 只交换索引，保持状态不变
+        self._pos[ci] = (state_i, j)  # 保持ci的状态，更新索引为j
+        self._pos[cj] = (state_j, i)  # 保持cj的状态，更新索引为i
+        
+        # 交换堆中的元素
+        self._heap[i], self._heap[j] = self._heap[j], self._heap[i]
 
     def _sift_up(self, idx):
         while idx > 0:
-            parent = (idx - 1) >> 1
+            parent = (idx - 1) // 2
             if self._heap[idx][0] < self._heap[parent][0]:
                 self._swap(idx, parent)
                 idx = parent
@@ -476,16 +483,18 @@ class IndexMinHeap:
         if len(self._heap) >= self.capacity:
             _, min_cache_idx, min_chunk_id = self.pop_min()
             cache_idx = min_cache_idx
-            self._pos.pop(min_chunk_id)
+            self._pos.pop(min_chunk_id) 
+            #logger.info(f"IndexMinHeap: remove chunk_id={min_chunk_id}")
         else:
             cache_idx = len(self._heap)
 
         idx = len(self._heap)
         self._pos[chunk_id] = 0, idx
+        #logger.info(f"Heap Push: Before heap_push: score={score}, chunk_id={chunk_id},state={self._pos[chunk_id]}, heap={self._heap}")
         self._heap.append((score, cache_idx, chunk_id))
-
+        
         self._sift_up(idx)
-
+        #logger.info(f"Heap Push: After score={score}, chunk_id={chunk_id},state={self._pos[chunk_id]}, heap={self._heap}")
         return idx, cache_idx
 
     def pop_min(self):
@@ -495,23 +504,25 @@ class IndexMinHeap:
         last = self._heap.pop()
         if self._heap:
             self._heap[0] = last
-            status, _ = self._pos[last[2]]
-            self._pos[last[2]] = status, 0
+            state, _ = self._pos[last[2]]
+            self._pos[last[2]] = state, 0
             self._sift_down(0)
         return min_score, min_cache_id, min_chunk_id
 
     def update_score(self, chunk_id, new_score):
         """原地修改 chunk 的 score(自动上浮或下沉)。"""
-        status, idx = self._pos[chunk_id]
+        state, idx = self._pos[chunk_id]
         if idx is None:
             return
-        
+        #logger.info(f"Heap Update Score: Before chunk_id={chunk_id}, new_score={new_score}, state={self._pos[chunk_id]}")
         old_score, cache_idx, chunk_id = self._heap[idx]
         self._heap[idx] = (new_score, cache_idx, chunk_id)
         if new_score < old_score:
             self._sift_up(idx)
         else:
             self._sift_down(idx)
+        
+        #logger.info(f"Heap Update Score: After chunk_id={chunk_id}, new_score={new_score}, state={self._pos[chunk_id]}")
     
     def peek_min(self):
         if not self._heap:

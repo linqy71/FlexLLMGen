@@ -19,7 +19,7 @@ from transformers import AutoTokenizer
 from flexllmgen.compression import CompressionConfig
 from flexllmgen.opt_config import OptConfig, get_opt_config, download_opt_weights
 from flexllmgen.pytorch_backend import (TorchDevice, TorchDisk, TorchLink,
-    TorchMixedDevice, DeviceType, general_copy, fix_recursive_import)
+    TorchMixedDevice, DeviceType, general_copy, fix_recursive_import, sync_general_copy)
 from flexllmgen.timer import timers
 from flexllmgen.utils import (Task, ExecutionEnv, GB, T, ValueHolder,
     array_1d, array_2d, array_3d, str2bool, project_decode_latency,
@@ -89,8 +89,8 @@ class Policy:
     important_ratio: float = 0.2
 
     # Config of Chunk Pool
-    chunk_size: int = 64
-    gpu_heap_size: int = 512
+    chunk_size: int = 128
+    gpu_heap_size: int = 768
     cpu_heap_size: int = 512
 
     @property
@@ -1465,6 +1465,93 @@ class OptLM:
 
     def __del__(self):
         self.delete_all_weights()
+    
+    def test_probe_disk(self):
+        cpu_buf = torch.empty((1 * GB,), dtype=torch.float16, pin_memory=True)
+        timers("test_probe_disk").reset()
+        shape = (100, 3 ,128)
+        dst = self.env.gpu.allocate(shape, np.float16)
+        for i in range(100):
+            chunk_meta = self.chunk_pool.chunk_table[i]
+            disk_ref = chunk_meta.disk_ref.full_head_k
+            src_indices = (
+                slice(0, 1), 
+                slice(0, 3),            
+                slice(0, 128)             
+            )
+            dst_indices = (
+                slice(i, i + 1), 
+                slice(0, 56),            
+                slice(0, 128)             
+            )
+            timers("test_probe_disk").start()
+            sync_general_copy(dst, dst_indices, disk_ref, src_indices, cpu_buf)
+            timers("test_probe_disk").stop()
+        print("="*50)
+        print(timers("test_probe_disk").elapsed("average"))
+        print(timers("test_probe_disk").costs)
+        print("="*50) 
+
+    def test_full_disk(self):
+        cpu_buf = torch.empty((1 * GB,), dtype=torch.float16, pin_memory=True)
+        timers("test_full_disk").reset()
+        dim1 = self.config.n_head
+        shape = (100, dim1 ,128)
+        dst = self.env.gpu.allocate(shape, np.float16)
+        for i in range(100):
+            chunk_meta = self.chunk_pool.chunk_table[i]
+            disk_ref = chunk_meta.disk_ref.full_head_k
+            src_indices = (
+                slice(0, 1), 
+                slice(0, dim1),            
+                slice(0, 128)             
+            )
+            dst_indices = (
+                slice(i, i + 1), 
+                slice(0, dim1),            
+                slice(0, 128)             
+            )
+            timers("test_full_disk").start()
+            sync_general_copy(dst, dst_indices, disk_ref, src_indices, cpu_buf)
+            timers("test_full_disk").stop()
+        print("="*50)
+        print(timers("test_full_disk").elapsed("average"))
+        print(timers("test_full_disk").costs)
+        print("="*50)
+
+    def test_full_gpu(self):
+        cpu_buf = torch.empty((1 * GB,), dtype=torch.float16, pin_memory=True)
+        self.chunk_pool.sync()
+        logger.info(f"test_full_gpu: gpu_cache_queue={self.chunk_pool.gpu_cache.copy_queue.qsize()}")
+        for idx in self.chunk_pool.gpu_cache._heap._heap:
+            score, cache_idx, chunk_id = idx
+            status, heap_idx = self.chunk_pool.gpu_cache._heap._pos[chunk_id]
+            logger.info(f"score={score}, cache_idx={cache_idx}, chunk_id={chunk_id}, status={status}, heap_idx={heap_idx}")
+        timers("test_full_gpu").reset()
+        dim1 = self.config.n_head
+        shape = (100, dim1 ,128)
+        dst = self.env.gpu.allocate(shape, np.float16)
+        for i in range(100):
+            chunk_id = self.chunk_pool.gpu_cache._heap._heap[i][2]
+            gpu_ref = self.chunk_pool.get_chunk_data(chunk_id).full_head_k
+            logger.info(f"gpu_ref.device={gpu_ref.device}")
+            src_indices = (
+                slice(0, 1), 
+                slice(0, dim1),            
+                slice(0, 128)             
+            )
+            dst_indices = (
+                slice(i, i + 1), 
+                slice(0, dim1),            
+                slice(0, 128)             
+            )
+            timers("test_full_gpu").start()
+            sync_general_copy(dst, dst_indices, gpu_ref, src_indices, cpu_buf)
+            timers("test_full_gpu").stop()
+        print("="*50)
+        print(timers("test_full_gpu").elapsed("average"))
+        print(timers("test_full_gpu").costs)
+        print("="*50)
 
 
 def get_filename(args):
@@ -1502,7 +1589,7 @@ def run_prefix_flexllmgen(args):
     num_prompts = args.num_gpu_batches * args.gpu_batch_size
     max_prompt_len, gen_len, cut_gen_len = args.prompt_len, args.gen_len, args.cut_gen_len
     
-    gpu = TorchDevice("cuda:0")
+    gpu = TorchDevice("cuda:7")
     cpu = TorchDevice("cpu")
     disk = TorchDisk(args.offload_dir)
     env = ExecutionEnv(gpu=gpu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gpu, cpu, disk]))
@@ -1681,7 +1768,7 @@ def run_dapr_flexllmgen(args):
     num_prompts = args.num_gpu_batches * args.gpu_batch_size
     max_prompt_len, gen_len, cut_gen_len = args.prompt_len, args.gen_len, args.cut_gen_len
     
-    gpu = TorchDevice("cuda:0")
+    gpu = TorchDevice("cuda:7")
     cpu = TorchDevice("cpu")
     disk = TorchDisk(args.offload_dir)
     env = ExecutionEnv(gpu=gpu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gpu, cpu, disk]))
@@ -1779,10 +1866,20 @@ def run_dapr_flexllmgen(args):
 
         if(i == len(inputs) // 2):
             model.kv_reordering()
+            print("=" * 25,"KV_REORDERING", "="*25)
 
 
         logger.info(f"gpu_cache:{len(model.chunk_pool.gpu_cache._heap._pos)}")
         logger.info(f"cpu_cache:{len(model.chunk_pool.cpu_cache._heap._pos)}")
+
+        if i == 4:
+            model.chunk_pool.sync()
+            print("=" * 50, "Test Copy Overhead", "="*50)
+            model.test_probe_disk()
+            model.test_full_disk()
+            model.test_full_gpu()
+
+
         subprocess.run(['sudo', 'drop_cache'], check=True)
 
 
