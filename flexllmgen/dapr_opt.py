@@ -43,11 +43,13 @@ logger = logging.getLogger(__name__)
 
 io_bytes = 0
 
-sum_continue_addr = 0
+sum_continue_addr = 768
 cur_continue_addr = 0
 last_id = -1
 last_offset = -1
 average_continue_addr = []
+
+chunk_cnt=[]
 
 @dataclasses.dataclass(frozen=True)
 class Policy:
@@ -86,12 +88,12 @@ class Policy:
     comp_cache_config: CompressionConfig
 
     # the ratio of important tokens in prefix kv cache
-    important_ratio: float = 0.2
+    important_ratio: float = 0.5
 
-    # Config of Chunk Pool
+    # Config of Chunk Pool (128, b*n_head, head_dim) * 2
     chunk_size: int = 128
-    gpu_heap_size: int = 768
-    cpu_heap_size: int = 512
+    gpu_heap_size: int = 64
+    cpu_heap_size: int = 64
 
     @property
     def w_disk_percent(self):
@@ -398,7 +400,9 @@ class SelfAttention:
             kv_ptr = self.task.common_prefix_token[t_idx].kv_ptr[j]
             chunk_id, offset = kv_ptr.chunk_id, kv_ptr.offset
             #logger.info(f"In load_probe_cahe token:{t_idx} layer:{j}: kv_ptr = {kv_ptr}")
+            timers("probe_cache").start()
             self.chunk_pool.get_probe_cache(k_cache, t_idx, chunk_id, offset)
+            timers("probe_cache").stop()
         self.env.disk.synchronize()
         end_event_load_probe.record(torch.cuda.current_stream())
         timers("imp io").stop(end_event_load_probe.synchronize())
@@ -427,8 +431,13 @@ class SelfAttention:
             req[chunk_id].append((offset, j))
 
         for chunk_id, store_ptr in req.items():
+            #logger.info(f"Get Prefix KV: len(store_ptr)={len(store_ptr)}")
+            timers("full_cache").start()
             self.chunk_pool.get_full_head_cache_impress(k_cache, v_cache, chunk_id, store_ptr)
+            timers("full_cache").stop()
 
+        global chunk_cnt
+        chunk_cnt.append(len(req))
 
         # global io_bytes
         # io_bytes += n_important
@@ -553,9 +562,10 @@ class SelfAttention:
         general_copy(k_home, indices, k_new, None)
         general_copy(v_home, indices, v_new, None)
 
-    def update_importance(self, imp_token_idx):
+    def update_importance(self, imp_token_idx, j):
         for idx in imp_token_idx:
             self.task.common_prefix_token[idx].importance += 1
+            self.task.common_prefix_token[idx].layer_importance[j] += 1
 
     def input_act_shape_and_dtype(self, batch_size, seq_len):
         return (batch_size, seq_len, self.config.input_dim), self.config.dtype
@@ -600,7 +610,7 @@ class SelfAttention:
                 imp_token_idx = imp_token_idx[0] # 解开batch维度
 
                 # logger.info(f"Get Important token indices: {imp_token_idx}")
-                self.update_importance(imp_token_idx)
+                self.update_importance(imp_token_idx, j)
 
                 end_event_atn_load = torch.cuda.Event(enable_timing=True)
                 timers("imp load and compute").start()
@@ -1423,6 +1433,8 @@ class OptLM:
             new_chunk_id = self.chunk_pool.switch_to_new_chunk()
             self.kv_reordering(cur)
 
+            self.radix_tree.visualize()
+            
             self.sync()
             #logger.info(f"KV reordering: Before Delete:{len(self.chunk_pool.pool)}")
             keys_to_delete = [k for k in self.chunk_pool.chunk_table if k < new_chunk_id]
@@ -1469,10 +1481,13 @@ class OptLM:
     def test_probe_disk(self):
         cpu_buf = torch.empty((1 * GB,), dtype=torch.float16, pin_memory=True)
         timers("test_probe_disk").reset()
-        shape = (100, 3 ,128)
+        shape = (200, 3 ,128)
         dst = self.env.gpu.allocate(shape, np.float16)
-        for i in range(100):
-            chunk_meta = self.chunk_pool.chunk_table[i]
+        i = 0
+        for chunk_id, chunk_meta in self.chunk_pool.chunk_table.items():
+            if i >= 200:
+                break
+            i += 1
             disk_ref = chunk_meta.disk_ref.full_head_k
             src_indices = (
                 slice(0, 1), 
@@ -1492,14 +1507,47 @@ class OptLM:
         print(timers("test_probe_disk").costs)
         print("="*50) 
 
+    def test_probe_gpu(self):
+        cpu_buf = torch.empty((1 * GB,), dtype=torch.float16, pin_memory=True)
+        self.chunk_pool.sync()
+        timers("test_probe_gpu").reset()
+        dim1 = 3
+        shape = (100, dim1 ,128)
+        dst = self.env.gpu.allocate(shape, np.float16)
+        for i in range(100):
+            chunk_id = self.chunk_pool.gpu_cache._heap._heap[i][2]
+            gpu_ref = self.chunk_pool.get_chunk_data(chunk_id).full_head_k
+            logger.info(f"gpu_ref.device={gpu_ref.device}")
+            src_indices = (
+                slice(0, 1), 
+                slice(0, dim1),            
+                slice(0, 128)             
+            )
+            dst_indices = (
+                slice(i, i + 1), 
+                slice(0, dim1),            
+                slice(0, 128)             
+            )
+            timers("test_probe_gpu").start()
+            sync_general_copy(dst, dst_indices, gpu_ref, src_indices, cpu_buf)
+            timers("test_probe_gpu").stop()
+        print("="*50)
+        print(timers("test_probe_gpu").elapsed("average"))
+        print(timers("test_probe_gpu").costs)
+        print("="*50)
+
+
     def test_full_disk(self):
         cpu_buf = torch.empty((1 * GB,), dtype=torch.float16, pin_memory=True)
         timers("test_full_disk").reset()
         dim1 = self.config.n_head
-        shape = (100, dim1 ,128)
+        shape = (200, dim1 ,128)
         dst = self.env.gpu.allocate(shape, np.float16)
-        for i in range(100):
-            chunk_meta = self.chunk_pool.chunk_table[i]
+        i = 0
+        for chunk_id, chunk_meta in self.chunk_pool.chunk_table.items():
+            if i >= 200:
+                break
+            i += 1
             disk_ref = chunk_meta.disk_ref.full_head_k
             src_indices = (
                 slice(0, 1), 
@@ -1552,7 +1600,22 @@ class OptLM:
         print(timers("test_full_gpu").elapsed("average"))
         print(timers("test_full_gpu").costs)
         print("="*50)
-
+    
+    def plot_layer_distribution(self):
+        from collections import deque
+        for i in range(len(self.layers)):
+            if isinstance(self.layers[i], SelfAttention):
+                x = [[] for _ in range(12)]
+                queue = deque([self.radix_tree.root])
+                while queue:
+                    cur = queue.popleft()
+                    for token in cur.tokens:
+                        cnt = token.layer_importance[i]
+                        x[cnt].append(token)
+                    for child in cur.children.values():
+                        queue.append(child)
+                plot_and_save_layer_frequency(x, i)
+    
 
 def get_filename(args):
     model_size = args.model.split('-')[-1]
@@ -1821,6 +1884,10 @@ def run_dapr_flexllmgen(args):
         timers("compute").reset()
         timers("imp load and compute").reset()
         timers("cache store").reset()
+
+        timers("probe_cache").reset()
+        timers("full_cache").reset()
+
         output_ids = model.generate(
             inputs=[inputs_ids[i]], max_new_tokens = args.gen_len, debug_mode=args.debug_mode, 
             cut_gen_len=cut_gen_len, verbose=args.verbose)
@@ -1857,6 +1924,9 @@ def run_dapr_flexllmgen(args):
         #print("store cache:",timers("cache store").costs)
         print("generate:", timers("generate").costs)
         print("generate sum:", timers("generate").elapsed("sum"))
+        print("probe_cache: ",timers("probe_cache").elapsed("average"), "  ", timers("probe_cache").elapsed("sum"))
+        print("full_cache: ",timers("full_cache").elapsed("average"), "  ", timers("full_cache").elapsed("sum"))
+        
         # print("total io token:", io_bytes)
         # print("total continue token", cur_continue_addr)
         # if i!=0:
@@ -1865,24 +1935,30 @@ def run_dapr_flexllmgen(args):
         print("=" * 50)
 
         if(i == len(inputs) // 2):
-            model.kv_reordering()
+            global chunk_cnt
+            logger.info(f"Befor KV Reordering, avg_chunk_cnt = {sum(chunk_cnt)/len(chunk_cnt)}")
+            chunk_cnt = []
+            #model.kv_reordering()
             print("=" * 25,"KV_REORDERING", "="*25)
 
 
         logger.info(f"gpu_cache:{len(model.chunk_pool.gpu_cache._heap._pos)}")
         logger.info(f"cpu_cache:{len(model.chunk_pool.cpu_cache._heap._pos)}")
 
-        if i == 4:
-            model.chunk_pool.sync()
-            print("=" * 50, "Test Copy Overhead", "="*50)
-            model.test_probe_disk()
-            model.test_full_disk()
-            model.test_full_gpu()
-
+        # if i == 4 or i==10:
+        #     subprocess.run(['sudo', 'drop_cache'], check=True)
+        #     model.chunk_pool.sync()
+        #     print("=" * 50, "Test Copy Overhead", "="*50)
+        #     model.test_probe_disk()
+        #     #model.test_probe_gpu()
+        #     subprocess.run(['sudo', 'drop_cache'], check=True)
+        #     model.test_full_disk()
+        #     #model.test_full_gpu()
 
         subprocess.run(['sudo', 'drop_cache'], check=True)
-
-
+        
+    logger.info(f"After KV Reordering, avg_chunk_cnt = {sum(chunk_cnt)/len(chunk_cnt)}")
+    model.plot_layer_distribution()
     env.close_copy_threads()
 
     _, gpu_peak_mem = gpu.mem_stats()
@@ -1936,6 +2012,58 @@ def add_parser_arguments(parser):
 
     parser.add_argument("--overlap", type=str2bool, nargs='?',
         const=True, default=True)
+
+import matplotlib.pyplot as plt
+def plot_and_save_layer_frequency(data: List[int], layer: int):
+    plot_data = [len(x) for x in data]
+    total_tokens = sum(plot_data[1:])
+    
+    # 只使用前12个数据（包括下标0的数据，但绘制时不包含下标12的数据）
+    plot_data = plot_data[1:12]
+    
+    # 创建保存目录（如果不存在）
+    save_dir = f"./layer_distribution/"
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # 创建图形和坐标轴
+    plt.figure(figsize=(12, 6))
+    
+    # 创建x轴标签（0-11）
+    x_labels = [str(i) for i in range(1,12)]
+    x_pos = np.arange(len(x_labels))
+    
+    # 绘制柱状图（只绘制前12个数据）
+    bars = plt.bar(x_pos, plot_data, color='skyblue', alpha=0.8)
+    
+    # 在每个柱子上方添加数值标签
+    for bar in bars:
+        height = bar.get_height()
+        plt.text(bar.get_x() + bar.get_width()/2., height + 0.05,
+                f'{int(height)}', ha='center', va='bottom')
+    
+    # 设置标题和标签（在图题中显示总token数）
+    plt.title(f'Token Frequency Distribution (Layer={layer}, Total Tokens: {total_tokens})', 
+              fontsize=16, fontweight='bold')
+    plt.xlabel('Token Index', fontsize=12)
+    plt.ylabel('Frequency', fontsize=12)
+    
+    # 设置x轴刻度
+    plt.xticks(x_pos, x_labels)
+    
+    # 添加网格线
+    plt.grid(axis='y', alpha=0.3)
+    
+    # 自动调整布局
+    plt.tight_layout()
+    
+    # 保存图像到指定路径
+    save_path = os.path.join(save_dir, f'frequency_layer_{layer}.png')
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    
+    plt.close()
+
+
+
 
 
 if __name__ == "__main__":

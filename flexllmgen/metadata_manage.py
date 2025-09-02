@@ -29,6 +29,8 @@ class RadixToken:
 
         self.token_name = token_name or RadixToken.next_token_name()
 
+        self.layer_importance = [0 for _ in range(len(kv_ptr))]
+
     def __repr__(self):
         return f"(id={self.token_id},imp={self.importance})"
 
@@ -49,7 +51,7 @@ class RadixTreeNode:
         self.children:Dict[int,RadixTreeNode] = {} 
     
     def __repr__(self):
-        return f"Node(token={self.tokens})"
+        return f"Node(token={self.get_all_sorted_token()})"
     
     def sort_by_importance(self):
         self.mapping_list.sort(key=lambda i: self.tokens[i].importance, reverse=True)

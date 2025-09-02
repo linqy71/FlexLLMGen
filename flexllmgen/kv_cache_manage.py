@@ -42,7 +42,7 @@ class ChunkMeta:
         
     def update_on_access(self, hits:int):
         instant_ir = hits / self.chunk_size
-        self.ir_avg = (self.ir_avg * self.access_count + instant_ir)/(self.access_count + 1)
+        self.ir_avg = (self.ir_avg * self.access_count + instant_ir) / (self.access_count + 1)
         self.access_count += 1
         self.score += instant_ir
     
@@ -165,17 +165,19 @@ class ChunkPool:
             slice(0, full_head_k.shape[1]),
             slice(0, full_head_k.shape[2])
         )
-        general_copy(
+        sync_general_copy(
             dst=full_head_k,
             dst_indices=full_head_dst_indices,
             src=k_cache,
-            src_indices=full_head_src_indices
+            src_indices=full_head_src_indices,
+            cpu_buf=self.cpu_buf
         )
-        general_copy(
+        sync_general_copy(
             dst=full_head_v,
             dst_indices=full_head_dst_indices,
             src=v_cache,
-            src_indices=full_head_src_indices
+            src_indices=full_head_src_indices,
+            cpu_buf=self.cpu_buf
         )
 
         ptr = CachePointer(self.current_id, self.current_offset)
@@ -211,12 +213,19 @@ class ChunkPool:
             slice(0, k_cache.shape[2])                  
         )
         
-        general_copy(
+        sync_general_copy(
             dst=k_cache,
             dst_indices=dst_indices,
             src=src_cache,
-            src_indices=src_indices
+            src_indices=src_indices,
+            cpu_buf=self.cpu_buf
         )
+        # general_copy(
+        #     dst=k_cache,
+        #     dst_indices=dst_indices,
+        #     src=src_cache,
+        #     src_indices=src_indices,
+        # )
     
     def get_full_head_cache(self, k_cache, v_cache, cache_offset, chunk_id:int, token_offset:int):
         '''
@@ -401,6 +410,8 @@ class ScoredCache:
         return None            
 
     def insert_cache(self, chunk_id, score, chunk_data):
+        if self.capacity == 0:
+            return False
         with self._lock:
             if self._heap.has_cache(chunk_id):
                 self._heap.update_score(chunk_id, score)
@@ -444,15 +455,14 @@ class IndexMinHeap:
     def _swap(self, i, j):
         ci, cj = self._heap[i][2], self._heap[j][2]
         
-        # 获取当前状态
+
         state_i, _ = self._pos[ci]
         state_j, _ = self._pos[cj]
         
-        # 只交换索引，保持状态不变
-        self._pos[ci] = (state_i, j)  # 保持ci的状态，更新索引为j
-        self._pos[cj] = (state_j, i)  # 保持cj的状态，更新索引为i
-        
-        # 交换堆中的元素
+
+        self._pos[ci] = (state_i, j)  
+        self._pos[cj] = (state_j, i)  
+
         self._heap[i], self._heap[j] = self._heap[j], self._heap[i]
 
     def _sift_up(self, idx):
