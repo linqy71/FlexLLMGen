@@ -2,6 +2,7 @@ import torch
 from lsh import LSH
 from kvstore import KVStore 
 import os
+from itertools import combinations
 
 
 class LSHServer:
@@ -153,6 +154,9 @@ class LSHServer:
             self.sorted_hash_values_buffer[i].copy_(sorted_hash_values)
             self.sorted_hash_indices_buffer[i].copy_(sorted_hash_indices)
         
+        if layer_idx == 1:
+            self.check(head_id=0, seq_len=seq_len)
+
         self.lsh_retriever.fill(layer_idx, request_id,
                     self.sorted_hash_values_buffer, 
                     self.sorted_hash_indices_buffer)
@@ -299,6 +303,40 @@ class LSHServer:
         self.lsh_retriever.save_to_file(self.kv_store_path + "/lsh_table_" + str(prefix_id))
 
         self.persisted = True
+
+    def check(self, head_id, seq_len):
+        hash_values, hash_indices = self.sorted_hash_values_buffer[head_id], self.sorted_hash_indices_buffer[head_id]
+        
+        connection = torch.zeros((seq_len, seq_len))
+        
+        value_to_ind = {}
+        for i in range(self.L):
+            t_hash_v = hash_values[i].tolist()
+            t_hash_i = hash_indices[i].tolist()
+            for cur_id, v in enumerate(t_hash_v):
+                if v not in value_to_ind:
+                    value_to_ind[v] = [t_hash_i[cur_id]]
+                else :
+                    value_to_ind[v].append(t_hash_i[cur_id])
+            # print(value_to_ind)
+        
+            for v, bucket_content in value_to_ind.items():
+                if len(bucket_content) >= 2:
+                    pairs = list(combinations(bucket_content, 2))
+                    for a, b in pairs:
+                        connection[a, b] += 1
+            value_to_ind = {}
+        
+        # mask = connection > 2
+        # positions = torch.nonzero(mask)
+        # count = mask.sum().item()
+        
+        # values, flat_indices = torch.topk(connection.flatten(), k=30)
+        # rows = flat_indices // seq_len
+        # cols = flat_indices % seq_len
+        
+        torch.save(connection, f"/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/lqy/llm_infer/FlexLLMGen/analyze/connection_layer0_head{head_id}.pt")
+        
 
     ### arrange tokens into groups according to first req's query results
     # def single_query_group_strategy(self, layer_idx, q_hashcode, offload_len, prefix_id):

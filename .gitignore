@@ -37,3 +37,5 @@ flexllmgen_offload_dir
 
 # tmp scripts
 today_job.sh
+
+analyze/

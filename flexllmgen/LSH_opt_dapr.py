@@ -517,6 +517,14 @@ class SelfAttention:
     def input_act_shape_and_dtype(self, batch_size, seq_len):
         return (batch_size, seq_len, self.config.input_dim), self.config.dtype
 
+    def _record_imp_token_idx(self):
+        req_id = self.task.req_id
+        save_dir = f"/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/lqy/llm_infer/FlexLLMGen/analyze/{req_id}"
+        os.makedirs(save_dir, exist_ok=True)
+        filename = f"layer_{self.layer_id}_prefill_imp_token_idx.pt"
+        query_results = self.kv_server.query_results[self.layer_id]
+        torch.save(query_results, f"{save_dir}/{filename}")
+
     def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
                 cache_write_buf, i, k, j):
         n_head = self.config.n_head
@@ -569,6 +577,8 @@ class SelfAttention:
                 imp_token_idx, avg_n_imp = self.kv_server.get_imp_idx(self.layer_id)
                 # imp_token_idx = self.kv_server.get_full_idx(self.layer_id)
                 print(f"get {avg_n_imp} important tokens")
+                
+                self._record_imp_token_idx()
 
                 # print(imp_token_idx[:3])
                 h, new_k_cache, new_v_cache = self.compute.mha_prefill_with_kv(h, mask, w_q, b_q,
@@ -1010,7 +1020,8 @@ class OptLM:
                  stop: Optional[int] = None,
                  debug_mode: Optional[str] = None,
                  cut_gen_len: Optional[int] = None,
-                 verbose: int = 0):
+                 verbose: int = 0,
+                 req_id: int = 0):
         matched_prefix = self.radix_tree.match(inputs[0])
         prefix_only = False
         new_prefix_id = 0
@@ -1031,7 +1042,8 @@ class OptLM:
             common_prefix_len=None,
             matched_prefix=matched_prefix,
             prefix_only=prefix_only,
-            new_prefix_id = new_prefix_id
+            new_prefix_id = new_prefix_id,
+            req_id = req_id
         )
         logger.info(f"generate: Task={task}")
         num_layers = self.num_layers
@@ -1407,7 +1419,7 @@ def process_dapr():
         if (len(v) > 10):
             doc_id, query_ids = k, v
             break
-    #print(doc_id)
+    print(doc_id)
     docs = docs.filter(lambda row: row["doc_id"] == doc_id)
 
     passages = docs[0]["passages"]
@@ -1421,7 +1433,7 @@ def process_dapr():
         questions.append(q["text"])
     #print(questions)
 
-    return context, questions
+    return context, questions[:1]
 
 def run_dapr_flexllmgen(args):
     print(f"<run_dapr_flexllmgen>: args.model: {args.model}")
@@ -1494,7 +1506,7 @@ def run_dapr_flexllmgen(args):
         timers("cache store").reset()
         output_ids = model.generate(
             inputs=[inputs_ids[i]], max_new_tokens = args.gen_len, debug_mode=args.debug_mode, 
-            cut_gen_len=cut_gen_len, verbose=args.verbose)
+            cut_gen_len=cut_gen_len, verbose=args.verbose, req_id=i)
         if DUMMY_WEIGHT not in args.path:
             outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
             show_str = "Outputs:\n" + 70 * '-' + "\n"
@@ -1711,7 +1723,7 @@ def add_parser_arguments(parser):
     parser.add_argument("--path", type=str, default="/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/hyk/opt_weights",
         help="The path to the model weights. If there are no cached weights, "
              "FlexLLMGen will automatically download them from HuggingFace.")
-    parser.add_argument("--offload-dir", type=str, default="/ssd/nsccgz_zgchen_6/flexllmgen_offload_dir",
+    parser.add_argument("--offload-dir", type=str, default="/ssd/nsccgz_zgchen_6/lqy/flexllmgen_offload_dir",
         help="The directory to offload tensors. ")
     parser.add_argument("--prompt-len", type=int, default=5120)
     parser.add_argument("--gen-len", type=int, default=32)
@@ -1762,3 +1774,5 @@ if __name__ == "__main__":
 
     # run_prefix_flexllmgen(args)
     run_dapr_flexllmgen(args)
+    # context, questions = process_dapr()
+    # print(questions)
