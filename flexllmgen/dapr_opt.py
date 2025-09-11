@@ -1515,7 +1515,7 @@ class OptLM:
         shape = (100, dim1 ,128)
         dst = self.env.gpu.allocate(shape, np.float16)
         for i in range(100):
-            chunk_id = self.chunk_pool.gpu_cache._heap._heap[i][2]
+            chunk_id = self.chunk_pool.gpu_cache.index_heap._heap[i][2]
             gpu_ref = self.chunk_pool.get_chunk_data(chunk_id).full_head_k
             logger.info(f"gpu_ref.device={gpu_ref.device}")
             src_indices = (
@@ -1571,16 +1571,16 @@ class OptLM:
         cpu_buf = torch.empty((1 * GB,), dtype=torch.float16, pin_memory=True)
         self.chunk_pool.sync()
         logger.info(f"test_full_gpu: gpu_cache_queue={self.chunk_pool.gpu_cache.copy_queue.qsize()}")
-        for idx in self.chunk_pool.gpu_cache._heap._heap:
+        for idx in self.chunk_pool.gpu_cache.index_heap._heap:
             score, cache_idx, chunk_id = idx
-            status, heap_idx = self.chunk_pool.gpu_cache._heap._pos[chunk_id]
+            status, heap_idx = self.chunk_pool.gpu_cache.index_heap._pos[chunk_id]
             logger.info(f"score={score}, cache_idx={cache_idx}, chunk_id={chunk_id}, status={status}, heap_idx={heap_idx}")
         timers("test_full_gpu").reset()
         dim1 = self.config.n_head
         shape = (100, dim1 ,128)
         dst = self.env.gpu.allocate(shape, np.float16)
         for i in range(100):
-            chunk_id = self.chunk_pool.gpu_cache._heap._heap[i][2]
+            chunk_id = self.chunk_pool.gpu_cache.index_heap._heap[i][2]
             gpu_ref = self.chunk_pool.get_chunk_data(chunk_id).full_head_k
             logger.info(f"gpu_ref.device={gpu_ref.device}")
             src_indices = (
@@ -1942,8 +1942,8 @@ def run_dapr_flexllmgen(args):
             print("=" * 25,"KV_REORDERING", "="*25)
 
 
-        logger.info(f"gpu_cache:{len(model.chunk_pool.gpu_cache._heap._pos)}")
-        logger.info(f"cpu_cache:{len(model.chunk_pool.cpu_cache._heap._pos)}")
+        logger.info(f"gpu_cache:{len(model.chunk_pool.gpu_cache.index_heap._pos)}")
+        logger.info(f"cpu_cache:{len(model.chunk_pool.cpu_cache.index_heap._pos)}")
 
         # if i == 4 or i==10:
         #     subprocess.run(['sudo', 'drop_cache'], check=True)
