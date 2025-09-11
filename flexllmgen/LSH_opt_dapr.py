@@ -1465,9 +1465,10 @@ def run_dapr_flexllmgen(args):
     model = OptLM(opt_config, env, args.path, args.offload_dir, policy, args.prompt_len, args.gen_len, args.strategy)
 
     context, questions = process_dapr()
-    context = context[:4096]
+    context = context[:6144]
     ### feed prefix
     prefix_input = get_tokenized_inputs(context, max_prompt_len=max_prompt_len, tokenizer=tokenizer)
+    print(len(prefix_input[0]))
     output_ids = model.generate(
         prefix_input, max_new_tokens=1, debug_mode=args.debug_mode,
         cut_gen_len=cut_gen_len, verbose=args.verbose
@@ -1750,7 +1751,7 @@ def add_parser_arguments(parser):
         const=True, default=False)
     
     ## query for query_group_persist; seq for sequential_persist
-    parser.add_argument("--strategy", type=str, default="seq")
+    parser.add_argument("--strategy", type=str, default="query")
 
 
 if __name__ == "__main__":

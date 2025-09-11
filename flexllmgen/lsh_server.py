@@ -255,7 +255,7 @@ class LSHServer:
         for layer_idx in range(self.num_layers):
             new_token_orders = [ list(range(self.offload_len)) for _ in range(self.num_key_value_heads)]
             self.persist_strategy[layer_idx] = new_token_orders
-            self.kv_store.write_to_storage(self.kv_store_path,
+            self.kv_store.write_to_file(self.kv_store_path,
                                             prefix_id, layer_idx, new_token_orders)
             print(f"Successfully write prefix {prefix_id} to storage in {self.kv_store_path}")
         
@@ -291,7 +291,7 @@ class LSHServer:
 
             # Save strategy
             self.persist_strategy[layer_idx] = new_token_orders
-            self.kv_store.write_to_storage(self.kv_store_path,
+            self.kv_store.write_to_file(self.kv_store_path,
                                             prefix_id, layer_idx, new_token_orders)
             print(f"Successfully write prefix {prefix_id} to storage in {self.kv_store_path}")
         

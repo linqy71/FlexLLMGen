@@ -323,7 +323,8 @@ void KVStore::collect_queried_key_value(
         }
 
         // load from storage
-        this->load_key_value(content, prefix_id, layer_id, i);
+        // this->load_key_value(content, prefix_id, layer_id, i);
+        this->load_key_value_from_file(content, prefix_id, layer_id, i);
 
         content.clear();
     }
