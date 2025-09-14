@@ -250,8 +250,8 @@ void KVStore::write_to_file(
             int file_index = j / tokens_per_file;
 
             std::streampos head_base_offset = files[file_index].tellp();
-            std::streampos entry_offset = head_base_offset + entry_size;
-
+            //std::streampos entry_offset = head_base_offset + entry_size;
+            std::streampos entry_offset = head_base_offset;
             DTYPE* cur_key = head_key + idx * this->head_dim; //当前token的数据位置
             DTYPE* cur_value = head_value + idx * this->head_dim;
             
@@ -520,6 +520,7 @@ void KVStore::load_key_value_from_file(
     int layer_id,
     int head_id)
 {
+    auto start = std::chrono::high_resolution_clock::now(); // 记录开始时间
     // std::string file_name = this->store_path + "/" + std::to_string(prefix_id) + ".bin";
     // std::ifstream file(file_name, std::ios::binary);
     // if (!file.is_open()) {
@@ -575,6 +576,9 @@ void KVStore::load_key_value_from_file(
     }
 
     if (file.is_open()) file.close();
+    auto end = std::chrono::high_resolution_clock::now(); // 记录结束时间
+    double elapsed = std::chrono::duration<double>(end - start).count();
+    // printf("[KVStore::load_key_value_from_file] elapsed time: %.6f seconds\n", elapsed);
 }
 
 
