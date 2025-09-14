@@ -9,7 +9,7 @@ class LSHServer:
     def __init__(self,
         config,
         num_layers: int,
-        kv_store_path: str,
+        kv_store_path: str, 
         K: int = 10, 
         L: int = 150, 
         batch_size: int = 1,
@@ -17,7 +17,7 @@ class LSHServer:
         device: str = 'cuda:0',
         dtype = torch.float16,
         ):
-    
+        # 2^K=哈希表桶数，L=哈希表个数
         self.config = config  ### OptConfig or LlamaConfig
         self.K = K
         self.L = L
@@ -59,11 +59,11 @@ class LSHServer:
         else :
             self.hash_func = torch.randn((self.head_dim, self.K * self.L), device=self.device, dtype=self.dtype)
             torch.save(self.hash_func, hash_func_path)
-        self.binary_pack = [int(2**i) for i in range(self.K)]
+        self.binary_pack = [int(2**i) for i in range(self.K)] # 可能是用来快速判断属于哪个桶
         self.binary_pack = torch.Tensor(self.binary_pack).to(device=self.device, dtype=torch.float16)
         
         ### store lsh query results; TODO: adjust shape to (b * num_key_value_heads,)
-        self.nnz = torch.zeros((self.batch_size * self.num_attention_heads,)).to(torch.int32)
+        self.nnz = torch.zeros((self.batch_size * self.num_attention_heads,)).to(torch.int32) # maybe每个 head 在 LSH 检索阶段找到的候选索引数。
         self.results_lsh_cpu = torch.zeros((self.batch_size * self.num_attention_heads, self.max_length)).to(torch.int32)
     
         self.query_results = [(torch.zeros_like(self.nnz), torch.zeros_like(self.results_lsh_cpu)) for _ in range(self.num_layers)]
@@ -123,7 +123,7 @@ class LSHServer:
         hash_code = torch.mv(hash_code, self.binary_pack)
         hash_code = hash_code.reshape(self.num_key_value_heads, -1, self.L)
         hash_code = hash_code.transpose(1,2).contiguous().to(torch.int16)
-        self.hash_code_buffer[:,:,:offload_len].copy_(hash_code)
+        self.hash_code_buffer[:,:,:offload_len].copy_(hash_code) #这里存hash_code，用于后面前缀kv直接查
 
         print("gpu ---> cpu")
         offload_key = offload_key.cpu()
@@ -257,7 +257,7 @@ class LSHServer:
             self.persist_strategy[layer_idx] = new_token_orders
             self.kv_store.write_to_file(self.kv_store_path,
                                             prefix_id, layer_idx, new_token_orders)
-            print(f"Successfully write prefix {prefix_id} to storage in {self.kv_store_path}")
+        print(f"Successfully write prefix {prefix_id} to storage in {self.kv_store_path}")
         
         ## persist hash table
         self.lsh_retriever.save_to_file(self.kv_store_path + "/lsh_table_" + str(prefix_id))
@@ -293,7 +293,7 @@ class LSHServer:
             self.persist_strategy[layer_idx] = new_token_orders
             self.kv_store.write_to_file(self.kv_store_path,
                                             prefix_id, layer_idx, new_token_orders)
-            print(f"Successfully write prefix {prefix_id} to storage in {self.kv_store_path}")
+        print(f"Successfully write prefix {prefix_id} to storage in {self.kv_store_path}")
         
         ## persist hash table
         self.lsh_retriever.save_to_file(self.kv_store_path + "/lsh_table_" + str(prefix_id))
