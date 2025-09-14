@@ -1,4 +1,14 @@
 #!/bin/bash
+cd /HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/hyk/my_FlexLLMGen/FlexLLMGen/library/lsh
+
+pip install -e .
+
+cd /HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/hyk/my_FlexLLMGen/FlexLLMGen/library/kvstore
+
+python setup.py install
+
+cd ../../
+
 python3 -m flexllmgen.LSH_opt_dapr --model facebook/opt-30b \
         --percent 100 0 100 0 100 0 \
         --path /HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/hyk/opt_weights  \
