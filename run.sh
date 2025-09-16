@@ -16,7 +16,7 @@ python3 -m flexllmgen.LSH_opt_dapr --model facebook/opt-30b \
         --prompt-len 2016 \
         --gen-len 32 \
         --strategy seq \
-        --offload-dir /ssd/nsccgz_zgchen_6/flexllmgen_offload_dir  > test_seq.log 2>&1
+        --offload-dir /ssd/nsccgz_zgchen_6/flexllmgen_offload_dir  > log/test_seq_f.log 2>&1
 
 python3 -m flexllmgen.LSH_opt_dapr --model facebook/opt-30b \
         --percent 100 0 100 0 100 0 \
@@ -24,4 +24,4 @@ python3 -m flexllmgen.LSH_opt_dapr --model facebook/opt-30b \
         --prompt-len 2016 \
         --gen-len 32 \
         --strategy query \
-        --offload-dir /ssd/nsccgz_zgchen_6/flexllmgen_offload_dir  > test_query.log 2>&1   
+        --offload-dir /ssd/nsccgz_zgchen_6/flexllmgen_offload_dir  > log/test_query_f.log 2>&1   
