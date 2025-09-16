@@ -1,4 +1,5 @@
 """Implement tensor computations with pytorch."""
+import direct_io
 from enum import Enum, auto
 from functools import partial
 from itertools import count
@@ -1179,3 +1180,66 @@ def sync_general_copy(dst: TorchTensor, dst_indices: Tuple[slice],
         src = src.data[src_indices] if src_indices else src.data
         dst = dst.data[dst_indices] if dst_indices else dst.data
         dst.copy_(src, non_blocking=True)
+
+def sync_general_copy_with_direct_io(dst: TorchTensor, dst_indices: Tuple[slice],
+                 src: TorchTensor, src_indices: Tuple[slice], cpu_buf):
+    src_dev = src.device.device_type
+    dst_dev = dst.device.device_type
+
+    if src_dev == DeviceType.DISK:
+        # 从文件读取数据
+        try:
+            # 使用直接IO读取
+            shape = src.shape
+            filename = src.data
+            dtype = src.dtype
+            tensor = direct_io.read_file_direct(
+                filename,
+                list(shape),
+                dtype,
+            )
+            torch_tensor = TorchTensor(shape, dtype, tensor, global_cpu_device, name=src.name)
+            #logger.info(f"read direct_io successful")
+            sync_general_copy_with_direct_io(dst, dst_indices, torch_tensor, src_indices, cpu_buf)
+        except Exception as e:
+            logger.error(f"直接IO读取失败: {e}")
+            import sys
+            sys.exit(1)  # 终止程序，返回错误码1
+            # logger.info(f"直接IO读取失败{e}")
+            # src_data = map_to_torch_tensor(src, src_indices)
+            # dst_data = map_to_torch_tensor(dst, dst_indices)
+
+            # if (src_dev == DeviceType.CUDA or
+            #     dst_dev == DeviceType.CUDA):
+            #     # Use a pinned cpu buffer as a relay
+            #     size = np.prod(src_data.shape)
+            #     tmp_cpu_buf = cpu_buf[:size].view(src_data.shape)
+            #     tmp_cpu_buf.copy_(src_data)
+            #     dst_data.copy_(tmp_cpu_buf, non_blocking=True)
+            # else:
+            #     dst_data.copy_(src_data)
+    elif dst_dev == DeviceType.DISK:
+        src_data = map_to_torch_tensor(src, src_indices)
+        dst_data = map_to_torch_tensor(dst, dst_indices)
+
+        if (src_dev == DeviceType.CUDA or
+            dst_dev == DeviceType.CUDA):
+            # Use a pinned cpu buffer as a relay
+            size = np.prod(src_data.shape)
+            tmp_cpu_buf = cpu_buf[:size].view(src_data.shape)
+            tmp_cpu_buf.copy_(src_data)
+            dst_data.copy_(tmp_cpu_buf, non_blocking=True)
+        else:
+            dst_data.copy_(src_data)
+    elif src_dev == DeviceType.CPU and dst_dev == DeviceType.CUDA and not src.data.is_pinned():
+        # The cpu tensor is not pinned, use pin_memory as a relay
+        src = src.data[src_indices] if src_indices else src.data
+        dst = dst.data[dst_indices] if dst_indices else dst.data
+        src = src.pin_memory()
+        dst.copy_(src, non_blocking=True)
+    else:
+        # The normal path
+        src = src.data[src_indices] if src_indices else src.data
+        dst = dst.data[dst_indices] if dst_indices else dst.data
+        dst.copy_(src, non_blocking=True)
+

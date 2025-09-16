@@ -88,12 +88,12 @@ class Policy:
     comp_cache_config: CompressionConfig
 
     # the ratio of important tokens in prefix kv cache
-    important_ratio: float = 0.5
+    important_ratio: float = 0.3
 
     # Config of Chunk Pool (128, b*n_head, head_dim) * 2
     chunk_size: int = 128
-    gpu_heap_size: int = 64
-    cpu_heap_size: int = 64
+    gpu_heap_size: int = 0
+    cpu_heap_size: int = 0
 
     @property
     def w_disk_percent(self):
@@ -1863,7 +1863,7 @@ def run_dapr_flexllmgen(args):
 
     context, questions = process_dapr()
     
-    inputs = [context[-8192:] +  query + "\n" for query in questions]
+    inputs = [context[:6144] +  query + "\n" for query in questions]
     inputs_ids = tokenizer(inputs, truncation=True, max_length=max_prompt_len).input_ids
     output_ids = model.generate(
         inputs=[inputs_ids[0]], max_new_tokens = 1, debug_mode=args.debug_mode, 
@@ -1958,7 +1958,7 @@ def run_dapr_flexllmgen(args):
         subprocess.run(['sudo', 'drop_cache'], check=True)
         
     logger.info(f"After KV Reordering, avg_chunk_cnt = {sum(chunk_cnt)/len(chunk_cnt)}")
-    model.plot_layer_distribution()
+    #model.plot_layer_distribution()
     env.close_copy_threads()
 
     _, gpu_peak_mem = gpu.mem_stats()

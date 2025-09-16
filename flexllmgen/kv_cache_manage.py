@@ -7,7 +7,7 @@ from typing import Dict, List, Tuple
 import numpy as np
 import torch
 from flexllmgen.utils import ValueHolder
-from flexllmgen.pytorch_backend import TorchTensor,TorchDevice,TorchDisk, general_copy, sync_general_copy, DeviceType, map_to_torch_tensor 
+from flexllmgen.pytorch_backend import TorchTensor,TorchDevice,TorchDisk, general_copy, sync_general_copy, DeviceType, map_to_torch_tensor, sync_general_copy_with_direct_io 
 from flexllmgen.utils import (GB, T, cpu_mem_stats, vector_gather,
     np_dtype_to_torch_dtype, torch_dtype_to_np_dtype,
     torch_dtype_to_num_bytes)
@@ -166,14 +166,14 @@ class ChunkPool:
             slice(0, full_head_k.shape[1]),
             slice(0, full_head_k.shape[2])
         )
-        sync_general_copy(
+        sync_general_copy_with_direct_io(
             dst=full_head_k,
             dst_indices=full_head_dst_indices,
             src=k_cache,
             src_indices=full_head_src_indices,
             cpu_buf=self.cpu_buf
         )
-        sync_general_copy(
+        sync_general_copy_with_direct_io(
             dst=full_head_v,
             dst_indices=full_head_dst_indices,
             src=v_cache,
@@ -214,7 +214,7 @@ class ChunkPool:
             slice(0, k_cache.shape[2])                  
         )
         
-        sync_general_copy(
+        sync_general_copy_with_direct_io(
             dst=k_cache,
             dst_indices=dst_indices,
             src=src_cache,
@@ -253,7 +253,7 @@ class ChunkPool:
             slice(0, k_cache.shape[1]),                 
             slice(0, k_cache.shape[2])                  
         )
-        sync_general_copy(
+        sync_general_copy_with_direct_io(
             dst=k_cache,
             dst_indices=dst_indices,
             src=full_head_k,
@@ -261,7 +261,7 @@ class ChunkPool:
             cpu_buf=self.cpu_buf
         )
 
-        sync_general_copy(
+        sync_general_copy_with_direct_io(
             dst=v_cache,
             dst_indices=dst_indices,
             src=full_head_v,
@@ -294,7 +294,7 @@ class ChunkPool:
                 slice(0, k_cache.shape[1]),                 
                 slice(0, k_cache.shape[2])                  
             )
-            sync_general_copy(
+            sync_general_copy_with_direct_io(
                 dst=k_cache,
                 dst_indices=dst_indices,
                 src=full_head_k,
@@ -302,7 +302,7 @@ class ChunkPool:
                 cpu_buf=self.cpu_buf
             )
 
-            sync_general_copy(
+            sync_general_copy_with_direct_io(
                 dst=v_cache,
                 dst_indices=dst_indices,
                 src=full_head_v,
@@ -382,11 +382,11 @@ class ScoredCache:
 
                 src = src_chunk.full_head_k
                 dst = dst_chunk.full_head_k
-                sync_general_copy(dst, None, src, None, cpu_buf)
+                sync_general_copy_with_direct_io(dst, None, src, None, cpu_buf)
 
                 src = src_chunk.full_head_v
                 dst = dst_chunk.full_head_v
-                sync_general_copy(dst, None, src, None, cpu_buf)
+                sync_general_copy_with_direct_io(dst, None, src, None, cpu_buf)
                 
                 #logger.info(f"Chunk_Copy: finish copy src_chunk_id={src_chunk_id}, dst_cache_idx={dst_cache_idx}")
                 with self._lock:
