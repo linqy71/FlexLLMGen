@@ -1,0 +1,7 @@
+#!/bin/bash
+python3 -m flexllmgen.dapr_opt --model facebook/opt-30b \
+        --percent 100 0 100 0 100 0 \
+        --path /HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/hyk/opt_weights  \
+        --prompt-len 2016 \
+        --gen-len 32 \
+        --offload-dir /HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/hyk/my_FlexLLMGen/flexllmgen_offload_dir  > test18.log 2>&1

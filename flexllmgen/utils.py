@@ -11,6 +11,7 @@ from typing import Tuple, Union, Optional, Any, Sequence, List
 import numpy as np
 import torch
 
+from flexllmgen.metadata_manage import CachePointer, RadixToken
 
 KB = 1 << 10
 MB = 1 << 20
@@ -30,6 +31,14 @@ class Task:
     temperature: float
     stop: Optional[int]
 
+    # prefix_seq: Union[np.array, List[List[RadixToken]]]
+    common_prefix_len: int # 每个请求的prefix长度
+    common_prefix_kv_ptr: List[List[CachePointer]] # shape(prefix_len, num_layers)
+
+    ### for lsh, dict: prefix_id, max_common_len
+    matched_prefix: dict = None
+    prefix_only: bool = None
+    new_prefix_id: int = None
 
 @dataclasses.dataclass(frozen=True)
 class ExecutionEnv:

@@ -17,7 +17,7 @@ from transformers import AutoTokenizer
 
 from flexllmgen.compression import CompressionConfig
 from flexllmgen.opt_config import OptConfig, get_opt_config, download_opt_weights
-from flexllmgen.pytorch_backend import (TorchDevice, TorchDisk, TorchLink,
+from flexllmgen.pytorch_backend_lsh import (TorchDevice, TorchDisk, TorchLink,
     TorchMixedDevice, DeviceType, general_copy, fix_recursive_import)
 from flexllmgen.timer import timers
 from flexllmgen.utils import (Task, ExecutionEnv, GB, T, ValueHolder,
@@ -25,10 +25,22 @@ from flexllmgen.utils import (Task, ExecutionEnv, GB, T, ValueHolder,
     torch_mem_stats, torch_dtype_to_np_dtype, write_benchmark_log,
     read_benchmark_log)
 
+from flexllmgen.metadata_manage import RadixTree, RadixTreeNode, RadixToken, CachePointer
+from flexllmgen.lsh_server import LSHServer
 fix_recursive_import()
 
 DUMMY_WEIGHT = "_DUMMY_"  # Use dummy weights for benchmark purposes
 
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+
+from collections import defaultdict
+from datasets import load_dataset
+import logging
+
+logging.basicConfig(#filename="test.log", filemode="w",
+                    format="%(asctime)s %(name)s:%(levelname)s:%(message)s", 
+                    datefmt="%m-%d %H:%M:%S", level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
 @dataclasses.dataclass(frozen=True)
 class Policy:
@@ -65,6 +77,14 @@ class Policy:
     # Compress KV cache with group-wise quantization
     compress_cache: bool
     comp_cache_config: CompressionConfig
+
+    # the ratio of important tokens in prefix kv cache
+    important_ratio: float = 0.3
+
+    # Config of Chunk Pool
+    chunk_size: int = 4
+    #gpu_heap_size: int = 0
+    #cpu_heap_size: int = 0
 
     @property
     def w_disk_percent(self):
@@ -145,6 +165,9 @@ class InputEmbed:
     def set_task(self, task):
         self.task = task
 
+    def set_kv_server(self, kv_server):
+        pass
+
     def init_weight(self, weight_home, path):
         v, h, s, dtype = (self.config.vocab_size, self.config.input_dim,
             self.config.max_seq_len, self.config.dtype)
@@ -165,10 +188,10 @@ class InputEmbed:
             dst = self.weight_load_dst
             weight_read_buf.store((w_token.smart_copy(dst), w_pos.smart_copy(dst)))
 
-    def init_cache_one_gpu_batch(self, cache_home):
+    def init_cache_one_gpu_batch(self, cache_home, max_prompt_len, max_gen_len):
         pass  # do nothing
 
-    def load_cache(self, cache_home, cache_read_buf, i):
+    def load_cache(self, cache_home, cache_read_buf, i, j):
         pass  # do nothing
 
     def store_cache(self, cache_home, cache_write_buf, i):
@@ -178,7 +201,7 @@ class InputEmbed:
         return (batch_size, seq_len), np.int64
 
     def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
-                cache_write_buf, i, k):
+                cache_write_buf, i, k, j):
         # Compute input embedding
         donate = [False] * 4
         h, donate[0] = hidden.val, True
@@ -209,6 +232,9 @@ class OutputEmbed:
     def set_task(self, task):
         self.task = task
 
+    def set_kv_server(self, kv_server):
+        pass
+    
     def init_weight(self, weight_home, path):
         v, h, dtype = (self.config.vocab_size, self.config.input_dim,
             self.config.dtype)
@@ -233,10 +259,10 @@ class OutputEmbed:
             weight_read_buf.store((w_ln.smart_copy(dst2), b_ln.smart_copy(dst2),
                 w_token.smart_copy(dst1)))
 
-    def init_cache_one_gpu_batch(self, cache_home):
+    def init_cache_one_gpu_batch(self, cache_home, max_prompt_len, max_gen_len):
         pass  # do nothing
 
-    def load_cache(self, cache_home, cache_read_buf, i):
+    def load_cache(self, cache_home, cache_read_buf, i, j):
         pass  # do nothing
 
     def store_cache(self, cache_home, cache_write_buf, i):
@@ -246,7 +272,7 @@ class OutputEmbed:
         return (batch_size, seq_len, self.config.input_dim), self.config.dtype
 
     def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
-                cache_write_buf, i, k):
+                cache_write_buf, i, k, j):
         donate = [False] * 4
         h, donate[0] = hidden.val, True
 
@@ -275,8 +301,13 @@ class SelfAttention:
 
         self.task = None
 
+        self.prefill_cache_shape = 0 #prefill阶段的cache第一维长度，可能是n_imp + NR(jaccard超过threshold)  可能是R+NR(没有超过threshold)
+
     def set_task(self, task):
         self.task = task
+    
+    def set_kv_server(self, kv_server):
+        self.kv_server = kv_server
 
     def init_weight(self, weight_home, path):
         h, dtype = (self.config.input_dim, self.config.dtype)
@@ -318,7 +349,7 @@ class SelfAttention:
                 w_out.smart_copy(dst1), b_out.smart_copy(dst2),
                 w_ln.smart_copy(dst2), b_ln.smart_copy(dst2)))
 
-    def init_cache_one_gpu_batch(self, cache_home):
+    def init_cache_one_gpu_batch(self, cache_home, max_prompt_len, max_gen_len):
         if self.policy.cache_gpu_percent == 100:
             device = self.env.gpu
         elif self.policy.cache_cpu_percent == 100:
@@ -332,10 +363,61 @@ class SelfAttention:
             assert device.device_type != DeviceType.MIXED
             device = device.compressed_device
 
-        cache = device.init_cache_one_gpu_batch(self.config, self.task, self.policy)
+        cache = device.init_cache_one_gpu_batch(self.config, self.task, self.policy, max_prompt_len, max_gen_len)
         cache_home.store(cache)
 
-    def load_cache(self, cache_home, cache_read_buf, i):
+    def alloc_prefix_kv(self, matched_prefix):
+        n_head = self.config.n_head
+        batch_size = self.policy.gpu_batch_size
+        head_dim = self.config.input_dim // n_head
+
+        total_common_len = sum(matched_prefix.values())
+        dst = self.attention_compute
+        shape = (total_common_len, batch_size * n_head, head_dim)
+
+        pin_memory = True if dst.device_type == DeviceType.CPU else False
+
+        k_cache = dst.allocate(shape, np.float16, pin_memory=pin_memory)
+        v_cache = dst.allocate(shape, np.float16, pin_memory=pin_memory)
+
+        return k_cache, v_cache
+    
+    ### fetch important kv from lsh server , copy after each get_kv()
+    ### todo: manage the shape of k_cache_data
+    ### dst: TorchTensor, src: torch.Tensor
+    ### copy src[0:length] to dst[start:start+length]
+    def copy_prefix(self, dst, src, start):
+        ### copy
+        assert(dst.device.device_type == DeviceType.CPU or DeviceType.CUDA)
+        length = src.shape[0]
+        dst = dst.data[start: start + length]
+        dst.copy_(src, non_blocking=False)
+        return length
+
+
+    def get_prefix_kv(self, imp_token_idx, layer):
+        n_head = self.config.n_head
+        batch_size = self.policy.gpu_batch_size
+        head_dim = self.config.input_dim // n_head
+
+        n_important = len(imp_token_idx) # 如果超过threshold长度就是重要token个数，如果没超过就是common_prefix_len
+        dst = self.attention_compute
+        shape = (n_important, batch_size * n_head, head_dim)
+
+        pin_memory = True if dst.device_type == DeviceType.CPU else False
+        
+        k_cache = dst.allocate(shape, np.float16, pin_memory=pin_memory)
+        v_cache = dst.allocate(shape, np.float16, pin_memory=pin_memory)
+
+        for j in range(n_important):
+            kv_ptr = self.task.common_prefix_kv_ptr[imp_token_idx[j]][layer]
+            chunk_id, offset = kv_ptr.chunk_id, kv_ptr.offset
+            logger.info(f"Get prefix kv: chunk_id={chunk_id}, offset={offset}")
+            self.chunk_pool.get_full_head_cache(k_cache, v_cache, j, chunk_id, offset)
+
+        return k_cache, v_cache
+
+    def load_cache(self, cache_home, cache_read_buf, i, j):
         if i == 0:  # prefill, no cache
             return
 
@@ -402,19 +484,30 @@ class SelfAttention:
         else:
             raise ValueError(f"Invalid path: {path}")
 
+    ### prefix_only: instead of store to cache_home, store by lsh_server
+    ### not prefix_only: store important_kv+non_prefix_kv to cache_home
     def store_cache(self, cache_home, cache_write_buf, i):
         # shape: (s, b * n_head, head_dim)
         k_home, v_home = cache_home.val
         k_new, v_new = cache_write_buf.pop()
+        seq_len, _, _ = k_new.shape
+
+        if self.task.prefix_only:
+            print(f"offloading prefix {self.task.new_prefix_id} to LSH")
+            self.kv_server.offload_to_lsh(self.layer_id, 0, seq_len, self.task.new_prefix_id, k_new.data, v_new.data)
+            return
 
         if i == self.task.gen_len - 1:  # last token, no need to store cache
             return
 
-        if i == 0:  # prefill
+        if i == 0:  # prefix prefill
+            # prefill阶段整个cache存入
             indices = (slice(0, k_new.shape[0]),
                        slice(0, k_new.shape[1]))
         else:  # decoding
-            pos = self.task.prompt_len + i
+            # 在原先cache的基础上拼接
+            # pos = self.task.prompt_len + i
+            pos = self.prefill_cache_shape + i
             indices = (slice(pos - k_new.shape[0], pos),
                        slice(0, k_new.shape[1]))
 
@@ -425,7 +518,7 @@ class SelfAttention:
         return (batch_size, seq_len, self.config.input_dim), self.config.dtype
 
     def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
-                cache_write_buf, i, k):
+                cache_write_buf, i, k, j):
         n_head = self.config.n_head
 
         donate = [False] * 14
@@ -442,20 +535,70 @@ class SelfAttention:
              (w_ln, _), (b_ln, _)) = weight_read_buf.val
 
         if i == 0:  # prefill
+            timers("compute").start()
             mask, donate[1] = attention_mask.val.smart_copy(self.compute)
-            h, new_k_cache, new_v_cache = self.compute.mha(h, mask, w_q, b_q,
-                w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln, n_head, donate,
-                self.policy.compress_cache, self.policy.comp_cache_config)
+            if not self.task.prefix_only:
+                ### should get important kv first
+                
+                matched_prefix = self.task.matched_prefix
+                ### alloc common_prefix_len space, not n_imp space
+                k_cache, v_cache = self.alloc_prefix_kv(matched_prefix)
+
+                cur_pos = 0
+                for prefix_id, max_common_len in matched_prefix.items():
+                    ## j is layer_id
+                    ## get query_states from compute
+                    query_states = self.compute.get_suffix_query_states(h, mask, w_q, b_q, 
+                        w_ln, b_ln, n_head, k_cache, donate, self.policy.compress_cache, 
+                        self.policy.comp_cache_config, matched_prefix)
+                    timers("imp calc").start()
+                    self.kv_server.lsh_retrieve(0, self.layer_id, query_states, prefix_id, max_common_len)
+                    timers("imp calc").stop()
+                    timers("imp load and compute").start()
+                    k_cache_data, v_cache_data = self.kv_server.load_kv(0, self.layer_id, prefix_id)
+                    # k_cache_data, v_cache_data = self.kv_server.get_full_kv(0, self.layer_id, query_states, prefix_id)
+                    # print(k_cache_data)
+                    
+                    # k_cache_data, v_cache_data = self.kv_server.get_full_kv(0, j, query_states, prefix_id)
+                    length = self.copy_prefix(k_cache, k_cache_data, cur_pos)
+                    length = self.copy_prefix(v_cache, v_cache_data, cur_pos)
+                    timers("imp load and compute").stop()
+                    cur_pos += length
+                # n_imp = cur_pos
+                ### kv_server的layer统一用layer_id管理
+                imp_token_idx, avg_n_imp = self.kv_server.get_imp_idx(self.layer_id)
+                # imp_token_idx = self.kv_server.get_full_idx(self.layer_id)
+                print(f"get {avg_n_imp} important tokens")
+
+                # print(imp_token_idx[:3])
+                h, new_k_cache, new_v_cache = self.compute.mha_prefill_with_kv(h, mask, w_q, b_q,
+                    w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln, n_head, k_cache, v_cache, donate,
+                    self.policy.compress_cache, self.policy.comp_cache_config, matched_prefix, 
+                    imp_token_idx, self.kv_server.K, self.kv_server.L)
+                self.prefill_cache_shape = new_k_cache.shape[0]
+                # logger.info(f"SelfAttention Prefix cache shape: {self.prefill_cache_shape}")
+            else:
+                ### only compute prefix kv
+                h, new_k_cache, new_v_cache = self.compute.mha(h, mask, w_q, b_q,
+                    w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln, n_head, donate,
+                    self.policy.compress_cache, self.policy.comp_cache_config, self.kv_server.K, self.kv_server.L)
+                
+                self.prefill_cache_shape = self.task.prompt_len
+                # logger.info(f"SelfAttention Prefix cache shape: {self.prefill_cache_shape}")
+            # 存入的cache shape可能是(s, b * n_head, head_dim) 也可能是 (n_imp + s - common_prefix_len[0], ..., ...)
             cache_write_buf.store((new_k_cache, new_v_cache))
+            timers("compute").stop()
         else:  # decoding
+            imp_token_idx, _ = self.kv_server.get_imp_idx(self.layer_id)
             mask, donate[1] = attention_mask.val.smart_copy(self.attention_compute)
             (k_cache, donate[12]), (v_cache, donate[13]) = cache_read_buf.pop()
+            # logger.info(f"SelfAttention decoding prefill_cache_shape:{self.prefill_cache_shape}, i:{i}")
             h, new_k_cache, new_v_cache = self.compute.mha_gen(h, mask, w_q,
                 b_q, w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln, n_head,
                 k_cache, v_cache, donate, self.policy.attn_sparsity,
-                self.policy.compress_cache, self.policy.comp_cache_config)
+                self.policy.compress_cache, self.policy.comp_cache_config,pos=self.prefill_cache_shape + i, imp_token_idx=imp_token_idx)
             cache_write_buf.store((new_k_cache, new_v_cache))
-
+        
         hidden.val = h
 
 
@@ -473,6 +616,9 @@ class MLP:
 
     def set_task(self, task):
         self.task = task
+    
+    def set_kv_server(self, kv_server):
+        pass
 
     def init_weight(self, weight_home, path):
         h, dtype = (self.config.input_dim, self.config.dtype)
@@ -504,10 +650,10 @@ class MLP:
                 wo.smart_copy(dst1), bo.smart_copy(dst2),
                 w_ln.smart_copy(dst2), b_ln.smart_copy(dst2)))
 
-    def init_cache_one_gpu_batch(self, cache_home):
+    def init_cache_one_gpu_batch(self, cache_home, max_prompt_len, max_gen_len):
         pass  # do nothing
 
-    def load_cache(self, cache_home, cache_read_buf, i):
+    def load_cache(self, cache_home, cache_read_buf, i, j):
         pass  # do nothing
 
     def store_cache(self, cache_home, cache_write_buf, i):
@@ -517,7 +663,7 @@ class MLP:
         return (batch_size, seq_len, self.config.input_dim), self.config.dtype
 
     def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
-                cache_write_buf, i, k):
+                cache_write_buf, i, k, j):
         donate = [False] * 7
         h, donate[0] = hidden.val, True
 
@@ -543,6 +689,10 @@ class TransformerLayer:
     def set_task(self, task):
         self.attention.set_task(task)
         self.mlp.set_task(task)
+    
+    def set_kv_server(self, kv_server):
+        self.attention.set_kv_server(kv_server)
+        #self.mlp.set_kv_server(chunk_pool)
 
     def init_weight(self, weight_home, path):
         home1, home2 = ValueHolder(), ValueHolder()
@@ -558,33 +708,36 @@ class TransformerLayer:
         if k == 0:
             weight_read_buf.store((read_buf1, read_buf2))
 
-    def init_cache_one_gpu_batch(self, cache_home):
-        self.attention.init_cache_one_gpu_batch(cache_home)
+    def init_cache_one_gpu_batch(self, cache_home, max_prompt_len, max_gen_len):
+        self.attention.init_cache_one_gpu_batch(cache_home, max_prompt_len, max_gen_len)
 
-    def load_cache(self, cache_home, cache_read_buf, i):
-        self.attention.load_cache(cache_home, cache_read_buf, i)
+    def load_cache(self, cache_home, cache_read_buf, i, j):
+        self.attention.load_cache(cache_home, cache_read_buf, i, j)
 
     def store_cache(self, cache_home, cache_write_buf, i):
         self.attention.store_cache(cache_home, cache_write_buf, i)
 
     def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
-                cache_write_buf, i, k):
+                cache_write_buf, i, k, j):
         if k == self.policy.num_gpu_batches - 1:
             read_buf1, read_buf2 = weight_read_buf.pop()
         else:
             read_buf1, read_buf2 = weight_read_buf.val
 
         self.attention.forward(hidden, cache_read_buf, read_buf1, attention_mask,
-                               cache_write_buf, i, k)
-        self.mlp.forward(hidden, None, read_buf2, attention_mask, None, i, k)
-
+                               cache_write_buf, i, k, j)
+        self.mlp.forward(hidden, None, read_buf2, attention_mask, None, i, k, j)
 
 class OptLM:
     def __init__(self,
                  config: Union[str, OptConfig],
                  env: ExecutionEnv,
                  path: str,
-                 policy: Policy):
+                 offload_dir: str,
+                 policy: Policy,
+                 max_prompt_len: int,
+                 max_gen_len: int,
+                 persist_strategy: str):
         if isinstance(config, str):
             config = get_opt_config(config)
         self.config = config
@@ -592,6 +745,9 @@ class OptLM:
         self.path = path
         self.policy = policy
         self.num_gpu_batches = policy.num_gpu_batches
+        self.max_prompt_len = max_prompt_len
+        self.max_gen_len = max_gen_len
+        self.persist_strategy = persist_strategy
 
         layers = []
         layers.append(InputEmbed(self.config, self.env, self.policy))
@@ -604,6 +760,7 @@ class OptLM:
         layers.append(OutputEmbed(self.config, self.env, self.policy))
         self.layers = layers
         self.num_layers = len(layers)
+        self.num_hidden_layers = self.config.num_hidden_layers
 
         if self.policy.act_gpu_percent == 100:
             self.act_home = self.env.gpu
@@ -613,7 +770,7 @@ class OptLM:
             self.act_home = self.env.disk
         else:
             raise NotImplementedError()
-
+        
         # CUDA streams
         self.load_weight_stream = torch.cuda.Stream()
         self.load_cache_stream = torch.cuda.Stream()
@@ -634,12 +791,34 @@ class OptLM:
         self.attention_mask = array_1d(num_gpu_batches, ValueHolder)
 
         self.task = None
-        self.init_all_weights()
+        self.init_all_weights() # 权重全部读入weights_home
+
+        self.radix_tree = RadixTree() 
+        ### default settings, note that device=cuda:0
+        self.kv_store_path = os.path.join(offload_dir, "kv_store")
+        if not os.path.exists(self.kv_store_path):
+            os.makedirs(self.kv_store_path)
+        self.kv_server = LSHServer(self.config, self.num_hidden_layers, self.kv_store_path, K=10, L=100, batch_size=1, max_length=8192, device='cuda:0')
+        self.set_kv_server()
+        
+        for j in range(num_layers):
+            for k in range(num_gpu_batches):
+                self.cache_home[j][k].clear()
+                self.cache_read_buf[j][k].clear()
+                self.cache_write_buf[j][k].clear()
+                self.init_cache(j, k, max_gen_len, max_prompt_len)
+        if self.policy.cpu_cache_compute:
+            self.env.cpu.init_attention_compute_workspace(self.config, self.task, self.policy, max_gen_len, max_prompt_len)
+
 
     def set_task(self, task):
         self.task = task
         for l in self.layers:
             l.set_task(task)
+
+    def set_kv_server(self):
+        for l in self.layers:
+            l.set_kv_server(self.kv_server)
 
     def init_weight(self, j):
         expanded_path = os.path.abspath(os.path.expanduser(
@@ -674,13 +853,14 @@ class OptLM:
                 else:
                     x.delete()
 
-    def init_cache(self, j, k):
-        self.layers[j].init_cache_one_gpu_batch(self.cache_home[j][k])
+    def init_cache(self, j, k, max_gen_len, max_prompt_len):
+        self.layers[j].init_cache_one_gpu_batch(self.cache_home[j][k], max_gen_len, max_prompt_len)
+
 
     def load_cache(self, i, j, k, overlap=True):
         # Handle corner cases
-        if i == 0:  # prefill, no cache
-            return
+        # if i == 0:  # prefill, no cache
+        #     return
         if k == self.num_gpu_batches:
             k = 0
             j += 1
@@ -693,9 +873,9 @@ class OptLM:
         # Load from cache_home to cache_read_buf
         if overlap:
             with torch.cuda.stream(self.load_cache_stream):
-                self.layers[j].load_cache(self.cache_home[j][k], self.cache_read_buf[j][k], i)
+                self.layers[j].load_cache(self.cache_home[j][k], self.cache_read_buf[j][k], i, j)
         else:
-            self.layers[j].load_cache(self.cache_home[j][k], self.cache_read_buf[j][k], i)
+            self.layers[j].load_cache(self.cache_home[j][k], self.cache_read_buf[j][k], i, j)
 
     def store_cache(self, i, j, k, overlap=True):
         # Handle corner cases
@@ -707,7 +887,7 @@ class OptLM:
             i -= 1
             if i == -1:
                 return
-        if i == self.task.gen_len - 1:  # last token, no need to store cache
+        if i == self.task.gen_len - 1 and i != 0:  # last token, no need to store cache
             self.cache_write_buf[j][k].pop()
             return
 
@@ -788,7 +968,7 @@ class OptLM:
         # Run layer computation
         self.layers[j].forward(self.hidden[i][j][k], self.cache_read_buf[j][k],
             self.weight_read_buf[j], self.attention_mask[k],
-            self.cache_write_buf[j][k], i, k)
+            self.cache_write_buf[j][k], i, k, j)
 
     def sync(self):
         self.env.disk.synchronize()
@@ -807,9 +987,9 @@ class OptLM:
         if i > 0:
             mask = self.attention_mask[k]
             assert mask.val is not None
-            mask.val = mask.val.device.extend_attention_mask(mask.val, [True])
+            mask.val = mask.val.device.extend_attention_mask(mask.val, [True]) # 在后面加一排1
             return
-
+        # prefill阶段, attention_mask把pad的部分置为false
         gpu_batch_size = self.policy.gpu_batch_size
         left = k * gpu_batch_size
         right = left + gpu_batch_size
@@ -823,7 +1003,7 @@ class OptLM:
         self.attention_mask[k].store(val)
 
     def generate(self,
-                 inputs: Union[np.array, List[List[int]]],
+                 inputs: Union[np.array, List[int]],
                  max_new_tokens: int = 32,
                  do_sample: bool = False,
                  temperature: float = 1.0,
@@ -831,6 +1011,14 @@ class OptLM:
                  debug_mode: Optional[str] = None,
                  cut_gen_len: Optional[int] = None,
                  verbose: int = 0):
+        matched_prefix = self.radix_tree.match(inputs[0])
+        prefix_only = False
+        new_prefix_id = 0
+        if len(matched_prefix) == 0:
+            prefix_only = True
+            new_prefix_id = self.radix_tree.insert(inputs[0])
+        elif len(matched_prefix) == 1:
+            new_prefix_id = list(matched_prefix.keys())[0]
         task = Task(
             inputs=inputs,
             prompt_len=len(inputs[0]),
@@ -839,7 +1027,13 @@ class OptLM:
             do_sample=do_sample,
             temperature=temperature,
             stop=stop,
+            common_prefix_kv_ptr=None,
+            common_prefix_len=None,
+            matched_prefix=matched_prefix,
+            prefix_only=prefix_only,
+            new_prefix_id = new_prefix_id
         )
+        logger.info(f"generate: Task={task}")
         num_layers = self.num_layers
         num_gpu_batches = self.num_gpu_batches
         gpu_batch_size = self.policy.gpu_batch_size
@@ -858,24 +1052,19 @@ class OptLM:
         # The following buffers store values used
         # for the i-th token, j-th layer, k-th gpu batch.
         num_layers, num_gpu_batches = self.num_layers, self.policy.num_gpu_batches
+
         for j in range(num_layers):
             for k in range(num_gpu_batches):
-                self.cache_home[j][k].clear()
                 self.cache_read_buf[j][k].clear()
                 self.cache_write_buf[j][k].clear()
+        
         for j in range(num_layers):
             self.weight_read_buf[j].clear()
         for k in range(num_gpu_batches):
             self.attention_mask[k].clear()
         self.hidden = array_3d(gen_len, num_layers, num_gpu_batches, ValueHolder)
 
-        # Init cache
         self.set_task(task)
-        for j in range(num_layers):
-            for k in range(num_gpu_batches):
-                self.init_cache(j, k)
-        if self.policy.cpu_cache_compute:
-            self.env.cpu.init_attention_compute_workspace(self.config, self.task, self.policy)
 
         # Generate
         if debug_mode is None:
@@ -900,14 +1089,41 @@ class OptLM:
         else:
             raise ValueError("Invalid debug mode: {debug_mode}")
 
-        # Delete cache
-        for j in range(num_layers):
-            for k in range(num_gpu_batches):
-                self.delete_cache(j, k)
-        if self.policy.cpu_cache_compute:
-            self.env.cpu.del_attention_compute_workspace()
-
         return self.output_ids
+
+    def finish_one_query(self, final=False):
+        self.sync()
+        
+        ### if kv not persisted, persist
+        if self.kv_server.persisted == False:
+            if self.persist_strategy == "query":
+                self.kv_server.query_group_persist(self.task.new_prefix_id)
+            elif self.persist_strategy == "seq":
+                self.kv_server.sequential_persist(self.task.new_prefix_id)
+            else:
+                raise ValueError(f"Invalid strategy: {self.persist_strategy}")
+
+        self.kv_server.reset(switch=False)
+
+        try:
+            import subprocess
+            subprocess.run(['sudo', 'drop_cache'], check=True)
+            logger.info("Successfully dropped system caches")
+        except subprocess.CalledProcessError as e:
+            logger.warning(f"Failed to drop caches: {e}")
+        except Exception as e:
+            logger.warning(f"Unexpected error when dropping caches: {e}")
+
+        logger.info("query finished , now sync the model")
+        num_layers, num_gpu_batches = self.num_layers, self.policy.num_gpu_batches
+        if final:
+            # Delete cache
+            for j in range(num_layers):
+                for k in range(num_gpu_batches):
+                    self.delete_cache(j, k)
+            if self.policy.cpu_cache_compute:
+                self.env.cpu.del_attention_compute_workspace()
+
 
     def generation_loop_normal(self):
         for i in range(self.execute_gen_len):
@@ -1168,28 +1384,56 @@ def get_filename(args):
         filename += "-compc"
     return filename
 
+def get_tokenized_inputs(prompt, max_prompt_len, tokenizer):
+    prompt = [prompt] if isinstance(prompt, str) else prompt
+    inputs_ids = tokenizer(prompt, max_length=max_prompt_len, truncation=True).input_ids
+    return inputs_ids
 
-def get_test_inputs(prompt_len, num_prompts, tokenizer):
-    prompts = ["Paris is the capital city of"]
-    input_ids = tokenizer(prompts, padding="max_length",
-                          max_length=prompt_len).input_ids
-    return (input_ids[0],) * num_prompts
+def process_dapr():
+    RootPath = "/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/lqy/HF_HOME/datasets/"
+    docs = load_dataset(RootPath + "UKPLab___dapr/ConditionalQA-docs/0.0.0/67ae3daa13596700976d20605630f5f9db3bd732/", split="test")
+    qrels = load_dataset(RootPath + "UKPLab___dapr/ConditionalQA-qrels/0.0.0/67ae3daa13596700976d20605630f5f9db3bd732/", split="test")
+    queries = load_dataset(RootPath + "UKPLab___dapr/ConditionalQA-queries/0.0.0/67ae3daa13596700976d20605630f5f9db3bd732/", split="test")
+    print(queries)
+    qrels_dict = defaultdict(set)
 
+    for row in qrels:
+        corpus_id = row["corpus_id"]
+        doc_id = corpus_id.split('-')[0]
+        qrels_dict[doc_id].add(row["query_id"])
+    
+    doc_id, query_ids = None, None
+    for k, v in qrels_dict.items():
+        if (len(v) > 10):
+            doc_id, query_ids = k, v
+            break
+    #print(doc_id)
+    docs = docs.filter(lambda row: row["doc_id"] == doc_id)
 
-def run_flexllmgen(args):
-    print(f"<run_flexllmgen>: args.model: {args.model}")
+    passages = docs[0]["passages"]
+    context = ""
+    for psg in passages:
+        context += psg + "\n"
+    #print(context)
+    questions = []
+    target_queries = queries.filter(lambda q: q["_id"] in query_ids)
+    for q in target_queries:
+        questions.append(q["text"])
+    #print(questions)
+
+    return context, questions
+
+def run_dapr_flexllmgen(args):
+    print(f"<run_dapr_flexllmgen>: args.model: {args.model}")
     if args.model == "facebook/galactica-30b":
         tokenizer = AutoTokenizer.from_pretrained("facebook/galactica-30b", padding_side="left")
     else:
         #tokenizer = AutoTokenizer.from_pretrained("facebook/opt-30b", padding_side="left")
-        tokenizer = AutoTokenizer.from_pretrained("/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/hyk/param/opt-30b", padding_side="left")
+        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path, truncation_side="left")
+     
     num_prompts = args.num_gpu_batches * args.gpu_batch_size
-    prompt_len, gen_len, cut_gen_len = args.prompt_len, args.gen_len, args.cut_gen_len
-
-    # Task and policy
-    warmup_inputs = get_test_inputs(32, num_prompts, tokenizer)
-    inputs = get_test_inputs(prompt_len, num_prompts, tokenizer)
-
+    max_prompt_len, gen_len, cut_gen_len = args.prompt_len, args.gen_len, args.cut_gen_len
+    
     gpu = TorchDevice("cuda:0")
     cpu = TorchDevice("cpu")
     disk = TorchDisk(args.offload_dir)
@@ -1210,84 +1454,273 @@ def run_flexllmgen(args):
     assert not (args.compress_cache and args.attn_sparsity < 1.0), "Not implemented"
 
     opt_config = get_opt_config(args.model)
-    cache_size = opt_config.cache_bytes(num_prompts, prompt_len + gen_len)
-    hidden_size = opt_config.hidden_bytes(num_prompts, prompt_len + gen_len)
+    cache_size = opt_config.cache_bytes(num_prompts, max_prompt_len + gen_len)
+    hidden_size = opt_config.hidden_bytes(num_prompts, max_prompt_len + gen_len)
     print(f"model size: {opt_config.model_bytes()/GB:.3f} GB, "
           f"cache size: {cache_size/GB:.3f} GB, "
           f"hidden size (prefill): {hidden_size/GB:.3f} GB")
+    
+    print("init weight...init_cache_home...")
 
-    print("init weight...")
-    model = OptLM(opt_config, env, args.path, policy)
+    model = OptLM(opt_config, env, args.path, args.offload_dir, policy, args.prompt_len, args.gen_len, args.strategy)
+
+    context, questions = process_dapr()
+    context = context[:6144]
+    ### feed prefix
+    prefix_input = get_tokenized_inputs(context, max_prompt_len=max_prompt_len, tokenizer=tokenizer)
+    print(len(prefix_input[0]))
+    output_ids = model.generate(
+        prefix_input, max_new_tokens=1, debug_mode=args.debug_mode,
+        cut_gen_len=cut_gen_len, verbose=args.verbose
+    )
+    model.sync()
+
+    inputs = [context +  query + "\n" for query in questions]
+    inputs_ids = tokenizer(inputs, truncation=True, max_length=max_prompt_len).input_ids
+    
+    for i in range(len(inputs)):
+        global io_bytes 
+        io_bytes = 0
+        global last_id,last_offset,cur_continue_addr,average_continue_addr
+        last_id = -1
+        last_offset = -1
+        cur_continue_addr = 0
+        average_continue_addr = []
+
+        timers("generate").reset()
+        timers("imp io").reset()
+        timers("imp calc").reset()
+        timers("compute").reset()
+        timers("imp load and compute").reset()
+        timers("cache store").reset()
+        output_ids = model.generate(
+            inputs=[inputs_ids[i]], max_new_tokens = args.gen_len, debug_mode=args.debug_mode, 
+            cut_gen_len=cut_gen_len, verbose=args.verbose)
+        if DUMMY_WEIGHT not in args.path:
+            outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
+            show_str = "Outputs:\n" + 70 * '-' + "\n"
+            for j in range(0, len(outputs)):
+                show_str += f"{j}: {outputs[j]}\n"    
+                show_str += "-" * 70 + "\n"
+            if args.verbose >= 2:
+                print(show_str)
+        
+        start_cache_store = torch.cuda.Event(enable_timing=True)
+        end_cache_store = torch.cuda.Event(enable_timing=True)
+        timers("cache store").start(start_cache_store.record())
+        model.finish_one_query(i == len(inputs) - 1)
+        end_cache_store.record()
+        timers("cache store").stop(end_cache_store.synchronize())
+
+        print("imp io average:",timers("imp io").elapsed("average"))
+        print("imp io sum:",timers("imp io").elapsed("sum"))
+        print("imp calc average:",timers("imp calc").elapsed("average"))
+        print("imp calc sum:",timers("imp calc").elapsed("sum"))
+        #print("imp io:{}",timers("imp io").costs)
+        #print("imp calc:{}",timers("imp calc").costs)
+        print("compute average:",timers("compute").elapsed("average"))
+        print("compute sum:",timers("compute").elapsed("sum"))
+        #print("compute:{}",timers("compute").costs)
+        print("prefill:",timers("generate").costs[0])
+        print((timers("imp io").elapsed("sum") + timers("imp calc").elapsed("sum"))/timers("generate").costs[0] * 100)
+
+        print("imp load :",timers("imp load and compute").elapsed("average"))
+        print("imp sum:",timers("imp load and compute").elapsed("sum"))
+        print("store cache:",timers("cache store").costs)
+        print("generate:", timers("generate").costs)
+        print("generate sum:", timers("generate").elapsed("sum"))
+        # print("total io token:", io_bytes)
+        # print("total continue token", cur_continue_addr)
+        # if i!=0:
+        #     print("average continue:", sum(average_continue_addr) / len(average_continue_addr))
+        #     print("sum avg:", sum(average_continue_addr))
+        print("=" * 50)
+
+    env.close_copy_threads()
+
+    _, gpu_peak_mem = gpu.mem_stats()
+    _, cpu_peak_mem = cpu.mem_stats()
+    print(f"peak gpu mem: {gpu_peak_mem / GB:.3f} GB\t" + f"peak cpu mem: {cpu_peak_mem / GB:.3f} GB\t")
+
+
+def run_prefix_flexllmgen(args):
+    print(f"<run_prefix_flexllmgen>: args.model: {args.model}")
+    if args.model == "facebook/galactica-30b":
+        tokenizer = AutoTokenizer.from_pretrained("facebook/galactica-30b", padding_side="left")
+    else:
+        #tokenizer = AutoTokenizer.from_pretrained("facebook/opt-30b", padding_side="left")
+        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
+    
+    num_prompts = args.num_gpu_batches * args.gpu_batch_size
+    max_prompt_len, gen_len, cut_gen_len = args.prompt_len, args.gen_len, args.cut_gen_len
+    
+    gpu = TorchDevice("cuda:0")
+    cpu = TorchDevice("cpu")
+    disk = TorchDisk(args.offload_dir)
+    env = ExecutionEnv(gpu=gpu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gpu, cpu, disk]))
+
+    policy = Policy(args.gpu_batch_size, args.num_gpu_batches,
+                    args.percent[0], args.percent[1],
+                    args.percent[2], args.percent[3],
+                    args.percent[4], args.percent[5],
+                    args.overlap, args.sep_layer, args.pin_weight,
+                    args.cpu_cache_compute, args.attn_sparsity,
+                    args.compress_weight,
+                    CompressionConfig(num_bits=4, group_size=64,
+                                      group_dim=0, symmetric=False),
+                    args.compress_cache,
+                    CompressionConfig(num_bits=4, group_size=64,
+                                      group_dim=2, symmetric=False))
+    assert not (args.compress_cache and args.attn_sparsity < 1.0), "Not implemented"
+
+    opt_config = get_opt_config(args.model)
+    cache_size = opt_config.cache_bytes(num_prompts, max_prompt_len + gen_len)
+    hidden_size = opt_config.hidden_bytes(num_prompts, max_prompt_len + gen_len)
+    print(f"model size: {opt_config.model_bytes()/GB:.3f} GB, "
+          f"cache size: {cache_size/GB:.3f} GB, "
+          f"hidden size (prefill): {hidden_size/GB:.3f} GB")
+    
+    print("init weight...init_cache_home...")
+
+    model = OptLM(opt_config, env, args.path, args.offload_dir, policy, args.prompt_len, args.gen_len, args.strategy)
+    prefix = "Guangzhou is the capital and largest city of Guangdong province in southern China." + \
+      "Located on the Pearl River about 120 km (75 mi) northwest of Hong Kong and 145 km (90 mi) north of Macau, " + \
+      "Guangzhou has a history of over 2,200 years and was a major terminus of the Silk Road." + \
+      "The port of Guangzhou serves as a transportation hub for China's fourth largest city and surrounding areas, including Hong Kong." + \
+      "Guangzhou was captured by the British during the First Opium War and no longer enjoyed a monopoly after the war; " + \
+      "consequently it lost trade to other ports such as Hong Kong and Shanghai, but continued to serve as a major entrepot." + \
+      "Guangzhou is at the center of the Guangdong–Hong Kong–Macau Greater Bay Area, the most populous built-up metropolitan area " +\
+      "in the world, which extends into the neighboring cities of Foshan, Dongguan, Zhongshan, Shenzhen and part of Jiangmen, Huizhou, Zhuhai and Macau."
+    first_query = "Guangzhou is the capital of"
+    second_query = "Shenzhen is a city near"
+
+    prefix_input = get_tokenized_inputs(prefix, max_prompt_len, tokenizer)
+    ### feed prefix --------------
+    output_ids= model.generate(
+            prefix_input, max_new_tokens=1, debug_mode=args.debug_mode, 
+            cut_gen_len=cut_gen_len, verbose=args.verbose)
+    ### offload to lsh server
+    model.sync()
+    # model.store_prefix_cache()
+
+    ### first query: 1. match in radix tree; 2. pick important token; 3. persist
+    first_input = get_tokenized_inputs(prefix + first_query, max_prompt_len, tokenizer)
+    second_input = get_tokenized_inputs(prefix + second_query, max_prompt_len, tokenizer)
+    
+    logger.info(f"first_input: {prefix + first_query}")
+    logger.info(f"second_input: {prefix + second_query}")
 
     try:
-        print("warmup - generate")
-        output_ids = model.generate(
-            warmup_inputs, max_new_tokens=1, verbose=args.verbose)
+        print("first query - generate")
+        timers("generate").reset()
+        output_ids= model.generate(
+            first_input, max_new_tokens = args.gen_len, debug_mode=args.debug_mode, 
+            cut_gen_len=cut_gen_len, verbose=args.verbose)
+        costs = timers("generate").costs
 
-        print("benchmark - generate")
+        # Log output
+        prefill_latency = costs[0]
+        prefill_throughput = num_prompts * max_prompt_len / prefill_latency
+        if cut_gen_len:  # project latency of cut_gen_len to gen_len
+            decode_latency = project_decode_latency(costs, max_prompt_len, gen_len)
+        else:
+            decode_latency = sum(costs[1:])
+        decode_throughput = num_prompts * (gen_len - 1) / max(decode_latency, 1e-10)
+        num_generated_tokens = num_prompts * gen_len
+        total_latency = prefill_latency + decode_latency
+        total_throughput = num_generated_tokens / total_latency
+        _, gpu_peak_mem = gpu.mem_stats()
+        _, cpu_peak_mem = cpu.mem_stats()
+        log_str = (f"model size: {opt_config.model_bytes()/GB:.3f} GB\t"
+                f"cache size: {cache_size/GB:.3f} GB\t"
+                f"hidden size (p): {hidden_size/GB:.3f} GB\n"
+                f"peak gpu mem: {gpu_peak_mem / GB:.3f} GB\t"
+                f"prefill latency: {prefill_latency:.3f} s\t"
+                f"prefill throughput: {prefill_throughput:.3f} token/s\n"
+                f"decode latency: {decode_latency:.3f} s\t"
+                f"decode throughput: {decode_throughput:.3f} token/s\n"
+                f"total latency: {total_latency:.3f} s\t"
+                f"total throughput: {total_throughput:.3f} token/s")
+        print(log_str)
+
+        if DUMMY_WEIGHT not in args.path:
+            outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
+            show_str = "Outputs:\n" + 70 * '-' + "\n"
+            for i in range(0, len(outputs)):
+                show_str += f"{i}: {outputs[i]}\n"
+                show_str += "-" * 70 + "\n"
+            if args.verbose >= 2:
+                print(show_str)
+
+        model.finish_one_query(False)
+
+        print("=" * 50)
+
+        print("second query - generate")
         timers("generate").reset()
         output_ids = model.generate(
-            inputs, max_new_tokens=args.gen_len,
-            debug_mode=args.debug_mode, cut_gen_len=cut_gen_len, verbose=args.verbose)
+            second_input, max_new_tokens = args.gen_len, debug_mode=args.debug_mode, 
+            cut_gen_len=cut_gen_len, verbose=args.verbose)
         costs = timers("generate").costs
+
+        # Log output
+        
+        prefill_latency = costs[0]
+        prefill_throughput = num_prompts * max_prompt_len / prefill_latency
+        if cut_gen_len:  # project latency of cut_gen_len to gen_len
+            decode_latency = project_decode_latency(costs, max_prompt_len, gen_len)
+        else:
+            decode_latency = sum(costs[1:])
+        decode_throughput = num_prompts * (gen_len - 1) / max(decode_latency, 1e-10)
+        num_generated_tokens = num_prompts * gen_len
+        total_latency = prefill_latency + decode_latency
+        total_throughput = num_generated_tokens / total_latency
+        _, gpu_peak_mem = gpu.mem_stats()
+        _, cpu_peak_mem = cpu.mem_stats()
+        log_str = (f"model size: {opt_config.model_bytes()/GB:.3f} GB\t"
+                f"cache size: {cache_size/GB:.3f} GB\t"
+                f"hidden size (p): {hidden_size/GB:.3f} GB\n"
+                f"peak gpu mem: {gpu_peak_mem / GB:.3f} GB\t"
+                f"prefill latency: {prefill_latency:.3f} s\t"
+                f"prefill throughput: {prefill_throughput:.3f} token/s\n"
+                f"decode latency: {decode_latency:.3f} s\t"
+                f"decode throughput: {decode_throughput:.3f} token/s\n"
+                f"total latency: {total_latency:.3f} s\t"
+                f"total throughput: {total_throughput:.3f} token/s")
+        print(log_str)
+
+        if DUMMY_WEIGHT not in args.path:
+            outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
+            show_str = "Outputs:\n" + 70 * '-' + "\n"
+            for i in range(0, len(outputs)):
+                show_str += f"{i}: {outputs[i]}\n"
+                show_str += "-" * 70 + "\n"
+            if args.verbose >= 2:
+                print(show_str)
+
+        print("=" * 50)  
+        model.finish_one_query(True)
+
     finally:
         env.close_copy_threads()
 
-    # Log output
-    prefill_latency = costs[0]
-    prefill_throughput = num_prompts * prompt_len / prefill_latency
-    if cut_gen_len:  # project latency of cut_gen_len to gen_len
-        decode_latency = project_decode_latency(costs, prompt_len, gen_len)
-    else:
-        decode_latency = sum(costs[1:])
-    decode_throughput = num_prompts * (gen_len - 1) / max(decode_latency, 1e-10)
-    num_generated_tokens = num_prompts * gen_len
-    total_latency = prefill_latency + decode_latency
-    total_throughput = num_generated_tokens / total_latency
-    _, gpu_peak_mem = gpu.mem_stats()
-    _, cpu_peak_mem = cpu.mem_stats()
-
-    if DUMMY_WEIGHT not in args.path:
-        outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
-        show_str = "Outputs:\n" + 70 * '-' + "\n"
-        for i in [0, len(outputs)-1]:
-            show_str += f"{i}: {outputs[i]}\n"
-            show_str += "-" * 70 + "\n"
-        if args.verbose >= 2:
-            print(show_str)
-
-    gpu.print_stats()
-    cpu.print_stats()
-    projected = bool(args.debug_mode or cut_gen_len)
-
-    if args.log_file == "auto":
-        filename = get_filename(args) + ".log"
-    else:
-        filename = args.log_file
-
-    log_str = write_benchmark_log(filename,
-        opt_config.model_bytes(), cache_size, hidden_size,
-        gpu_peak_mem, projected, prefill_latency, prefill_throughput,
-        decode_latency, decode_throughput, total_latency, total_throughput)
-    if args.verbose >= 1:
-        print(log_str)
-
-
 def add_parser_arguments(parser):
-    parser.add_argument("--model", type=str, default="facebook/opt-6.7b",
+    parser.add_argument("--model", type=str, default="facebook/opt-30b",
         help="The model name.")
-    parser.add_argument("--path", type=str, default="~/opt_weights",
+    parser.add_argument("--tokenizer-path", type=str, default="/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/hyk/param/opt-30b",
+                        help="The path to the tokenizer.")
+    parser.add_argument("--path", type=str, default="/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/hyk/opt_weights",
         help="The path to the model weights. If there are no cached weights, "
              "FlexLLMGen will automatically download them from HuggingFace.")
-    parser.add_argument("--offload-dir", type=str, default="~/flexllmgen_offload_dir",
+    parser.add_argument("--offload-dir", type=str, default="/ssd/nsccgz_zgchen_6/flexllmgen_offload_dir",
         help="The directory to offload tensors. ")
-    parser.add_argument("--prompt-len", type=int, default=512)
+    parser.add_argument("--prompt-len", type=int, default=5120)
     parser.add_argument("--gen-len", type=int, default=32)
     parser.add_argument("--cut-gen-len", type=int,
         help="Cut generation length for fast debugging.")
     parser.add_argument("--debug-mode", type=str,
         choices=["fewer_batch", "breakdown"])
-    parser.add_argument("--gpu-batch-size", type=int, default=4)
+    parser.add_argument("--gpu-batch-size", type=int, default=1)
     parser.add_argument("--num-gpu-batches", type=int, default=1)
     parser.add_argument("--percent", nargs="+", type=int,
         default=[100, 0, 100, 0, 100, 0],
@@ -1299,7 +1732,7 @@ def add_parser_arguments(parser):
          "the percentage of activations on GPU, "
          "the percentage of activations on CPU")
     parser.add_argument("--sep-layer", type=str2bool, nargs='?',
-        const=True, default=True)
+        const=True, default=False)
     parser.add_argument("--pin-weight", type=str2bool, nargs="?",
         const=True, default=True)
     parser.add_argument("--cpu-cache-compute", action="store_true")
@@ -1315,7 +1748,10 @@ def add_parser_arguments(parser):
     parser.add_argument("--verbose", type=int, default=2)
 
     parser.add_argument("--overlap", type=str2bool, nargs='?',
-        const=True, default=True)
+        const=True, default=False)
+    
+    ## query for query_group_persist; seq for sequential_persist
+    parser.add_argument("--strategy", type=str, default="query")
 
 
 if __name__ == "__main__":
@@ -1325,4 +1761,5 @@ if __name__ == "__main__":
 
     assert len(args.percent) == 6
 
-    run_flexllmgen(args)
+    # run_prefix_flexllmgen(args)
+    run_dapr_flexllmgen(args)

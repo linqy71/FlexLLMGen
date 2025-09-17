@@ -7,6 +7,9 @@ benchmark/third_party/pagecache-mangagement/trunk/*.so
 benchmark/third_party/pagecache-mangagement/trunk/sfr
 benchmark/third_party/pagecache-mangagement/trunk/Makefile
 dist
+library/kvstore/build/
+library/lsh/build/
+library/lsh/*.so
 
 # vscode & VIM & JetBrain
 .vscode/
@@ -22,6 +25,7 @@ flexllmgen/apps/benchmark_output
 flexllmgen/apps/data_wrangle/data
 flexllmgen/apps/data_wrangle/outputs
 flexllmgen/apps/data_wrangle/core
+flexllmgen_offload_dir
 
 # pickle
 *.pkl
@@ -35,6 +39,3 @@ flexllmgen/apps/data_wrangle/core
 today_job.sh
 
 analyze/
-flexllmgen_offload_dir
-build/
-*.so
