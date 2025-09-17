@@ -33,3 +33,8 @@ flexllmgen/apps/data_wrangle/core
 
 # tmp scripts
 today_job.sh
+
+analyze/
+flexllmgen_offload_dir
+build/
+*.so
