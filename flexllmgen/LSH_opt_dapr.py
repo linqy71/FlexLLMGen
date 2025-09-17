@@ -578,7 +578,7 @@ class SelfAttention:
                 # imp_token_idx = self.kv_server.get_full_idx(self.layer_id)
                 print(f"get {avg_n_imp} important tokens")
                 
-                self._record_imp_token_idx()
+                # self._record_imp_token_idx()
 
                 # print(imp_token_idx[:3])
                 h, new_k_cache, new_v_cache = self.compute.mha_prefill_with_kv(h, mask, w_q, b_q,
@@ -1489,7 +1489,7 @@ def run_dapr_flexllmgen(args):
     inputs = [context +  query + "\n" for query in questions]
     inputs_ids = tokenizer(inputs, truncation=True, max_length=max_prompt_len).input_ids
     
-    for i in range(len(inputs)):
+    for i in range(1):
         global io_bytes 
         io_bytes = 0
         global last_id,last_offset,cur_continue_addr,average_continue_addr
@@ -1723,7 +1723,7 @@ def add_parser_arguments(parser):
     parser.add_argument("--path", type=str, default="/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/hyk/opt_weights",
         help="The path to the model weights. If there are no cached weights, "
              "FlexLLMGen will automatically download them from HuggingFace.")
-    parser.add_argument("--offload-dir", type=str, default="/ssd/nsccgz_zgchen_6/lqy/flexllmgen_offload_dir",
+    parser.add_argument("--offload-dir", type=str, default="/ssd/nsccgz_zgchen_6/flexllmgen_offload_dir/kv_store/analyze",
         help="The directory to offload tensors. ")
     parser.add_argument("--prompt-len", type=int, default=5120)
     parser.add_argument("--gen-len", type=int, default=32)

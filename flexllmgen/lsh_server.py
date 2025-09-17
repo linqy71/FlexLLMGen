@@ -66,6 +66,7 @@ class LSHServer:
         ### store lsh query results; TODO: adjust shape to (b * num_key_value_heads,)
         self.nnz = torch.zeros((self.batch_size * self.num_attention_heads,)).to(torch.int32)
         self.results_lsh_cpu = torch.zeros((self.batch_size * self.num_attention_heads, self.max_length)).to(torch.int32)
+        self.hit_counts = torch.zeros((self.batch_size * self.num_attention_heads, self.max_length)).to(torch.int32)
     
         self.query_results = [(torch.zeros_like(self.nnz), torch.zeros_like(self.results_lsh_cpu)) for _ in range(self.num_layers)]
     
@@ -208,8 +209,9 @@ class LSHServer:
         
         self.pinned_hashcode_multi[...,:q_len,:].copy_(q_hashcode)
         ### get results from lsh hashtables
-        self.lsh_retriever.batch_retrieve_multi(layer_idx, self.pinned_hashcode_multi, q_len ,self.results_lsh_cpu, self.nnz, max_index)
+        self.lsh_retriever.batch_retrieve_multi(layer_idx, self.pinned_hashcode_multi, q_len ,self.results_lsh_cpu, self.nnz, self.hit_counts, max_index)
         print(self.nnz)
+        torch.save(self.hit_counts, f"analyze/hits/counts_{layer_idx}.pt")
         self.record_query_results(layer_idx)
     
     def load_kv(self, 

@@ -376,6 +376,7 @@ void LSH::batch_retrieve_multi(
     int num_queries,
     torch::Tensor results_pt,
     torch::Tensor nnz_pt,
+    torch::Tensor hit_counts_pt,
     int max_index)
 {
 
@@ -383,6 +384,7 @@ void LSH::batch_retrieve_multi(
 
   int *results = static_cast<int *>(results_pt.data_ptr());
   int *nnz = static_cast<int *>(nnz_pt.data_ptr());
+  int *hit_counts = static_cast<int *>(hit_counts_pt.data_ptr());
 
   assert(query_pt.size(0) == this->batch_size * this->num_attention_heads * num_queries);
   assert(query_pt.size(1) == this->L);
@@ -399,6 +401,7 @@ void LSH::batch_retrieve_multi(
         query,
         num_queries,
         results,
+        hit_counts,
         max_index);
   }
 }
@@ -409,6 +412,7 @@ int LSH::retrieve_multi(
     int *__restrict query,
     int num_queries,
     int *__restrict results,
+    int *__restrict hit_counts,
     int max_index)
 {
 
@@ -418,10 +422,12 @@ int LSH::retrieve_multi(
   int *__restrict end = this->table_end[layer_id] + group_id * this->L * this->num_buckets;
   int *__restrict content = this->table[layer_id] + group_id * this->L * this->max_length;
   int *__restrict result = results + head_id * this->max_length;
+  int *__restrict counts = hit_counts + head_id * this->max_length;
   int *query_head = query + head_id * 1024 * this->L;
   uint8_t *__restrict tmask = reinterpret_cast<uint8_t *>(mask + head_id * this->max_length);
   // 初始化 tmask
   memset(tmask, 0, this->max_length);
+  memset(counts, 0, this->max_length);
   int offset = 0;
   int *result_ptr = result;
 
@@ -448,6 +454,7 @@ int LSH::retrieve_multi(
       for (int j = start_pos; j < end_pos; ++j)
       {
         int idx = m_content[j];
+        counts[idx]++;
         // if (idx >= max_index) {
         //   break;
         // }
