@@ -31,7 +31,7 @@ fix_recursive_import()
 
 DUMMY_WEIGHT = "_DUMMY_"  # Use dummy weights for benchmark purposes
 
-os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+#os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
 from collections import defaultdict
 from datasets import load_dataset
@@ -794,11 +794,11 @@ class OptLM:
         self.init_all_weights() # 权重全部读入weights_home
 
         self.radix_tree = RadixTree() 
-        ### default settings, note that device=cuda:0
+        ### default settings, note that device=cuda:7
         self.kv_store_path = os.path.join(offload_dir, "kv_store")
         if not os.path.exists(self.kv_store_path):
             os.makedirs(self.kv_store_path)
-        self.kv_server = LSHServer(self.config, self.num_hidden_layers, self.kv_store_path, K=10, L=100, batch_size=1, max_length=8192, device='cuda:0')
+        self.kv_server = LSHServer(self.config, self.num_hidden_layers, self.kv_store_path, K=10, L=100, batch_size=1, max_length=8192, device='cuda:7')
         self.set_kv_server()
         
         for j in range(num_layers):
@@ -1102,7 +1102,9 @@ class OptLM:
                 self.kv_server.sequential_persist(self.task.new_prefix_id)
             else:
                 raise ValueError(f"Invalid strategy: {self.persist_strategy}")
-
+        else:
+            pass
+            self.kv_server.promote_persist(self.task.new_prefix_id)
         self.kv_server.reset(switch=False)
 
         try:
@@ -1123,6 +1125,27 @@ class OptLM:
                     self.delete_cache(j, k)
             if self.policy.cpu_cache_compute:
                 self.env.cpu.del_attention_compute_workspace()
+            self.clear_cache_files(self.task.new_prefix_id)
+
+    def clear_cache_files(self,prefix_id):
+        store_path = self.kv_store_path
+        filename_list = []
+        for i in range(12):
+            filename = f"{prefix_id}_part{i}.bin"
+            filename_list.append(filename)
+        # filename_list.append("lsh_table_1")
+        # filename_list.append("hash_func_10_100.pt")
+        for filename in filename_list:
+            file_path = os.path.join(store_path, filename)     
+            if os.path.exists(file_path):
+                try:
+                    # 以写入模式打开文件会立即清空其内容
+                    with open(file_path, 'w') as f:
+                        pass  # 不需要做任何事，文件已被清空
+                except Exception as e:
+                    print(f"  - 清空文件失败: {file_path}, 错误: {e}")
+            else:
+                print(f"  - 文件不存在，跳过: {file_path}")
 
 
     def generation_loop_normal(self):
@@ -1434,7 +1457,7 @@ def run_dapr_flexllmgen(args):
     num_prompts = args.num_gpu_batches * args.gpu_batch_size
     max_prompt_len, gen_len, cut_gen_len = args.prompt_len, args.gen_len, args.cut_gen_len
     
-    gpu = TorchDevice("cuda:0")
+    gpu = TorchDevice("cuda:7")
     cpu = TorchDevice("cpu")
     disk = TorchDisk(args.offload_dir)
     env = ExecutionEnv(gpu=gpu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gpu, cpu, disk]))
@@ -1554,7 +1577,7 @@ def run_prefix_flexllmgen(args):
     num_prompts = args.num_gpu_batches * args.gpu_batch_size
     max_prompt_len, gen_len, cut_gen_len = args.prompt_len, args.gen_len, args.cut_gen_len
     
-    gpu = TorchDevice("cuda:0")
+    gpu = TorchDevice("cuda:7")
     cpu = TorchDevice("cpu")
     disk = TorchDisk(args.offload_dir)
     env = ExecutionEnv(gpu=gpu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gpu, cpu, disk]))

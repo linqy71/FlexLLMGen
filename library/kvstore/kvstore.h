@@ -34,7 +34,8 @@ class KVStore{
         void recover_meta(std::string path, int prefix_id);
         void collect_queried_key_value(int prefix_id, int layer_id, torch::Tensor ind_pt, torch::Tensor nnz_pt);
         void load_key_value_from_file(std::vector<std::tuple<uint64_t,uint64_t, int>>& content, int prefix_id, int layer_id, int head_id);
-        // void load_key_value(std::vector<std::tuple<uint64_t, uint64_t, int>>& content, int prefix_id, int layer_id, int head_id);
+        void load_key_value(std::vector<std::tuple<uint64_t, uint64_t, int>>& content, int prefix_id, int layer_id, int head_id);
+        void promote_persist(std::string path, int prefix_id, int layer_idx, const torch::Tensor& promote_token_info);
         torch::Tensor to_tensor(DTYPE* start, int length);
         torch::Tensor get_key_cache(int layer_id);
         torch::Tensor get_value_cache(int layer_id);
