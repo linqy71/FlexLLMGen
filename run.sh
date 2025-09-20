@@ -1,14 +1,13 @@
 #!/bin/bash
-cd /HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/hyk/my_FlexLLMGen/FlexLLMGen/library/lsh
+cd /HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/hyk/my_FlexLLMGen/Flex2/library/lsh
 
 pip install -e .
 
-cd /HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/hyk/my_FlexLLMGen/FlexLLMGen/library/kvstore
+cd /HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/hyk/my_FlexLLMGen/Flex2/library/kvstore
 
 python setup.py install
 
 cd ../../
-
 
 python3 -m flexllmgen.LSH_opt_dapr --model facebook/opt-30b \
         --percent 100 0 100 0 100 0 \
@@ -16,7 +15,8 @@ python3 -m flexllmgen.LSH_opt_dapr --model facebook/opt-30b \
         --prompt-len 2016 \
         --gen-len 32 \
         --strategy query \
-        --offload-dir /ssd/nsccgz_zgchen_6/flexllmgen_offload_dir/gathering  > log/gather_direct1.log 2>&1
+        --offload-dir /ssd/nsccgz_zgchen_6/flexllmgen_offload_dir/gathering  > log/multi_f0.log 2>&1
+
 
 # python3 -m flexllmgen.LSH_opt_dapr --model facebook/opt-30b \
 #         --percent 100 0 100 0 100 0 \
