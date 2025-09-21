@@ -14,6 +14,13 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 
+import logging
+
+logging.basicConfig(#filename="test.log", filemode="w",
+                    format="%(asctime)s %(name)s:%(levelname)s:%(message)s", 
+                    datefmt="%m-%d %H:%M:%S", level=logging.DEBUG)
+logger = logging.getLogger(__name__)
+
 from flexllmgen.utils import (GB, T, cpu_mem_stats, vector_gather,
     np_dtype_to_torch_dtype, torch_dtype_to_np_dtype,
     torch_dtype_to_num_bytes)
@@ -45,17 +52,26 @@ def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
     return freqs_cis.view(*shape)
 
 ### from https://github.com/meta-llama/llama3/blob/main/llama/model.py
+# def apply_rotary_emb(
+#     xq: torch.Tensor,
+#     xk: torch.Tensor,
+#     freqs_cis: torch.Tensor,
+# ) -> Tuple[torch.Tensor, torch.Tensor]:
+#     xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
+#     xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
+#     freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
+#     xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
+#     xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
+#     return xq_out.type_as(xq), xk_out.type_as(xk)
+
 def apply_rotary_emb(
-    xq: torch.Tensor,
-    xk: torch.Tensor,
+    x: torch.Tensor,
     freqs_cis: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
-    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-    freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
-    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
-    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
-    return xq_out.type_as(xq), xk_out.type_as(xk)
+    x_ = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
+    freqs_cis = reshape_for_broadcast(freqs_cis, x_)
+    x_out = torch.view_as_real(x_ * freqs_cis).flatten(3)
+    return x_out.type_as(x)
 
 class DeviceType(Enum):
     CPU = auto()
@@ -392,11 +408,11 @@ class TorchDevice:
             ids = last_token_logits.argmax(dim=1, keepdim=True)
         return TorchTensor.create_from_torch(ids, self)
 
-    def init_cache_one_gpu_batch_llama(self, config, task, policy):
+    def init_cache_one_gpu_batch_llama(self, config, task, policy, max_prompt_len, max_gen_len):
         num_head, num_key_value_heads, hidden_size, prompt_len, gen_len, gpu_batch_size = (
-            config.n_head, config.num_key_value_heads, config.input_dim, task.prompt_len, task.gen_len,
+            config.n_head, config.num_key_value_heads, config.input_dim, max_prompt_len, max_gen_len,
             policy.gpu_batch_size)
-        shape = (prompt_len + gen_len - 1, gpu_batch_size, num_key_value_heads, hidden_size // num_head)
+        shape = (max_prompt_len + max_gen_len - 1, gpu_batch_size * num_key_value_heads, hidden_size // num_head)
         # NOTE: disable pin_memory due to high memory overhead
         pin_memory = False
         k_cache = self.allocate(shape, np.float16, pin_memory=pin_memory)
@@ -443,9 +459,11 @@ class TorchDevice:
         v = v.view(b, s, n_kv_head, head_dim)
         
         # RotaryEmbedding
-        q, k = apply_rotary_emb(q, k, freqs_cis)
+        q = apply_rotary_emb(q, freqs_cis)
+        k = apply_rotary_emb(k, freqs_cis)
 
-        ori_k, ori_v = k.transpose(0, 1), v.transpose(0,1)
+        ori_k = k.transpose(0,1).reshape(s, b*n_kv_head, head_dim)
+        ori_v = v.transpose(0,1).reshape(s, b*n_kv_head, head_dim)
         # Expand kv heads to match attention heads if needed
         repeat_kv = n_head // n_kv_head
         if repeat_kv > 1:
@@ -481,11 +499,10 @@ class TorchDevice:
             v = TorchTensor.create_from_torch(ori_v, self)
         return TorchTensor.create_from_torch(out, self), k, v
 
-    def mha(self, inputs, attention_mask, w_q, b_q, w_k, b_k, w_v, b_v,
-            w_out, b_out, w_ln, b_ln, n_head, donate, compress_cache, comp_config):
-        """Multi-head attention (prefill phase)."""
-        # decompress weights
+    def get_suffix_query_states(self, inputs, attention_mask, i_n, w_q, w_k, w_v, w_out, eps,
+            freqs_cis, n_head, n_kv_head, donate, compress_cache, comp_config, matched_prefix):
         if w_q.device.device_type == DeviceType.COMPRESSED:
+            i_n = i_n.device.decompress(i_n)
             w_q = w_q.device.decompress(w_q)
             w_k = w_k.device.decompress(w_k)
             w_v = w_v.device.decompress(w_v)
@@ -493,67 +510,118 @@ class TorchDevice:
 
         b, s, h = inputs.shape
         head_dim = h // n_head
-        scaling = head_dim ** -0.5
+        common_prefix_len = sum(matched_prefix.values())
+        
+        freqs_cis = freqs_cis[common_prefix_len:s].to(self.dev)
 
-        hidden = F.layer_norm(inputs.data, (h,), weight=w_ln.data, bias=b_ln.data)
+        # input_layernorm
+        hidden = F.rms_norm(inputs.data, (h,), weight=i_n.data, eps=eps)
+        hidden = hidden[:, common_prefix_len:, :]
+        
+        # shape: (b, suffix_len, h)
+        q = F.linear(hidden, w_q.data)
+        # shape: (b, suffix_len, n_head, head_dim)
+        q = q.view(b, s - common_prefix_len, n_head, head_dim)
+        
+        # RotaryEmbedding
+        q = apply_rotary_emb(q, freqs_cis)
+        return q[0]
 
-        # shape: (b, s, h)
-        q = F.linear(hidden, w_q.data, bias=b_q.data) * scaling
-        k = F.linear(hidden, w_k.data, bias=b_k.data)
-        v = F.linear(hidden, w_v.data, bias=b_v.data)
+    def gqa_prefill_with_kv(self, inputs, attention_mask, i_n, w_q, w_k, w_v, w_out, eps,
+            freqs_cis, n_head, n_kv_head, k_cache, v_cache, donate,
+            compress_cache, comp_config, matched_prefix, imp_token_idx):
+        """Grouped query attention (prefill with prefix cache)"""
+        # decompress weights
+        if w_q.device.device_type == DeviceType.COMPRESSED:
+            i_n = i_n.device.decompress(i_n)
+            w_q = w_q.device.decompress(w_q)
+            w_k = w_k.device.decompress(w_k)
+            w_v = w_v.device.decompress(w_v)
+            w_out = w_out.device.decompress(w_out)
+        if compress_cache:
+            # shape: (n_imp, b * n_kv_head, head_dim)
+            k = k_cache.device.decompress(k_cache)
+            v = v_cache.device.decompress(v_cache)
+        else:
+            # shape: (n_imp, b * n_kv_head, head_dim)
+            k = k_cache.data
+            v = v_cache.data
+        
+        n_imp = imp_token_idx.shape[1]
+        b, s, h = inputs.shape
+        head_dim = h // n_head
+        common_prefix_len = sum(matched_prefix.values())
+        suffix_len = s - common_prefix_len
+        k = k[:n_imp]
+        v = v[:n_imp]
+
+        freqs_cis = freqs_cis.to(self.dev)
+        repeat_kv = n_head // n_kv_head
+        
+        #input_layernorm
+        hidden = F.rms_norm(inputs.data, (h,), weight=i_n.data, eps=eps)
+        suffix_hidden = hidden[:, common_prefix_len:, :]
+        
+        q = F.linear(hidden, w_q.data)            # (b, s, h)
+        k_new = F.linear(suffix_hidden, w_k.data)            # (b, suffix_len, h)
+        v_new = F.linear(suffix_hidden, w_v.data)            # (b, suffix_len, h)
         # shape: (b, s, n_head, head_dim)
         q = q.view(b, s, n_head, head_dim)
-        k = k.view(b, s, n_head, head_dim)
-        v = v.view(b, s, n_head, head_dim)
+        k_new = k_new.view(b, suffix_len, n_kv_head, head_dim)
+        v_new = v_new.view(b, suffix_len, n_kv_head, head_dim)
+        
+        # RotaryEmbedding
+        q = apply_rotary_emb(q, freqs_cis[:s])
+        k_new = apply_rotary_emb(k_new, freqs_cis[common_prefix_len:s])
+        # q, k_new = apply_rotary_emb(q, k_new, freqs_cis)
+        # k_new = k_new[:, common_prefix_len:s, :, :]
 
-        # shape: (b * n_head, s, head_dim)
         q = q.permute(0, 2, 1, 3).reshape(b * n_head, s, head_dim)
-        # shape: (b * n_head, head_dim, s)
-        k = k.permute(0, 2, 3, 1).reshape(b * n_head, head_dim, s)
-        # shape: (b * n_head, s, head_dim)
-        v = v.permute(0, 2, 1, 3).reshape(b * n_head, s, head_dim)
+        k_new = k_new.permute(1, 0, 2, 3).reshape(suffix_len, b * n_kv_head, head_dim)
+        v_new = v_new.permute(1, 0, 2, 3).reshape(suffix_len, b * n_kv_head, head_dim)
+        ori_k = torch.cat((k, k_new), dim=0)
+        ori_v = torch.cat((v, v_new), dim=0)
+        l = n_imp + suffix_len
 
-        # shape: (b * n_head, s, s)
-        attn_weights = torch.bmm(q, k)
+        # Expand kv heads to match attention heads if needed
+        repeat_kv = n_head // n_kv_head
+        if repeat_kv > 1:
+            # shape: l, b, n_head, head_dim
+            k = ori_k.repeat_interleave(repeat_kv, dim=1)
+            v = ori_v.repeat_interleave(repeat_kv, dim=1)
 
-        # shape: (b, 1, s, s)
-        idx = torch.arange(s, device=self.dev)
-        causal_mask = (idx <= idx.view(s, 1)).view(1, 1, s, s)
-        mask = attention_mask.data.view(b, 1, 1, s) & causal_mask
+        # shape: (b * n_head, head_dim, l)
+        k = k.permute(1, 2, 0).reshape(b * n_head, head_dim, l)
+        # shape: (b * n_head, l, head_dim)
+        v = v.permute(1, 0, 2).reshape(b * n_head, l, head_dim)
 
-        # shape: (b, n_head, s, s)
-        attn_weights = attn_weights.view(b, n_head, s, s)
-        attn_weights = torch.where(mask, attn_weights, -1e4)
-        attn_weights = attn_weights.view(b * n_head, s, s)
-        attn_weights = F.softmax(attn_weights, dim=2)
-        # shape: (b, n_head, s, head_dim)
-        value = torch.bmm(attn_weights, v).view(b, n_head, s, head_dim)
-        # shape: (b, s, h)
-        value = value.transpose(1, 2).reshape(b, s, h)
-        value = F.linear(value, w_out.data, bias=b_out.data)
+        scores = torch.matmul(q, k) / math.sqrt(head_dim)
+        # if attention_mask.data is not None:
+        #     scores = scores + attention_mask.data  # (b, n_head, s, s)
 
-        value.add_(inputs.data)
+        ### shape: b, n_head, s, l
+        scores = F.softmax(scores.float(), dim=-1).type_as(q)
+        output = torch.matmul(scores, v)  # (b, n_head, s, head_dim)
+        output = output.transpose(1, 2).contiguous().view(b, s, -1)
+        out = F.linear(output, w_out.data)
+
+        out.add_(inputs.data)
 
         if donate[0]: inputs.delete()
         if donate[1]: attention_mask.delete()
 
-        # (s, b * n_head, head_dim)
-        k = k.permute(2, 0, 1)
-        v = v.permute(1, 0, 2)
-
         if compress_cache:
-            k = self.compressed_device.compress(k, comp_config)
-            v = self.compressed_device.compress(v, comp_config)
+            k = self.compressed_device.compress(ori_k, comp_config)
+            v = self.compressed_device.compress(ori_v, comp_config)
         else:
-            k = TorchTensor.create_from_torch(k, self)
-            v = TorchTensor.create_from_torch(v, self)
-
-        return TorchTensor.create_from_torch(value, self), k, v
-
+            k = TorchTensor.create_from_torch(ori_k, self)
+            v = TorchTensor.create_from_torch(ori_v, self)
+        return TorchTensor.create_from_torch(out, self), k, v
+        
 
     def gqa_gen(self, inputs, attention_mask, i_n, w_q, w_k, w_v, w_out, eps,
             freqs_cis, n_head, n_kv_head, k_cache, v_cache, donate,
-            compress_cache, comp_config):
+            compress_cache, comp_config, pos):
         """Grouped-query attention (decoding phase)."""
         
         # decompress weights
@@ -565,7 +633,8 @@ class TorchDevice:
             w_out = w_out.device.decompress(w_out)
 
         b, tgt_s, h = inputs.shape
-        src_s = attention_mask.shape[1]
+        # src_s = attention_mask.shape[1]
+        src_s = pos
         head_dim = h // n_head
         
         freqs_cis = freqs_cis[src_s - 1 : src_s - 1 + tgt_s].to(self.dev)
@@ -584,47 +653,37 @@ class TorchDevice:
         v = v.view(b, tgt_s, n_kv_head, head_dim)
 
         # Rotary
-        q, k = apply_rotary_emb(q, k, freqs_cis)
-        ori_k, ori_v = k.transpose(0, 1), v.transpose(0, 1)
+        q = apply_rotary_emb(q, freqs_cis)
+        k = apply_rotary_emb(k, freqs_cis)
 
-        # Expand KV for matmul
-        k = k.repeat_interleave(repeat_kv, dim=2) # b, tgt_s, n_head, head_dim
-        v = v.repeat_interleave(repeat_kv, dim=2)
-
-        # shape: (b, n_head, tgt_s, head_dim)
-        q = q.transpose(1, 2)
-        # shape: (tgt_s, b, n_head, head_dim)
-        k = k.transpose(0, 1) 
-        # shape: (tgt_s, b, n_head, head_dim)
-        v = v.transpose(0, 1)
-
+        q = q.permute(0, 2, 1, 3).reshape(b * n_head, tgt_s, head_dim)
+        k_new = k.permute(1, 0, 2, 3).reshape(tgt_s, b * n_kv_head, head_dim)
+        v_new = v.permute(1, 0, 2, 3).reshape(tgt_s, b * n_kv_head, head_dim)
+        
         if compress_cache:
-            k_cache_data = k_cache.device.decompress(k_cache)[:src_s]
-            v_cache_data = v_cache.device.decompress(v_cache)[:src_s]
+            k = k_cache.device.decompress(k_cache)[:src_s]
+            v = v_cache.device.decompress(v_cache)[:src_s]
         else:
-            k_cache_data = k_cache.data[:src_s]
-            v_cache_data = v_cache.data[:src_s]
-
-        k_cache_data = k_cache_data.repeat_interleave(repeat_kv, dim=2)  # (s, b, n_head, head_dim)
-        v_cache_data = v_cache_data.repeat_interleave(repeat_kv, dim=2)
-
+            k = k_cache.data[:src_s]
+            v = v_cache.data[:src_s]
+        
         # concat cur k v to k_cache and v_cache
-        # shape: (s, b, n_head, head_dim)
+        k[src_s - 1:src_s] = k_new
+        v[src_s - 1:src_s] = v_new
 
-        k_cache_data[src_s - 1:src_s] = k
-        v_cache_data[src_s - 1:src_s] = v
+        # shape: (s, b * n_head, head_dim)
+        k = k.repeat_interleave(repeat_kv, dim=1)  # (s, b * n_head, head_dim)
+        v = v.repeat_interleave(repeat_kv, dim=1)
 
-        # shape: (b, n_head, src_s, head_dim)
-        k_attn = k_cache_data.permute(1, 2, 0, 3) 
-        # shape: (b, n_head, src_s, head_dim)
-        v_attn = v_cache_data.permute(1, 2, 0, 3)
+        k = k.permute(1, 2, 0).reshape(b * n_head, head_dim, src_s)
+        v = v.permute(1, 0, 2).reshape(b * n_head, src_s, head_dim)
 
         # q: (b, n_head, tgt_s, head_dim)
-        scores = torch.matmul(q, k_attn.transpose(2, 3)) / math.sqrt(head_dim)
+        scores = torch.matmul(q, k) / math.sqrt(head_dim)
         # if attention_mask.data is not None:
         #     scores = scores + attention_mask.data  # (b, n_head, tgt_s, src_s)
         scores = F.softmax(scores.float(), dim=-1).type_as(q)
-        output = torch.matmul(scores, v_attn) # (b, n_head, tgt_s, head_dim)
+        output = torch.matmul(scores, v) # (b, n_head, tgt_s, head_dim)
         
         # Postprocess
         output = output.transpose(1, 2).contiguous().view(b, tgt_s, -1)
@@ -639,8 +698,8 @@ class TorchDevice:
         # ori_k : (tgt_s, b, n_kv_head, head_dim)
         assert(not compress_cache)
         
-        k_new = TorchTensor.create_from_torch(ori_k, self)
-        v_new = TorchTensor.create_from_torch(ori_v, self)
+        k_new = TorchTensor.create_from_torch(k_new, self)
+        v_new = TorchTensor.create_from_torch(v_new, self)
 
         return TorchTensor.create_from_torch(out, self), k_new, v_new
 

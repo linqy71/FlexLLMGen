@@ -167,6 +167,7 @@ class LSHServer:
         for head_id, n in enumerate(nnz):
             res[head_id, n:] = -1
         max_len = nnz.max()
+        print(f"layer : {layer_idx}, max_len: {max_len}")
         avg_len = nnz.sum() / len(nnz)
         return res[:, :max_len], avg_len
 
@@ -204,6 +205,8 @@ class LSHServer:
         
         self.pinned_hashcode_multi[...,:q_len,:].copy_(q_hashcode)
         ### get results from lsh hashtables
+        self.nnz.zero_()
+        self.results_lsh_cpu.zero_()
         self.lsh_retriever.batch_retrieve_multi(layer_idx, self.pinned_hashcode_multi, q_len ,self.results_lsh_cpu, self.nnz, max_index)
         print(self.nnz)
         self.record_query_results(layer_idx)

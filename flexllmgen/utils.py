@@ -32,8 +32,8 @@ class Task:
     stop: Optional[int]
 
     # prefix_seq: Union[np.array, List[List[RadixToken]]]
-    common_prefix_len: int # 每个请求的prefix长度
-    common_prefix_kv_ptr: List[List[CachePointer]] # shape(prefix_len, num_layers)
+    common_prefix_len: int = None # 每个请求的prefix长度
+    common_prefix_kv_ptr: List[List[CachePointer]] = None # shape(prefix_len, num_layers)
 
     ### for lsh, dict: prefix_id, max_common_len
     matched_prefix: dict = None
