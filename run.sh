@@ -15,7 +15,7 @@ python3 -m flexllmgen.LSH_opt_dapr --model facebook/opt-30b \
         --prompt-len 2016 \
         --gen-len 32 \
         --strategy query \
-        --offload-dir /ssd/nsccgz_zgchen_6/flexllmgen_offload_dir/gathering  > log/multi_f0.log 2>&1
+        --offload-dir /ssd/nsccgz_zgchen_6/flexllmgen_offload_dir/gathering  > log/gather_d0.log 2>&1
 
 
 # python3 -m flexllmgen.LSH_opt_dapr --model facebook/opt-30b \

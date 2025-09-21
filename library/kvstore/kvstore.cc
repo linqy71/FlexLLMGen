@@ -206,7 +206,7 @@ void KVStore::write_to_file(
     DTYPE * k = this->key_cache[layer_id];
     DTYPE * v = this->value_cache[layer_id];
 
-    const int tokens_per_file = 4096; // max tokens per file
+    const int tokens_per_file = 128; // max tokens per file
 
     // std::string file_name = this->store_path + "/" + std::to_string(prefix_id) + ".bin";
     // std::ofstream file(file_name, std::ios::app | std::ios::binary);  //std::ios::app 所有层所有头所有token的数据保存在一个文件里面
@@ -357,7 +357,7 @@ void KVStore::collect_queried_key_value(
 
         // load from storage
         this->load_key_value(content, prefix_id, layer_id, i);
-        //this->load_key_value_from_file(content, prefix_id, layer_id, i);
+        // this->load_key_value_from_file(content, prefix_id, layer_id, i);
 
         content.clear();
     }
@@ -372,6 +372,7 @@ void analyze_content_segments(const std::vector<std::tuple<uint64_t, uint64_t, i
 
     std::map<uint64_t, std::vector<std::pair<uint64_t, uint64_t>>> file_segments;
     for (const auto& [file_index, offset, length] : content) {
+        std::cout<<"FileIndex: " << file_index << ", Offset: " << offset << ", Length: " << length << std::endl;
         file_segments[file_index].emplace_back(offset, offset + length);
     }
 
@@ -534,7 +535,7 @@ void KVStore::load_key_value_from_file(
     int layer_id,
     int head_id)
 {
-    auto start = std::chrono::high_resolution_clock::now(); // 记录开始时间
+    //auto start = std::chrono::high_resolution_clock::now(); // 记录开始时间
     // std::string file_name = this->store_path + "/" + std::to_string(prefix_id) + ".bin";
     // std::ifstream file(file_name, std::ios::binary);
     // if (!file.is_open()) {
@@ -590,8 +591,8 @@ void KVStore::load_key_value_from_file(
     }
 
     if (file.is_open()) file.close();
-    auto end = std::chrono::high_resolution_clock::now(); // 记录结束时间
-    double elapsed = std::chrono::duration<double>(end - start).count();
+    //auto end = std::chrono::high_resolution_clock::now(); // 记录结束时间
+    //double elapsed = std::chrono::duration<double>(end - start).count();
     // printf("[KVStore::load_key_value_from_file] elapsed time: %.6f seconds\n", elapsed);
 }
 

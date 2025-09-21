@@ -1104,7 +1104,7 @@ class OptLM:
                 raise ValueError(f"Invalid strategy: {self.persist_strategy}")
         else:
             pass
-            #self.kv_server.promote_persist(self.task.new_prefix_id)
+            self.kv_server.promote_persist(self.task.new_prefix_id)
         self.kv_server.reset(switch=False)
 
         try:
@@ -1125,7 +1125,7 @@ class OptLM:
                     self.delete_cache(j, k)
             if self.policy.cpu_cache_compute:
                 self.env.cpu.del_attention_compute_workspace()
-            #self.clear_cache_files(self.task.new_prefix_id)
+            self.clear_cache_files(self.task.new_prefix_id)
 
     def clear_cache_files(self,prefix_id):
         store_path = self.kv_store_path
@@ -1498,7 +1498,7 @@ def run_dapr_flexllmgen(args):
     )
     model.sync()
 
-    inputs = [context +  query + "\n" for query in questions[:3]]
+    inputs = [context +  query + "\n" for query in questions]
     inputs_ids = tokenizer(inputs, truncation=True, max_length=max_prompt_len).input_ids
     
     for i in range(len(inputs)):
