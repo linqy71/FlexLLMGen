@@ -1104,7 +1104,7 @@ class OptLM:
                 raise ValueError(f"Invalid strategy: {self.persist_strategy}")
         else:
             pass
-            self.kv_server.promote_persist(self.task.new_prefix_id)
+            #self.kv_server.promote_persist(self.task.new_prefix_id)
         self.kv_server.reset(switch=False)
 
         try:
@@ -1125,12 +1125,12 @@ class OptLM:
                     self.delete_cache(j, k)
             if self.policy.cpu_cache_compute:
                 self.env.cpu.del_attention_compute_workspace()
-            self.clear_cache_files(self.task.new_prefix_id)
+            #self.clear_cache_files(self.task.new_prefix_id)
 
     def clear_cache_files(self,prefix_id):
         store_path = self.kv_store_path
         filename_list = []
-        for i in range(12):
+        for i in range(200):
             filename = f"{prefix_id}_part{i}.bin"
             filename_list.append(filename)
         # filename_list.append("lsh_table_1")
@@ -1143,7 +1143,8 @@ class OptLM:
                     with open(file_path, 'w') as f:
                         pass  # 不需要做任何事，文件已被清空
                 except Exception as e:
-                    print(f"  - 清空文件失败: {file_path}, 错误: {e}")
+                    pass
+                    #print(f"  - 清空文件失败: {file_path}, 错误: {e}")
             else:
                 print(f"  - 文件不存在，跳过: {file_path}")
 

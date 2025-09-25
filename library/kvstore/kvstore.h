@@ -28,6 +28,9 @@ class KVStore{
         void fill(int layer_id, torch::Tensor k, torch::Tensor v);
         // void write_to_storage(std::string path, int prefix_id, int layer_id, const std::vector<std::vector<int>>& strategy);
         void write_to_file(std::string path, int prefix_id, int layer_id, const std::vector<std::vector<int>>& strategy);
+        void write_to_layer_file(std::string path, int prefix_id, int layer_id, const std::vector<std::vector<int>>& strategy);
+        void write_to_layer_promote_file(std::string path, int prefix_id, int layer_id, const std::vector<std::vector<int>>& strategy);
+        
         void clear();
         uint64_t get_meta_id(int token_id, int layer_id, int head_id);
         void persist_meta(int prefix_id);

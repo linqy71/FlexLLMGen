@@ -195,6 +195,117 @@ void KVStore::recover_meta(std::string path, int prefix_id) {
 //     this->persisted = true;
 
 // }
+void KVStore::write_to_layer_promote_file(
+    std::string path, 
+    int prefix_id, 
+    int layer_id, 
+    const std::vector<std::vector<int>>& strategy
+) {
+    this->store_path = path;
+    DTYPE * k = this->key_cache[layer_id];
+    DTYPE * v = this->value_cache[layer_id];
+
+    int seq_len = this->offload_len;
+    size_t entry_size = 2 * this->head_dim * sizeof(DTYPE); // key + value
+
+    std::string file_name = this->store_path + "/" + std::to_string(prefix_id) + "_layer" + std::to_string(layer_id) + "_part0.bin";
+    std::ofstream file(file_name, std::ios::app | std::ios::binary);  //std::ios::app 所有层所有头所有token的数据保存在一个文件里面
+
+    for (int i = 0; i < this->num_key_value_heads; i++){
+        const std::vector<int>& head_strategy = strategy[i];
+        size_t head_entries = head_strategy.size();
+        size_t total_size = head_entries * entry_size;
+
+
+        DTYPE* head_key = k + i * this->max_length * this->head_dim;  //当前注意力头的数据存放的位置
+        DTYPE* head_value = v + i * this->max_length * this->head_dim;
+
+        for (size_t j = 0; j < head_entries; j++) {
+            int idx = head_strategy[j];
+
+            std::streampos head_base_offset = file.tellp();
+            std::streampos entry_offset = head_base_offset;
+            DTYPE* cur_key = head_key + idx * this->head_dim; //当前token的数据位置
+            DTYPE* cur_value = head_value + idx * this->head_dim;
+            
+            file.write(reinterpret_cast<char*>(cur_key), this->head_dim * sizeof(DTYPE));
+            file.write(reinterpret_cast<char*>(cur_value), this->head_dim * sizeof(DTYPE));
+            uint64_t meta_id = get_meta_id(idx, layer_id, i);
+            FileOffsetInfo file_offset_info(uint64_t(0), uint64_t(entry_offset));
+            kv_meta->insert({meta_id, file_offset_info});
+        }
+    }
+    file.flush();
+    file.close();
+    this->persisted = true;
+}
+
+void KVStore::write_to_layer_file(
+    std::string path, 
+    int prefix_id, 
+    int layer_id, 
+    const std::vector<std::vector<int>>& strategy
+) {
+    this->store_path = path;
+    DTYPE * k = this->key_cache[layer_id];
+    DTYPE * v = this->value_cache[layer_id];
+
+    const int tokens_per_file = 4096; // max tokens per file
+
+    std::string file_name = this->store_path + "/" + std::to_string(prefix_id) + "_layer" + std::to_string(layer_id) + ".bin";
+    std::ofstream file(file_name, std::ios::app | std::ios::binary);  //std::ios::app 所有层所有头所有token的数据保存在一个文件里面
+    
+    // 准备按token范围分片存储 所有层所有头的一部分kv保存在一个文件，
+
+    int seq_len = this->offload_len;
+    size_t entry_size = 2 * this->head_dim * sizeof(DTYPE); // key + value
+
+
+    for (int i = 0; i < this->num_key_value_heads; i++){
+        const std::vector<int>& head_strategy = strategy[i];
+        size_t head_entries = head_strategy.size();
+        size_t total_size = head_entries * entry_size;
+        // std::streampos head_base_offset = file.tellp();
+
+        // DTYPE* key_value = new DTYPE[head_entries * this->head_dim * 2]; // key + value
+        // memset(key_value, 0, head_entries * this->head_dim * 2 * sizeof(DTYPE));
+
+        DTYPE* head_key = k + i * this->max_length * this->head_dim;  //当前注意力头的数据存放的位置
+        DTYPE* head_value = v + i * this->max_length * this->head_dim;
+
+        for (size_t j = 0; j < head_entries; j++) {
+            int idx = head_strategy[j];
+
+            std::streampos head_base_offset = file.tellp();
+            //std::streampos entry_offset = head_base_offset + entry_size;
+            std::streampos entry_offset = head_base_offset;
+            DTYPE* cur_key = head_key + idx * this->head_dim; //当前token的数据位置
+            DTYPE* cur_value = head_value + idx * this->head_dim;
+            
+            file.write(reinterpret_cast<char*>(cur_key), this->head_dim * sizeof(DTYPE));
+            file.write(reinterpret_cast<char*>(cur_value), this->head_dim * sizeof(DTYPE));
+            // // copy key
+            // memcpy(key_value + j * 2 * this->head_dim, cur_key, this->head_dim * sizeof(DTYPE));
+            // // copy value
+            // memcpy(key_value + j * 2 * this->head_dim + this->head_dim, cur_value, this->head_dim * sizeof(DTYPE));
+
+            // // record meta
+            // std::streampos entry_offset = head_base_offset + j * entry_size;
+            uint64_t meta_id = get_meta_id(idx, layer_id, i);
+            FileOffsetInfo file_offset_info(layer_id, uint64_t(entry_offset));
+            kv_meta->insert({meta_id, file_offset_info});
+            // kv_meta->insert({meta_id, uint64_t(entry_offset)});
+        }
+
+        // file.write(reinterpret_cast<const char*>(key_value), total_size);
+        // delete[] key_value;
+        
+    }
+    file.flush();
+    file.close();
+    this->persisted = true;
+}
+
 
 void KVStore::write_to_file(
     std::string path,
@@ -356,8 +467,8 @@ void KVStore::collect_queried_key_value(
         }
 
         // load from storage
-        this->load_key_value(content, prefix_id, layer_id, i);
-        // this->load_key_value_from_file(content, prefix_id, layer_id, i);
+        //this->load_key_value(content, prefix_id, layer_id, i);
+        this->load_key_value_from_file(content, prefix_id, layer_id, i);
 
         content.clear();
     }
@@ -372,7 +483,7 @@ void analyze_content_segments(const std::vector<std::tuple<uint64_t, uint64_t, i
 
     std::map<uint64_t, std::vector<std::pair<uint64_t, uint64_t>>> file_segments;
     for (const auto& [file_index, offset, length] : content) {
-        std::cout<<"FileIndex: " << file_index << ", Offset: " << offset << ", Length: " << length << std::endl;
+        //std::cout<<"FileIndex: " << file_index << ", Offset: " << offset << ", Length: " << length << std::endl;
         file_segments[file_index].emplace_back(offset, offset + length);
     }
 
@@ -440,6 +551,7 @@ void analyze_content_segments(const std::vector<std::tuple<uint64_t, uint64_t, i
     std::cout << "Max Continuous Length: " << max_continuous_length << " bytes" << std::endl;
     //std::cout << "Max Gap between Segments: " << max_gap << " bytes" << std::endl;
     std::cout << "Average Continuous Length: " << avg_continuous_length << " bytes" << std::endl;
+    std::cout<< "=====================================================================================================" << std::endl;
 }
 
 void KVStore::load_key_value(
@@ -448,7 +560,8 @@ void KVStore::load_key_value(
     int layer_id,
     int head_id)
 {
-    if (layer_id == 1 && head_id == 0){
+    //if (layer_id == 1 && head_id == 0){
+    if(head_id == 0){  
         analyze_content_segments(content);
     }
     const size_t alignment = 4096; // Should match filesystem block size
@@ -465,11 +578,13 @@ void KVStore::load_key_value(
             if (fd != -1) {
                 close(fd);
             }
-            std::string file_name = this->store_path + "/" + std::to_string(prefix_id) + "_part" + std::to_string(file_index) + ".bin";
+            //std::string file_name = this->store_path + "/" + std::to_string(prefix_id)  + "_part" + std::to_string(file_index) + ".bin";
+            //std::string file_name = this->store_path + "/" + std::to_string(prefix_id) + "_layer" + std::to_string(layer_id)  + "_part" + std::to_string(file_index) + ".bin";
+            std::string file_name = this->store_path + "/" + std::to_string(prefix_id)  + "_layer" + std::to_string(layer_id) + ".bin";
             fd = open(file_name.c_str(), O_RDONLY | O_DIRECT);
             if (fd == -1) {
                 perror(("open failed for " + file_name).c_str());
-                continue; // 跳过这个损坏或不存在的文件
+                //continue; // 跳过这个损坏或不存在的文件
             }
             cur_file_index = file_index;
         }
@@ -543,7 +658,8 @@ void KVStore::load_key_value_from_file(
     //     return;
     // }
     //////// ananlyze
-    if (layer_id == 1 && head_id == 0){
+    //if (layer_id == 1 && head_id == 0){
+    if(layer_id == 5 || layer_id == 15 || layer_id == 25){  
         analyze_content_segments(content);
     }
 
@@ -558,8 +674,9 @@ void KVStore::load_key_value_from_file(
         // change file
         if(file_index != cur_file_index){
             if (file.is_open()) file.close();
-            std::string file_name = this->store_path + "/" + std::to_string(prefix_id) + "_part" + std::to_string(file_index) + ".bin";
-
+            //std::string file_name = this->store_path + "/" + std::to_string(prefix_id) + "_part" + std::to_string(file_index) + ".bin";
+            //std::string file_name = this->store_path + "/" + std::to_string(prefix_id) + "_layer" + std::to_string(layer_id)  + "_part" + std::to_string(file_index) + ".bin";
+            std::string file_name = this->store_path + "/" + std::to_string(prefix_id)  + "_layer" + std::to_string(layer_id) + ".bin";
             file.open(file_name, std::ios::binary);
             if (!file.is_open()) {
                 std::cerr << "Failed to open file: " << file_name << std::endl;
@@ -597,7 +714,7 @@ void KVStore::load_key_value_from_file(
 }
 
 
-void KVStore::promote_persist(std::string path, int prefix_id, int layer_idx, const torch::Tensor &promote_token_info){
+void KVStore::promote_persist(std::string path, int prefix_id, int layer_id, const torch::Tensor &promote_token_info){
     if (promote_token_info.numel() == 0) {
         return; // 没有需要提升的token，直接返回
     }
@@ -613,7 +730,7 @@ void KVStore::promote_persist(std::string path, int prefix_id, int layer_idx, co
         int head_id = accessor[i][0];
         int token_id = accessor[i][1];
         
-        uint64_t meta_id = get_meta_id(token_id, layer_idx, head_id);
+        uint64_t meta_id = get_meta_id(token_id, layer_id, head_id);
         
         if (kv_meta->count(meta_id)) {
             const FileOffsetInfo& info = kv_meta->at(meta_id);
@@ -624,8 +741,8 @@ void KVStore::promote_persist(std::string path, int prefix_id, int layer_idx, co
     for (auto const& [source_file_index, promotions] : promotions_by_file) {
         uint64_t dest_file_index = source_file_index + 1;
 
-        std::string source_file_name = this->store_path + "/" + std::to_string(prefix_id) + "_part" + std::to_string(source_file_index) + ".bin";
-        std::string dest_file_name = this->store_path + "/" + std::to_string(prefix_id) + "_part" + std::to_string(dest_file_index) + ".bin";
+        std::string source_file_name = this->store_path + "/" + std::to_string(prefix_id) + "_layer" + std::to_string(layer_id)  + "_part" + std::to_string(source_file_index) + ".bin";
+        std::string dest_file_name = this->store_path + "/" + std::to_string(prefix_id) + "_layer" + std::to_string(layer_id)  + "_part" + std::to_string(dest_file_index) + ".bin";
 
         std::ifstream source_file(source_file_name, std::ios::binary);
         // 使用追加模式打开目标文件
@@ -696,7 +813,9 @@ PYBIND11_MODULE(kvstore, m) {
         .def("persist_meta", &KVStore::persist_meta)
         .def("recover_meta", &KVStore::recover_meta)
         //.def("write_to_storage", &KVStore::write_to_storage)
+        .def("write_to_layer_promote_file", &KVStore::write_to_layer_promote_file)
         .def("write_to_file", &KVStore::write_to_file)
+        .def("write_to_layer_file", &KVStore::write_to_layer_file)
         .def("collect_queried_key_value", &KVStore::collect_queried_key_value)
         .def("get_queried_key_cache", &KVStore::get_queried_key_cache)
         .def("promote_persist", &KVStore::promote_persist)
