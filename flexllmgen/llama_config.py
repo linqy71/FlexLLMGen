@@ -1,4 +1,5 @@
 from transformers import LlamaForCausalLM, LlamaConfig
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 import torch
 import os
 import numpy as np
@@ -41,6 +42,29 @@ class LlamaConfig:
         return batch_size * seq_len * self.input_dim * 2
     
 
+def get_llama_config(name, **kwargs):
+    if "/" in name:
+        name = name.split("/")[1]
+    name = name.lower()
+    print(name)
+    if name == "llama3.1-8b":
+        config = LlamaConfig()
+    elif name == "llama3.3-70b":
+        config = LlamaConfig(
+            name=name,
+            num_hidden_layers=80,
+            vocab_size=128256,
+            max_position_embeddings=131072,
+            hidden_size=8192,
+            n_head=64,
+            num_key_value_heads=8,
+            input_dim=8192
+        )
+    else:
+        raise ValueError(f"Invalid model name: {name}")
+
+    return dataclasses.replace(config, **kwargs)
+
 def preset_llama3_config():
     config = LlamaConfig(
         name = "llama3.1-8b",
@@ -80,21 +104,28 @@ def save_weights(output_dir, name, param):
             np.save(f, param)
         return 
     print(param.shape)
-    np_array = param.cpu().detach().numpy()
+    np_array = param.cpu().detach().to(torch.float16).numpy()
     print(name)
     with open(param_path, "wb") as f:
         np.save(f, np_array)
 
 def convert_local_llama_weights(model_dir, output_dir):
-    hf_model = LlamaForCausalLM.from_pretrained(model_dir, torch_dtype=torch.float16)
+    model = LlamaForCausalLM.from_pretrained(
+            model_dir,
+            device_map="cpu",
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True
+        )
+    print("Successfully loaded model automatically")
+
 
     name = "lm_head.weight"
-    save_weights(output_dir, name, hf_model.lm_head.weight)
+    save_weights(output_dir, name, model.lm_head.weight)
     
     name = "decoder.embed_tokens.weight"
-    save_weights(output_dir, name, hf_model.model.embed_tokens.weight)
+    save_weights(output_dir, name, model.model.embed_tokens.weight)
     
-    for idx, hf_layer in enumerate(hf_model.model.layers):
+    for idx, hf_layer in enumerate(model.model.layers):
       
         ### self attn
         name = f"decoder.layers.{idx}.self_attn.q_proj.weight"
@@ -123,14 +154,14 @@ def convert_local_llama_weights(model_dir, output_dir):
         save_weights(output_dir, name, hf_layer.post_attention_layernorm.weight)
         
     name = "decoder.norm.weight"
-    save_weights(output_dir, name, hf_model.model.norm.weight)
+    save_weights(output_dir, name, model.model.norm.weight)
     
     name = "rotary_emb.inv_freq"
-    save_weights(output_dir, name, hf_model.model.rotary_emb.inv_freq)
+    save_weights(output_dir, name, model.model.rotary_emb.inv_freq)
     name = "rotary_emb.attention_scaling"
-    save_weights(output_dir, name, hf_model.model.rotary_emb.attention_scaling)
+    save_weights(output_dir, name, model.model.rotary_emb.attention_scaling)
     
 
 if __name__ == "__main__":
-    convert_local_llama_weights("/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/lqy/HF_HOME/hub/models--meta-llama--Meta-Llama-3.1-8B-Instruct/snapshots/0e9e39f249a16976918f6564b8830bc894c89659",
-        "/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/lqy/HF_HOME/hub/llama3.1-8b-np")
+    convert_local_llama_weights("/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/lqy/HF_HOME/hub/models--meta-llama--Llama-3.3-70B-Instruct/snapshots/6f6073b423013f6a7d4d9f39144961bfbfbc386b",
+        "/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/lqy/HF_HOME/hub/llama3.3-70b-np")
