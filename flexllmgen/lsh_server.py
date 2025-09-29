@@ -175,7 +175,7 @@ class LSHServer:
         res = torch.zeros((self.num_key_value_heads, self.offload_len), dtype=int, device="cpu")
         for i in range(self.num_key_value_heads):
             res[i, :].copy_(torch.arange(0, self.offload_len))
-        return res
+        return res, self.offload_len
 
     ### get important kv by queries through lsh
     ### req_id: requst id inside a batch
@@ -233,7 +233,7 @@ class LSHServer:
 
     ### for debug...
     ### get full kv from kv_store by generating indices of range(offloaded_len)
-    def get_full_kv(self, req_id, layer_idx, query_states, prefix_id):
+    def get_full_kv(self, req_id, layer_idx, prefix_id):
         if not self.offloaded:
             return None, None
         ### generating indices covering offloaded_len

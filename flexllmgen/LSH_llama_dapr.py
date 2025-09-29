@@ -1,6 +1,6 @@
 """
 Usage:
-python3 -m flexllmgen.LSH_llama_dapr --model meta/llama3.3-70b --path=/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/lqy/HF_HOME/hub --overlap=False --percent 20 80 100 0 100 0
+python3 -m flexllmgen.LSH_llama_dapr --model meta/llama3.3-70b --path=/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/lqy/HF_HOME/hub --overlap=False --percent 50 50 100 0 100 0
 """
 
 import argparse
@@ -30,6 +30,8 @@ from flexllmgen.utils import (Task, ExecutionEnv, GB, T, ValueHolder,
     array_1d, array_2d, array_3d, str2bool, project_decode_latency,
     torch_mem_stats, torch_dtype_to_np_dtype, write_benchmark_log,
     read_benchmark_log)
+from flexllmgen.llama_template import *
+
 
 fix_recursive_import()
 
@@ -189,7 +191,7 @@ class InputEmbed:
         return (batch_size, seq_len), np.int64
 
     def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
-                cache_write_buf, i, k, freqs_cis):
+                cache_write_buf, i, k, position_ids):
         # Compute input embedding
         donate = [False] * 2
         h, donate[0] = hidden.val, True
@@ -257,7 +259,7 @@ class OutputEmbed:
         return (batch_size, seq_len, self.config.hidden_size), self.config.dtype
 
     def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
-                cache_write_buf, i, k, freqs_cis):
+                cache_write_buf, i, k, position_ids):
         donate = [False] * 3
         h, donate[0] = hidden.val, True
 
@@ -479,7 +481,7 @@ class SelfAttention:
         return (batch_size, seq_len, self.config.hidden_size), self.config.dtype
 
     def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
-                cache_write_buf, i, k, freqs_cis):
+                cache_write_buf, i, k, position_ids):
         n_head = self.config.n_head
         num_key_value_heads = self.config.num_key_value_heads
 
@@ -508,22 +510,24 @@ class SelfAttention:
                     ## get query_states from compute
                     ## -------todo:get_suffix_query_states_llama
                     query_states = self.compute.get_suffix_query_states(h, mask, i_n, w_q,
-                        w_k, w_v, w_out, self.rms_norm_eps, freqs_cis,n_head, num_key_value_heads,
+                        w_k, w_v, w_out, self.rms_norm_eps, position_ids,n_head, num_key_value_heads,
                         donate, self.policy.compress_cache, self.policy.comp_cache_config, matched_prefix)
                     
-                    self.kv_server.lsh_retrieve(0, self.layer_id, query_states, prefix_id, max_common_len)
-                    k_cache_data, v_cache_data = self.kv_server.load_kv(0, self.layer_id, prefix_id)
+                    # self.kv_server.lsh_retrieve(0, self.layer_id, query_states, prefix_id, max_common_len)
+                    # k_cache_data, v_cache_data = self.kv_server.load_kv(0, self.layer_id, prefix_id)
+
+                    k_cache_data, v_cache_data = self.kv_server.get_full_kv(0, self.layer_id, prefix_id)
 
                     length = self.copy_prefix(k_cache, k_cache_data, cur_pos)
                     length = self.copy_prefix(v_cache, v_cache_data, cur_pos)
                     cur_pos += length
             
                 ### kv_server的layer统一用layer_id管理
-                imp_token_idx, avg_n_imp = self.kv_server.get_imp_idx(self.layer_id)
-                # imp_token_idx = self.kv_server.get_full_idx(self.layer_id)
+                # imp_token_idx, avg_n_imp = self.kv_server.get_imp_idx(self.layer_id)
+                imp_token_idx, avg_n_imp = self.kv_server.get_full_idx(self.layer_id)
                 print(f"get {avg_n_imp} important tokens")
                 h, new_k_cache, new_v_cache = self.compute.gqa_prefill_with_kv(h, mask, i_n, w_q,
-                        w_k, w_v, w_out, self.rms_norm_eps, freqs_cis,n_head, num_key_value_heads,
+                        w_k, w_v, w_out, self.rms_norm_eps, position_ids,n_head, num_key_value_heads,
                         k_cache, v_cache,
                         donate, self.policy.compress_cache, self.policy.comp_cache_config, matched_prefix,
                         imp_token_idx)
@@ -532,7 +536,7 @@ class SelfAttention:
             else:
                 ### only compute prefix kv
                 h, new_k_cache, new_v_cache = self.compute.gqa(h, mask, i_n, w_q,
-                    w_k, w_v, w_out, self.rms_norm_eps, freqs_cis,
+                    w_k, w_v, w_out, self.rms_norm_eps, position_ids,
                     n_head, num_key_value_heads, donate, self.policy.compress_cache, self.policy.comp_cache_config)
                 self.prefill_cache_shape = new_k_cache.shape[0]
 
@@ -541,7 +545,7 @@ class SelfAttention:
             mask, donate[1] = attention_mask.val.smart_copy(self.attention_compute)
             (k_cache, donate[7]), (v_cache, donate[8]) = cache_read_buf.pop()
             h, new_k_cache, new_v_cache = self.compute.gqa_gen(h, mask, i_n, w_q,
-                w_k, w_v, w_out, self.rms_norm_eps, freqs_cis,
+                w_k, w_v, w_out, self.rms_norm_eps, position_ids,
                 n_head, num_key_value_heads, k_cache, v_cache, donate,
                 self.policy.compress_cache, self.policy.comp_cache_config,
                 pos=self.prefill_cache_shape+i)
@@ -624,7 +628,7 @@ class MLP:
         return (batch_size, seq_len, self.config.hidden_size), self.config.dtype
 
     def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
-                cache_write_buf, i, k, freqs_cis):
+                cache_write_buf, i, k, position_ids):
         donate = [False] * 5
         h, donate[0] = hidden.val, True
 
@@ -676,15 +680,15 @@ class TransformerLayer:
         self.attention.store_cache(cache_home, cache_write_buf, i)
 
     def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
-                cache_write_buf, i, k, freqs_cis):
+                cache_write_buf, i, k, position_ids):
         if k == self.policy.num_gpu_batches - 1:
             read_buf1, read_buf2 = weight_read_buf.pop()
         else:
             read_buf1, read_buf2 = weight_read_buf.val
 
         self.attention.forward(hidden, cache_read_buf, read_buf1, attention_mask,
-                               cache_write_buf, i, k, freqs_cis)
-        self.mlp.forward(hidden, None, read_buf2, attention_mask, None, i, k, freqs_cis)
+                               cache_write_buf, i, k, position_ids)
+        self.mlp.forward(hidden, None, read_buf2, attention_mask, None, i, k, position_ids)
 
 
 class LLAMA:
@@ -707,11 +711,12 @@ class LLAMA:
         self.persist_strategy = persist_strategy
         
         self.max_length = max_prompt_len + max_gen_len
-        self.freqs_cis = precompute_freqs_cis(
-            self.config.hidden_size // self.config.n_head,
-            self.max_length * 2,
-            self.config.rope_theta
-        )
+        # self.freqs_cis = precompute_freqs_cis(
+        #     self.config.hidden_size // self.config.n_head,
+        #     self.max_length * 2,
+        #     self.config.rope_theta
+        # )
+        self.position_ids = torch.arange(self.max_length)
 
         layers = []
         layers.append(InputEmbed(self.config, self.env, self.policy))
@@ -931,7 +936,7 @@ class LLAMA:
         # Run layer computation
         self.layers[j].forward(self.hidden[i][j][k], self.cache_read_buf[j][k],
             self.weight_read_buf[j], self.attention_mask[k],
-            self.cache_write_buf[j][k], i, k, self.freqs_cis)
+            self.cache_write_buf[j][k], i, k, self.position_ids)
 
     def sync(self):
         self.env.disk.synchronize()
@@ -1436,6 +1441,7 @@ def run_dapr_flexllmgen(args):
     context, questions = process_dapr()
     # context = context[:10240]
     ### feed prefix
+    # context_input = context_template.format(context)
     prefix_input = get_tokenized_inputs(context, max_prompt_len=max_prompt_len, tokenizer=tokenizer)
     print(len(prefix_input[0]))
     output_ids = model.generate(
