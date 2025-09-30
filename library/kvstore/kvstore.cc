@@ -277,13 +277,14 @@ void KVStore::collect_queried_key_value(
       DTYPE* key = this->key_cache[layer_id];
       DTYPE* value = this->value_cache[layer_id];
       for (int i = 0; i < this->num_key_value_heads; i++) {
+        auto head_ind = ind + i * this->max_length;
         int num_indices = nnz[i];
         auto queried_key_ptr = this->queried_key + i * stride;
         auto queried_value_ptr = this->queried_value + i * stride;
         auto key_ptr = key + i * stride;
         auto value_ptr = value + i * stride;
         for (int j = 0; j < num_indices; j++) {
-          auto cur_ind = ind[j];
+          auto cur_ind = head_ind[j];
           memcpy(queried_key_ptr + j * this->head_dim, key_ptr + cur_ind * this->head_dim, this->head_dim * sizeof(DTYPE));
           memcpy(queried_value_ptr + j * this->head_dim, value_ptr + cur_ind * this->head_dim, this->head_dim * sizeof(DTYPE));
         }
@@ -293,10 +294,10 @@ void KVStore::collect_queried_key_value(
     
     for(int i = 0; i < this->num_key_value_heads; i++){
         std::set<uint64_t> queried_meta_offset;
-
+        auto head_ind = ind + i * this->max_length;
         int num_indices = nnz[i];
         for (int j = 0; j < num_indices; j++) {
-            uint64_t meta_id = get_meta_id(ind[j], layer_id, i);
+            uint64_t meta_id = get_meta_id(head_ind[j], layer_id, i);
             queried_meta_offset.insert(kv_meta->at(meta_id));
         }
 
