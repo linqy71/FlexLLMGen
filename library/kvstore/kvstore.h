@@ -19,6 +19,22 @@ struct FileOffsetInfo {
     FileOffsetInfo(uint64_t idx, uint64_t off) : file_index(idx), offset(off) {}
 };
 
+struct LayerStats{
+    uint64_t    segment_cnt;
+    double      avg_continuous_length;
+    double      tot_time;
+    double      collect_time;
+
+    LayerStats(): segment_cnt(0), avg_continuous_length(0.0), tot_time(0.0){}
+
+    void update_len(uint64_t new_segment_cnt, double new_avg_len){
+        avg_continuous_length = (avg_continuous_length * segment_cnt + new_avg_len * new_segment_cnt) / (segment_cnt + new_segment_cnt);
+        segment_cnt += new_segment_cnt;
+    }
+
+    void update_time(double new_time) { tot_time += new_time; }
+};
+
 class KVStore{
 
     public:
@@ -36,8 +52,16 @@ class KVStore{
         void persist_meta(int prefix_id);
         void recover_meta(std::string path, int prefix_id);
         void collect_queried_key_value(int prefix_id, int layer_id, torch::Tensor ind_pt, torch::Tensor nnz_pt);
-        void load_key_value_from_file(std::vector<std::tuple<uint64_t,uint64_t, int>>& content, int prefix_id, int layer_id, int head_id);
-        void load_key_value(std::vector<std::tuple<uint64_t, uint64_t, int>>& content, int prefix_id, int layer_id, int head_id);
+
+        void merge_collect_queried_key_value(int prefix_id, int layer_id, torch::Tensor ind_pt, torch::Tensor nnz_pt);
+
+        void load_key_value_from_file(std::vector<std::tuple<uint64_t,uint64_t, int>>& content, std::vector<int> &key_order, int prefix_id, int layer_id, int head_id);
+        
+        void merge_load_key_value_from_file(std::vector<std::tuple<uint64_t, uint64_t, uint64_t, int>>& content, std::vector<int> &token_order, int prefix_id, int layer_id, int head_id);
+        
+        void load_key_value(std::vector<std::tuple<uint64_t, uint64_t, int>>& content, std::vector<int> &key_order, int prefix_id, int layer_id, int head_id);
+
+        void merge_load_key_value(std::vector<std::tuple<uint64_t, uint64_t, uint64_t, int>>& content, std::vector<int> &token_order, int prefix_id, int layer_id, int head_id);
         void promote_persist(std::string path, int prefix_id, int layer_idx, const torch::Tensor& promote_token_info);
         torch::Tensor to_tensor(DTYPE* start, int length);
         torch::Tensor get_key_cache(int layer_id);
@@ -64,4 +88,6 @@ class KVStore{
         bool persisted;
 
         std::unordered_map<uint64_t, FileOffsetInfo>* kv_meta; // metaid -> pos
+
+        std::vector<LayerStats> layer_stats;
 };

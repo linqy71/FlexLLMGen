@@ -58,6 +58,8 @@ void KVStore::alloc(
     memset(this->queried_key, 0, this->num_key_value_heads * this->max_length * this->head_dim * sizeof(DTYPE));
     memset(this->queried_value, 0, this->num_key_value_heads * this->max_length * this->head_dim * sizeof(DTYPE));
 
+    //this->layer_stats.assign(num_layers, LayerStats());
+
 }
 
 void KVStore::clear() {
@@ -399,8 +401,8 @@ void KVStore::collect_queried_key_value(
     torch::Tensor ind_pt, 
     torch::Tensor nnz_pt
 ) {
-    memset(this->queried_key, 0, this->num_key_value_heads * this->max_length * this->head_dim * sizeof(DTYPE));
-    memset(this->queried_value, 0, this->num_key_value_heads * this->max_length * this->head_dim * sizeof(DTYPE));
+    //memset(this->queried_key, 0, this->num_key_value_heads * this->max_length * this->head_dim * sizeof(DTYPE));
+    //memset(this->queried_value, 0, this->num_key_value_heads * this->max_length * this->head_dim * sizeof(DTYPE));
 
     int * ind = static_cast<int *>(ind_pt.data_ptr());
     int * nnz = static_cast<int *>(nnz_pt.data_ptr());
@@ -416,13 +418,14 @@ void KVStore::collect_queried_key_value(
       DTYPE* key = this->key_cache[layer_id];
       DTYPE* value = this->value_cache[layer_id];
       for (int i = 0; i < this->num_key_value_heads; i++) {
+        auto head_ind = ind + i * this->max_length;
         int num_indices = nnz[i];
         auto queried_key_ptr = this->queried_key + i * stride; // 当前头要查询的数据位置
         auto queried_value_ptr = this->queried_value + i * stride;
         auto key_ptr = key + i * stride; // 当前头完整数据位置
         auto value_ptr = value + i * stride;
         for (int j = 0; j < num_indices; j++) {
-          auto cur_ind = ind[j];
+          auto cur_ind = head_ind[j];
           memcpy(queried_key_ptr + j * this->head_dim, key_ptr + cur_ind * this->head_dim, this->head_dim * sizeof(DTYPE));
           memcpy(queried_value_ptr + j * this->head_dim, value_ptr + cur_ind * this->head_dim, this->head_dim * sizeof(DTYPE));
         }
@@ -430,28 +433,38 @@ void KVStore::collect_queried_key_value(
       return;
     }
     
-    for(int i = 0; i < this->num_key_value_heads; i++){
-        std::set<std::pair<uint64_t, uint64_t>> queried_meta_offset;
+    std::vector<int> key_order;
 
+    for(int i = 0; i < this->num_key_value_heads; i++){
+        auto head_ind = ind + i * this->max_length;
+        //std::set<std::pair<uint64_t, uint64_t>> queried_meta_offset;
+        std::set<std::tuple<uint64_t, uint64_t, int>> queried_meta_offset;
         int num_indices = nnz[i];
+
         for (int j = 0; j < num_indices; j++) {
-            uint64_t meta_id = get_meta_id(ind[j], layer_id, i);
+            uint64_t meta_id = get_meta_id(head_ind[j], layer_id, i);
             FileOffsetInfo& info = kv_meta->at(meta_id);
             uint64_t file_index = info.file_index;
             uint64_t offset = info.offset;
-            queried_meta_offset.insert({file_index, offset});
+            queried_meta_offset.insert({file_index, offset, j});
         }
 
         // merge contiguous offset
         if (!queried_meta_offset.empty()) {
             auto it = queried_meta_offset.begin();
-            uint64_t start_file_index = (*it).first; uint64_t start_offset = (*it).second;
-            uint64_t prev_file_index = (*it).first; uint64_t prev_offset = (*it).second;
+            // uint64_t start_file_index = (*it).first; uint64_t start_offset = (*it).second;
+            // uint64_t prev_file_index = (*it).first; uint64_t prev_offset = (*it).second;
+            auto [start_file_index, start_offset, key_index] = *it; 
+            uint64_t prev_file_index = start_file_index;
+            uint64_t prev_offset = start_offset;
+            key_order.emplace_back(key_index);
             int count = 1;
             ++it;
 
             for (; it != queried_meta_offset.end(); ++it) {
-                uint64_t cur_file_index = (*it).first; uint64_t cur_offset = (*it).second;
+                //uint64_t cur_file_index = (*it).first; uint64_t cur_offset = (*it).second;
+                auto [cur_file_index, cur_offset, cur_key_index] = *it; 
+                key_order.emplace_back(cur_key_index);
                 if (cur_file_index == prev_file_index && cur_offset == prev_offset + entry_size) {
                     count++;
                 } else {
@@ -462,24 +475,134 @@ void KVStore::collect_queried_key_value(
                 }
                 prev_file_index = cur_file_index, prev_offset = cur_offset;
             }
-
             content.emplace_back(start_file_index, start_offset, count * entry_size);
         }
 
         // load from storage
         //this->load_key_value(content, prefix_id, layer_id, i);
-        this->load_key_value_from_file(content, prefix_id, layer_id, i);
+        //this->load_key_value_from_file(content, prefix_id, layer_id, i);
 
+        this->load_key_value(content, key_order, prefix_id, layer_id, i);
+        //this->load_key_value_from_file(content, key_order, prefix_id, layer_id, i);
+
+        key_order.clear();
         content.clear();
     }
+}
+void KVStore::merge_collect_queried_key_value(
+    int prefix_id,
+    int layer_id, 
+    torch::Tensor ind_pt, 
+    torch::Tensor nnz_pt
+) {
+    int * ind = static_cast<int *>(ind_pt.data_ptr());
+    int * nnz = static_cast<int *>(nnz_pt.data_ptr());
 
+    int attn_group = this->num_attention_heads / this->num_key_value_heads;
+
+    uint64_t io_size = 4096;
+    size_t entry_size = 2 * this->head_dim * sizeof(DTYPE);
+
+    //handle persisted=false case; collect kv from memory
+    if (this->persisted == false) {
+      int stride = this->max_length * this->head_dim; // 一个头完整数据的长度
+      DTYPE* key = this->key_cache[layer_id];
+      DTYPE* value = this->value_cache[layer_id];
+      for (int i = 0; i < this->num_key_value_heads; i++) {
+        auto head_ind = ind + i * this->max_length;
+        int num_indices = nnz[i];
+        auto queried_key_ptr = this->queried_key + i * stride; // 当前头要查询的数据位置
+        auto queried_value_ptr = this->queried_value + i * stride;
+        auto key_ptr = key + i * stride; // 当前头完整数据位置
+        auto value_ptr = value + i * stride;
+        for (int j = 0; j < num_indices; j++) {
+          auto cur_ind = head_ind[j];
+          memcpy(queried_key_ptr + j * this->head_dim, key_ptr + cur_ind * this->head_dim, this->head_dim * sizeof(DTYPE));
+          memcpy(queried_value_ptr + j * this->head_dim, value_ptr + cur_ind * this->head_dim, this->head_dim * sizeof(DTYPE));
+        }
+      }
+      return;
+    }
+
+    std::vector<int> token_order;
+    std::vector<std::tuple<uint64_t, uint64_t, uint64_t, int>> content; //(file_index, start_offset, length, bitmap)
+
+
+    for(int i = 0; i < this->num_key_value_heads; i++){
+        auto head_ind  = ind + i * this->max_length;
+        std::set<std::tuple<uint64_t, uint64_t, int>> queried_meta_offset;
+
+        int num_indices = nnz[i];
+
+        for (int j = 0; j < num_indices; j++) {
+            uint64_t meta_id = get_meta_id(head_ind[j], layer_id, i);
+            FileOffsetInfo& info = kv_meta->at(meta_id);
+            uint64_t file_index = info.file_index;
+            uint64_t offset = info.offset;
+            queried_meta_offset.insert({file_index, offset, j});
+        }
+        
+        if(!queried_meta_offset.empty()){
+            auto [start_file_index, start_offset, token_index] = *queried_meta_offset.begin();
+            token_order.emplace_back(token_index);
+            uint64_t prev_file_index = start_file_index;  uint64_t prev_offset = start_offset;
+            
+            int count = 1;
+            for(auto it = next(queried_meta_offset.begin()); it != queried_meta_offset.end(); it++){
+                auto [cur_file_index, cur_offset, token_index] = *it;
+                token_order.emplace_back(token_index);
+
+                if(prev_file_index == cur_file_index && prev_offset + entry_size == cur_offset){
+                    count++;
+                }else{
+                    //new seg: [start_file_index, start_offset, count * entry_size]
+                    if(content.empty()){
+                        int bitmap = -1;
+                        if(count * entry_size <= io_size) bitmap = (1<<count) - 1;
+                        content.emplace_back(start_file_index, start_offset, count * entry_size, bitmap);
+                    }else{
+                        auto &[last_file_index, last_start_offset, last_length, last_bitmap] = content.back();
+                        uint64_t last_end_offset = last_start_offset + last_length;
+                        uint64_t gap = start_offset - last_end_offset;
+                        if(last_file_index == start_file_index && last_length + gap + count * entry_size <= io_size){
+                            int start_bit = last_length / entry_size + gap / entry_size;
+                            int end_bit = start_bit + count;
+                            for(int b = start_bit; b < end_bit; b++) last_bitmap |= (1 << b);
+
+                            last_length += gap + count * entry_size;
+                        }else{
+                            int bitmap = -1;
+                            if(count * entry_size <= io_size) bitmap = (1<<count) - 1;
+                            content.emplace_back(start_file_index, start_offset, count * entry_size, bitmap);
+                        }
+                    }
+                    start_file_index = cur_file_index;
+                    start_offset = cur_offset;
+                    count = 1;
+                }
+                prev_file_index = cur_file_index, prev_offset = cur_offset;
+            }
+            int bitmap = -1;
+            if(count * entry_size <= io_size) bitmap = (1 << count) - 1;
+            content.emplace_back(start_file_index, start_offset, count * entry_size, bitmap);
+        }
+        //this->load_key_value(content, key_order, prefix_id, layer_id, i);
+        //this->load_key_value_from_file(content, key_order, prefix_id, layer_id, i);
+        this->merge_load_key_value(content, token_order, prefix_id, layer_id, i);
+        //this->merge_load_key_value_from_file(content, token_order, prefix_id, layer_id, i);
+        token_order.clear();
+        content.clear();
+    }
 }
 
-void analyze_content_segments(const std::vector<std::tuple<uint64_t, uint64_t, int>>& content) {
+void analyze_content_segments(const std::vector<std::tuple<uint64_t, uint64_t, int>>& content, int layer_id, int head_id,
+                                std::vector<LayerStats> &layer_stats) {
     if (content.empty()) {
         std::cout << "Content is empty." << std::endl;
         return;
     }
+
+    std::cout << "[Analysis Result] Layer ID: " << layer_id << ", Head ID: " << head_id << std::endl;
 
     std::map<uint64_t, std::vector<std::pair<uint64_t, uint64_t>>> file_segments;
     for (const auto& [file_index, offset, length] : content) {
@@ -492,10 +615,15 @@ void analyze_content_segments(const std::vector<std::tuple<uint64_t, uint64_t, i
     uint64_t max_continuous_length = 0;
     uint64_t max_gap = 0;
 
-    for (const auto& [file_index, segments] : file_segments) {
+    uint64_t max_file_index = 0;
+
+    for (auto& [file_index, segments] : file_segments) {
+
+        max_file_index = std::max(max_file_index, file_index);
+
         if (segments.empty()) continue;
         // 按offset排序
-        std::vector<std::pair<uint64_t, uint64_t>> sorted_segments = segments;
+        std::vector<std::pair<uint64_t, uint64_t>>&sorted_segments = segments;
         std::sort(sorted_segments.begin(), sorted_segments.end());
 
         uint64_t current_start = sorted_segments[0].first;
@@ -545,24 +673,176 @@ void analyze_content_segments(const std::vector<std::tuple<uint64_t, uint64_t, i
         ? static_cast<double>(total_continuous_length) / total_segments
         : 0.0;
 
-    std::cout << "[Analysis Result]" << std::endl;
+    //layer_stats[layer_id].update_len(total_segments, avg_continuous_length);
     std::cout << "Total Segments: " << total_segments << std::endl;
     std::cout << "Total Continuous Length (sum of merged segments): " << total_continuous_length << " bytes" << std::endl;
     std::cout << "Max Continuous Length: " << max_continuous_length << " bytes" << std::endl;
     //std::cout << "Max Gap between Segments: " << max_gap << " bytes" << std::endl;
     std::cout << "Average Continuous Length: " << avg_continuous_length << " bytes" << std::endl;
     std::cout<< "=====================================================================================================" << std::endl;
+
+    std::cout << "Segments in max FileIndex " << max_file_index << ":" << std::endl;
+    uint64_t cur = 0;
+    for(auto &[l,r]:file_segments[max_file_index]){
+        if(l != cur && cur > 0) {
+            std::cout << ">>> GAP >>>\t[" << cur << " -> " << l 
+                      << ")\tgap=" << (l - cur) << " bytes\t*** MISSING DATA ***" << "\t\t";
+        }
+        std::cout << "=== SEG ===\t[" << l << " -> " << r 
+                  << ")\tsize=" << (r - l) << " bytes\t--- CONTINUOUS ---" << std::endl;
+        cur = r;
+    }
+    std::cout<< "=====================================================================================================" << std::endl;  
+
+
+    auto seg = file_segments[max_file_index];
+    for(int i=0;i<seg.size();i++){
+        auto [l,r] = seg[i];
+        if(i>0){
+            auto [li,ri] = seg[i-1];
+            if(l == li || r == ri){
+                std::cout << "ERROR: Duplicate segment detected!" << std::endl
+                          << "  File Index:\t\t" << max_file_index << std::endl
+                          << "  Current Segment [" << i << "]:\t[" << l << " -> " << r << ")" << std::endl
+                          << "  Previous Segment [" << (i-1) << "]:\t[" << li << " -> " << ri << ")" << std::endl
+                          << "  Conflict:\t\t" << (l == li ? "Same start offset" : "Same end offset") << std::endl
+                          << "=====================================================================================================" << std::endl;
+            }
+        }
+    }
+
+}
+
+void merge_analyze_content_segments(
+    const std::vector<std::tuple<uint64_t, uint64_t, uint64_t, int>>& content, 
+    int layer_id, 
+    int head_id,
+    std::vector<LayerStats> &layer_stats)
+{
+    if (content.empty()) {
+        std::cout << "Content is empty." << std::endl;
+        return;
+    }
+    std::cout << "[Analysis Result] Layer ID: " << layer_id << ", Head ID: " << head_id << std::endl;
+    std::map<uint64_t, std::vector<std::pair<uint64_t, uint64_t>>> file_segments;
+    for (const auto& [file_index, offset, length, bitmap] : content) {
+        //std::cout<<"FileIndex: " << file_index << ", Offset: " << offset << ", Length: " << length << std::endl;
+        file_segments[file_index].emplace_back(offset, offset + length);
+    }
+
+    size_t total_segments = 0;
+    uint64_t total_continuous_length = 0;
+    uint64_t max_continuous_length = 0;
+    uint64_t max_gap = 0;
+
+    uint64_t max_file_index = 0;
+
+    for (auto& [file_index, segments] : file_segments) {
+
+        max_file_index = std::max(max_file_index, file_index);
+
+        if (segments.empty()) continue;
+        // 按offset排序
+        std::vector<std::pair<uint64_t, uint64_t>>&sorted_segments = segments;
+        std::sort(sorted_segments.begin(), sorted_segments.end());
+
+        uint64_t current_start = sorted_segments[0].first;
+        uint64_t current_end = sorted_segments[0].second;
+        size_t continuous_segment_length = 0;
+
+        for (size_t i = 1; i < sorted_segments.size(); ++i) {
+            uint64_t next_start = sorted_segments[i].first;
+            uint64_t next_end = sorted_segments[i].second;
+
+            if (next_start == current_end) {
+                // 连续
+                current_end = next_end;
+            } else {
+                // 统计当前连续区间
+                uint64_t continuous_length = current_end - current_start;
+                continuous_segment_length += continuous_length;
+                total_continuous_length += continuous_length;
+                if (continuous_length > max_continuous_length) {
+                    max_continuous_length = continuous_length;
+                }
+                // 统计gap
+                uint64_t gap = next_start - current_end;
+                if (gap > max_gap) {
+                    max_gap = gap;
+                }
+                // 开始新的连续段
+                current_start = next_start;
+                current_end = next_end;
+            }
+        }
+        // 最后一个连续区间
+        uint64_t last_continuous_length = current_end - current_start;
+        total_continuous_length += last_continuous_length;
+        continuous_segment_length += last_continuous_length;
+
+        if (last_continuous_length > max_continuous_length) {
+            max_continuous_length = last_continuous_length;
+        }
+        total_segments += sorted_segments.size();
+
+        std::cout << "[FileIndex " << file_index << "] Segments: " << sorted_segments.size() << ", Avg Continuous Length: "
+                  << static_cast<double>(continuous_segment_length) / sorted_segments.size() << " bytes" << std::endl;
+    }
+
+    double avg_continuous_length = total_segments > 0
+        ? static_cast<double>(total_continuous_length) / total_segments
+        : 0.0;
+
+    //layer_stats[layer_id].update_len(total_segments, avg_continuous_length);
+    std::cout << "Total Segments: " << total_segments << std::endl;
+    std::cout << "Total Continuous Length (sum of merged segments): " << total_continuous_length << " bytes" << std::endl;
+    std::cout << "Max Continuous Length: " << max_continuous_length << " bytes" << std::endl;
+    //std::cout << "Max Gap between Segments: " << max_gap << " bytes" << std::endl;
+    std::cout << "Average Continuous Length: " << avg_continuous_length << " bytes" << std::endl;
+    std::cout<< "=====================================================================================================" << std::endl;  
+
+    std::cout << "Segments in max FileIndex " << max_file_index << ":" << std::endl;
+    uint64_t cur = 0;
+    for(auto &[l,r]:file_segments[max_file_index]){
+        if(l != cur && cur > 0) {
+            std::cout << ">>> GAP >>>\t[" << cur << " -> " << l 
+                      << ")\tgap=" << (l - cur) << " bytes\t*** MISSING DATA ***" << "\t\t";
+        }
+        std::cout << "=== SEG ===\t[" << l << " -> " << r 
+                  << ")\tsize=" << (r - l) << " bytes\t--- CONTINUOUS ---" << std::endl;
+        cur = r;
+    }
+    std::cout<< "=====================================================================================================" << std::endl;  
+
+
+    auto seg = file_segments[max_file_index];
+    for(int i=0;i<seg.size();i++){
+        auto [l,r] = seg[i];
+        if(i>0){
+            auto [li,ri] = seg[i-1];
+            if(l == li || r == ri){
+                std::cout << "ERROR: Duplicate segment detected!" << std::endl
+                          << "  File Index:\t\t" << max_file_index << std::endl
+                          << "  Current Segment [" << i << "]:\t[" << l << " -> " << r << ")" << std::endl
+                          << "  Previous Segment [" << (i-1) << "]:\t[" << li << " -> " << ri << ")" << std::endl
+                          << "  Conflict:\t\t" << (l == li ? "Same start offset" : "Same end offset") << std::endl
+                          << "=====================================================================================================" << std::endl;
+            }
+        }
+    }
+
 }
 
 void KVStore::load_key_value(
-    std::vector<std::tuple<uint64_t, uint64_t, int>>& content,
+    std::vector<std::tuple<uint64_t, uint64_t, int>> &content,
+    std::vector<int> &key_order,
     int prefix_id,
     int layer_id,
     int head_id)
 {
     //if (layer_id == 1 && head_id == 0){
-    if(head_id == 0){  
-        analyze_content_segments(content);
+    if(head_id == 0 || head_id == 1 || head_id == 2){  
+        analyze_content_segments(content, layer_id, head_id, this->layer_stats);
     }
     const size_t alignment = 4096; // Should match filesystem block size
     const size_t dtype_size = sizeof(DTYPE);
@@ -579,8 +859,8 @@ void KVStore::load_key_value(
                 close(fd);
             }
             //std::string file_name = this->store_path + "/" + std::to_string(prefix_id)  + "_part" + std::to_string(file_index) + ".bin";
-            //std::string file_name = this->store_path + "/" + std::to_string(prefix_id) + "_layer" + std::to_string(layer_id)  + "_part" + std::to_string(file_index) + ".bin";
-            std::string file_name = this->store_path + "/" + std::to_string(prefix_id)  + "_layer" + std::to_string(layer_id) + ".bin";
+            std::string file_name = this->store_path + "/" + std::to_string(prefix_id) + "_layer" + std::to_string(layer_id)  + "_part" + std::to_string(file_index) + ".bin";
+            //std::string file_name = this->store_path + "/" + std::to_string(prefix_id)  + "_layer" + std::to_string(layer_id) + ".bin";
             fd = open(file_name.c_str(), O_RDONLY | O_DIRECT);
             if (fd == -1) {
                 perror(("open failed for " + file_name).c_str());
@@ -628,9 +908,11 @@ void KVStore::load_key_value(
             DTYPE* cur_value = entry + this->head_dim;
 
             // 写入 queried_key 和 queried_value 中对应 head_id 和 position
-            int key_offset = head_id * this->max_length * this->head_dim + count * this->head_dim;
-            int value_offset = head_id * this->max_length * this->head_dim + count * this->head_dim;
-
+            int key_index = key_order[count];
+            //int key_offset = head_id * this->max_length * this->head_dim + count * this->head_dim;
+            //int value_offset = head_id * this->max_length * this->head_dim + count * this->head_dim;
+            int key_offset = head_id * this->max_length * this->head_dim + key_index * this->head_dim;
+            int value_offset = head_id * this->max_length * this->head_dim + key_index * this->head_dim;
             memcpy(this->queried_key + key_offset, cur_key, this->head_dim * sizeof(DTYPE));
             memcpy(this->queried_value + value_offset, cur_value, this->head_dim * sizeof(DTYPE));
 
@@ -646,6 +928,7 @@ void KVStore::load_key_value(
 
 void KVStore::load_key_value_from_file(
     std::vector<std::tuple<uint64_t,uint64_t, int>>& content,
+    std::vector<int> &key_order,
     int prefix_id,
     int layer_id,
     int head_id)
@@ -659,8 +942,9 @@ void KVStore::load_key_value_from_file(
     // }
     //////// ananlyze
     //if (layer_id == 1 && head_id == 0){
-    if(layer_id == 5 || layer_id == 15 || layer_id == 25){  
-        analyze_content_segments(content);
+
+    if (head_id == 0 || head_id == 1 || head_id == 2){  
+        analyze_content_segments(content, layer_id, head_id, this->layer_stats);
     }
 
 
@@ -675,8 +959,8 @@ void KVStore::load_key_value_from_file(
         if(file_index != cur_file_index){
             if (file.is_open()) file.close();
             //std::string file_name = this->store_path + "/" + std::to_string(prefix_id) + "_part" + std::to_string(file_index) + ".bin";
-            //std::string file_name = this->store_path + "/" + std::to_string(prefix_id) + "_layer" + std::to_string(layer_id)  + "_part" + std::to_string(file_index) + ".bin";
-            std::string file_name = this->store_path + "/" + std::to_string(prefix_id)  + "_layer" + std::to_string(layer_id) + ".bin";
+            std::string file_name = this->store_path + "/" + std::to_string(prefix_id) + "_layer" + std::to_string(layer_id)  + "_part" + std::to_string(file_index) + ".bin";
+            //std::string file_name = this->store_path + "/" + std::to_string(prefix_id)  + "_layer" + std::to_string(layer_id) + ".bin";
             file.open(file_name, std::ios::binary);
             if (!file.is_open()) {
                 std::cerr << "Failed to open file: " << file_name << std::endl;
@@ -697,8 +981,11 @@ void KVStore::load_key_value_from_file(
             DTYPE* cur_value = entry + this->head_dim;
 
             // 写入 queried_key 和 queried_value 中对应 head_id 和 position
-            int key_offset = head_id * this->max_length * this->head_dim + count * this->head_dim;
-            int value_offset = head_id * this->max_length * this->head_dim + count * this->head_dim;
+            // int key_offset = head_id * this->max_length * this->head_dim + count * this->head_dim;
+            // int value_offset = head_id * this->max_length * this->head_dim + count * this->head_dim;
+            int key_index = key_order[count];
+            int key_offset = head_id * this->max_length * this->head_dim + key_index * this->head_dim;
+            int value_offset = head_id * this->max_length * this->head_dim + key_index * this->head_dim;
 
             memcpy(this->queried_key + key_offset, cur_key, this->head_dim * sizeof(DTYPE));
             memcpy(this->queried_value + value_offset, cur_value, this->head_dim * sizeof(DTYPE));
@@ -713,6 +1000,172 @@ void KVStore::load_key_value_from_file(
     // printf("[KVStore::load_key_value_from_file] elapsed time: %.6f seconds\n", elapsed);
 }
 
+void KVStore::merge_load_key_value(
+    std::vector<std::tuple<uint64_t, uint64_t, uint64_t, int>> &content,
+    std::vector<int> &token_order,
+    int prefix_id,
+    int layer_id,
+    int head_id)
+{
+    if(head_id == 0 || head_id == 1 || head_id == 2){  
+        merge_analyze_content_segments(content, layer_id, head_id, this->layer_stats);
+    }
+    const size_t alignment = 4096; // Should match filesystem block size
+    const size_t dtype_size = sizeof(DTYPE);
+    size_t entry_size = 2 * this->head_dim * dtype_size; // key + value
+
+    uint64_t cur_file_index = std::numeric_limits<uint64_t>::max();
+    int fd = -1; // 文件描述符
+    int count = 0;
+
+    for(auto& [file_index, offset, length, bitmap] : content) {
+        // 如果文件分片改变，则切换文件描述符
+        if (file_index != cur_file_index) {
+            if (fd != -1) {
+                close(fd);
+            }
+            //std::string file_name = this->store_path + "/" + std::to_string(prefix_id)  + "_part" + std::to_string(file_index) + ".bin";
+            std::string file_name = this->store_path + "/" + std::to_string(prefix_id) + "_layer" + std::to_string(layer_id)  + "_part" + std::to_string(file_index) + ".bin";
+            //std::string file_name = this->store_path + "/" + std::to_string(prefix_id)  + "_layer" + std::to_string(layer_id) + ".bin";
+            fd = open(file_name.c_str(), O_RDONLY | O_DIRECT);
+            if (fd == -1) {
+                perror(("open failed for " + file_name).c_str());
+                //continue; // 跳过这个损坏或不存在的文件
+            }
+            cur_file_index = file_index;
+        }
+        // Calculate aligned parameters for the read
+        size_t aligned_offset = (offset / alignment) * alignment;
+        size_t aligned_length = ((offset % alignment) + length + alignment - 1) / alignment * alignment;
+        size_t read_offset = offset - aligned_offset;
+        
+        // Allocate aligned buffer for the read
+        DTYPE* aligned_buffer;
+        if (posix_memalign((void**)&aligned_buffer, alignment, aligned_length) != 0) {
+            close(fd);
+            throw std::runtime_error("Failed to allocate aligned buffer");
+        }
+        // Perform aligned read
+        if (lseek(fd, aligned_offset, SEEK_SET) == -1) {
+            perror("lseek");
+            free(aligned_buffer);
+            continue;
+        }
+
+        ssize_t bytes_read = read(fd, aligned_buffer, aligned_length);
+        if (bytes_read == -1) {
+            perror("read");
+            free(aligned_buffer);
+            continue;
+        }
+        // Verify we got enough data
+        if (static_cast<size_t>(bytes_read) < (read_offset + length)) {
+            free(aligned_buffer);
+            throw std::runtime_error("Read returned insufficient data");
+        }
+        // Process the actual data we need (starting at read_offset, length bytes)
+        char* data_start = reinterpret_cast<char*>(aligned_buffer) + read_offset;
+        int num_entries = length / entry_size;
+
+        while(bitmap != 0){
+            int pos = __builtin_ffs(bitmap) - 1;
+            bitmap &= (bitmap - 1);
+
+            DTYPE* entry = reinterpret_cast<DTYPE*>(data_start + pos * entry_size);
+            DTYPE* cur_key = entry;
+            DTYPE* cur_value = entry + this->head_dim;
+
+            int token_index = token_order[count];
+            int key_offset = head_id * this->max_length * this->head_dim + token_index * this->head_dim;
+            int value_offset = head_id * this->max_length * this->head_dim + token_index * this->head_dim;
+            memcpy(this->queried_key + key_offset, cur_key, this->head_dim * sizeof(DTYPE));
+            memcpy(this->queried_value + value_offset, cur_value, this->head_dim * sizeof(DTYPE));
+
+            count++;
+        }
+        free(aligned_buffer);
+    }
+    if (fd != -1) {
+        close(fd);
+    }
+}
+
+void KVStore::merge_load_key_value_from_file(
+    std::vector<std::tuple<uint64_t, uint64_t, uint64_t, int>>& content,
+    std::vector<int> &token_order,
+    int prefix_id,
+    int layer_id,
+    int head_id
+) {
+    if(head_id == 0 || head_id == 5){
+        merge_analyze_content_segments(content, layer_id, head_id, this->layer_stats);
+    }
+    size_t entry_size = 2 * this->head_dim * sizeof(DTYPE); // key + value
+    int count = 0;
+
+    uint64_t cur_file_index = std::numeric_limits<uint64_t>::max();
+    std::ifstream file;
+
+    for(auto& [file_index, start_offset, length, bitmap] : content){
+        // change file
+        if(file_index != cur_file_index){
+            if (file.is_open()) file.close();
+            //std::string file_name = this->store_path + "/" + std::to_string(prefix_id) + "_part" + std::to_string(file_index) + ".bin";
+            std::string file_name = this->store_path + "/" + std::to_string(prefix_id) + "_layer" + std::to_string(layer_id)  + "_part" + std::to_string(file_index) + ".bin";
+            //std::string file_name = this->store_path + "/" + std::to_string(prefix_id)  + "_layer" + std::to_string(layer_id) + ".bin";
+            file.open(file_name, std::ios::binary);
+            if (!file.is_open()) {
+                std::cerr << "Failed to open file: " << file_name << std::endl;
+                continue;
+            }
+            cur_file_index = file_index;
+        }
+
+        int num_entries = length / entry_size;
+        std::vector<char> buffer(length);
+        file.seekg(start_offset, std::ios::beg);
+        file.read(buffer.data(), length);
+
+        if(bitmap == -1){
+            for (int i = 0; i < num_entries; i++) {
+                DTYPE* entry = reinterpret_cast<DTYPE*>(buffer.data() + i * entry_size);
+                DTYPE* cur_key = entry;
+                DTYPE* cur_value = entry + this->head_dim;
+
+                // 写入 queried_key 和 queried_value 中对应 head_id 和 position
+                // int key_offset = head_id * this->max_length * this->head_dim + count * this->head_dim;
+                // int value_offset = head_id * this->max_length * this->head_dim + count * this->head_dim;
+                int key_index = token_order[count];
+                int key_offset = head_id * this->max_length * this->head_dim + key_index * this->head_dim;
+                int value_offset = head_id * this->max_length * this->head_dim + key_index * this->head_dim;
+
+                memcpy(this->queried_key + key_offset, cur_key, this->head_dim * sizeof(DTYPE));
+                memcpy(this->queried_value + value_offset, cur_value, this->head_dim * sizeof(DTYPE));
+
+                count++;
+            }
+        }else{
+            while(bitmap != 0){
+                int pos = __builtin_ffs(bitmap) - 1;
+                bitmap &= (bitmap - 1);
+                
+                DTYPE* entry = reinterpret_cast<DTYPE*>(buffer.data() + pos * entry_size);
+                DTYPE* cur_key = entry;
+                DTYPE* cur_value = entry + this->head_dim;
+                
+                int key_index = token_order[count];
+                int key_offset = head_id * this->max_length * this->head_dim + key_index * this->head_dim;
+                int value_offset = head_id * this->max_length * this->head_dim + key_index * this->head_dim;
+
+                memcpy(this->queried_key + key_offset, cur_key, this->head_dim * sizeof(DTYPE));
+                memcpy(this->queried_value + value_offset, cur_value, this->head_dim * sizeof(DTYPE));
+
+                count++;
+            }
+        }
+    }
+    if (file.is_open()) file.close();
+}
 
 void KVStore::promote_persist(std::string path, int prefix_id, int layer_id, const torch::Tensor &promote_token_info){
     if (promote_token_info.numel() == 0) {
@@ -817,6 +1270,7 @@ PYBIND11_MODULE(kvstore, m) {
         .def("write_to_file", &KVStore::write_to_file)
         .def("write_to_layer_file", &KVStore::write_to_layer_file)
         .def("collect_queried_key_value", &KVStore::collect_queried_key_value)
+        .def("merge_collect_queried_key_value", &KVStore::merge_collect_queried_key_value)
         .def("get_queried_key_cache", &KVStore::get_queried_key_cache)
         .def("promote_persist", &KVStore::promote_persist)
         .def("get_queried_value_cache", &KVStore::get_queried_value_cache)

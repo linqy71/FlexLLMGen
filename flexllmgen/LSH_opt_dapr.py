@@ -31,6 +31,7 @@ fix_recursive_import()
 
 DUMMY_WEIGHT = "_DUMMY_"  # Use dummy weights for benchmark purposes
 
+torch.cuda.set_device(6)
 #os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
 from collections import defaultdict
@@ -794,11 +795,11 @@ class OptLM:
         self.init_all_weights() # 权重全部读入weights_home
 
         self.radix_tree = RadixTree() 
-        ### default settings, note that device=cuda:7
+        ### default settings, note that device=cuda:6
         self.kv_store_path = os.path.join(offload_dir, "kv_store")
         if not os.path.exists(self.kv_store_path):
             os.makedirs(self.kv_store_path)
-        self.kv_server = LSHServer(self.config, self.num_hidden_layers, self.kv_store_path, K=10, L=100, batch_size=1, max_length=8192, device='cuda:7')
+        self.kv_server = LSHServer(self.config, self.num_hidden_layers, self.kv_store_path, K=10, L=100, batch_size=1, max_length=8192, device='cuda:6')
         self.set_kv_server()
         
         for j in range(num_layers):
@@ -1104,7 +1105,7 @@ class OptLM:
                 raise ValueError(f"Invalid strategy: {self.persist_strategy}")
         else:
             pass
-            #self.kv_server.promote_persist(self.task.new_prefix_id)
+            self.kv_server.promote_persist(self.task.new_prefix_id)
         self.kv_server.reset(switch=False)
 
         try:
@@ -1458,7 +1459,7 @@ def run_dapr_flexllmgen(args):
     num_prompts = args.num_gpu_batches * args.gpu_batch_size
     max_prompt_len, gen_len, cut_gen_len = args.prompt_len, args.gen_len, args.cut_gen_len
     
-    gpu = TorchDevice("cuda:7")
+    gpu = TorchDevice("cuda:6")
     cpu = TorchDevice("cpu")
     disk = TorchDisk(args.offload_dir)
     env = ExecutionEnv(gpu=gpu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gpu, cpu, disk]))
@@ -1517,6 +1518,9 @@ def run_dapr_flexllmgen(args):
         timers("compute").reset()
         timers("imp load and compute").reset()
         timers("cache store").reset()
+
+        timers("io part test").reset()
+
         output_ids = model.generate(
             inputs=[inputs_ids[i]], max_new_tokens = args.gen_len, debug_mode=args.debug_mode, 
             cut_gen_len=cut_gen_len, verbose=args.verbose)
@@ -1548,11 +1552,15 @@ def run_dapr_flexllmgen(args):
         print("prefill:",timers("generate").costs[0])
         print((timers("imp io").elapsed("sum") + timers("imp calc").elapsed("sum"))/timers("generate").costs[0] * 100)
 
-        print("imp load :",timers("imp load and compute").elapsed("average"))
-        print("imp sum:",timers("imp load and compute").elapsed("sum"))
+        print("imp load avg:",timers("imp load and compute").elapsed("average"))
+        print("imp load sum:",timers("imp load and compute").elapsed("sum"))
         print("store cache:",timers("cache store").costs)
         print("generate:", timers("generate").costs)
         print("generate sum:", timers("generate").elapsed("sum"))
+
+        print("io part test:", timers("io part test").costs)
+        print("io part test avg:", timers("io part test").elapsed("average"))
+        print("io part test sum:", timers("io part test").elapsed("sum"))
         # print("total io token:", io_bytes)
         # print("total continue token", cur_continue_addr)
         # if i!=0:
@@ -1578,7 +1586,7 @@ def run_prefix_flexllmgen(args):
     num_prompts = args.num_gpu_batches * args.gpu_batch_size
     max_prompt_len, gen_len, cut_gen_len = args.prompt_len, args.gen_len, args.cut_gen_len
     
-    gpu = TorchDevice("cuda:7")
+    gpu = TorchDevice("cuda:6")
     cpu = TorchDevice("cpu")
     disk = TorchDisk(args.offload_dir)
     env = ExecutionEnv(gpu=gpu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gpu, cpu, disk]))

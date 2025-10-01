@@ -2,7 +2,9 @@ import torch
 from lsh import LSH
 from kvstore import KVStore 
 import os
+from flexllmgen.timer import timers
 
+torch.cuda.set_device(6)
 
 class LSHServer:
 
@@ -14,7 +16,7 @@ class LSHServer:
         L: int = 150, 
         batch_size: int = 1,
         max_length: int = 8192,
-        device: str = 'cuda:7',
+        device: str = 'cuda:6',
         dtype = torch.float16,
         ):
         # 2^K=哈希表桶数，L=哈希表个数
@@ -63,8 +65,8 @@ class LSHServer:
         self.binary_pack = torch.Tensor(self.binary_pack).to(device=self.device, dtype=torch.float16)
         
         ### store lsh query results; TODO: adjust shape to (b * num_key_value_heads,)
-        self.nnz = torch.zeros((self.batch_size * self.num_attention_heads,)).to(torch.int32) # maybe每个 head 在 LSH 检索阶段找到的候选索引数。
-        self.results_lsh_cpu = torch.zeros((self.batch_size * self.num_attention_heads, self.max_length)).to(torch.int32)
+        self.nnz = torch.zeros((self.batch_size * self.num_attention_heads,), pin_memory=True).to(torch.int32) # maybe每个 head 在 LSH 检索阶段找到的候选索引数。
+        self.results_lsh_cpu = torch.zeros((self.batch_size * self.num_attention_heads, self.max_length), pin_memory=True).to(torch.int32)
     
         self.query_results = [(torch.zeros_like(self.nnz), torch.zeros_like(self.results_lsh_cpu)) for _ in range(self.num_layers)]
     
@@ -204,7 +206,11 @@ class LSHServer:
         
         self.pinned_hashcode_multi[...,:q_len,:].copy_(q_hashcode)
         ### get results from lsh hashtables
+        # self.results_lsh_cpu.zero_()
+        # self.nnz.zero_()
         self.lsh_retriever.batch_retrieve_multi(layer_idx, self.pinned_hashcode_multi, q_len ,self.results_lsh_cpu, self.nnz, max_index)
+        for i in range(self.num_attention_heads):
+            self.results_lsh_cpu[i][:self.nnz[i]], _ = torch.sort(self.results_lsh_cpu[i][:self.nnz[i]])
         #print(self.nnz)
         self.record_query_results(layer_idx)
     
@@ -215,16 +221,24 @@ class LSHServer:
         if not self.offloaded or prefix_id == 0:
             return None, None
         
+        
+        
         ### collect key value from kv_store
-        self.kv_store.collect_queried_key_value(prefix_id, layer_idx, self.results_lsh_cpu, self.nnz)
+        timers("io part test").start()
+        #self.kv_store.collect_queried_key_value(prefix_id, layer_idx, self.results_lsh_cpu, self.nnz)
+        self.kv_store.merge_collect_queried_key_value(prefix_id, layer_idx, self.results_lsh_cpu, self.nnz)
+        timers("io part test").stop()
         ### shape : n_head, max_length, head_dim
         res_len = self.nnz.max().data
-        queried_key = self.kv_store.get_queried_key_cache()
+        queried_key = self.kv_store.get_queried_key_cache()  # collect后保存在kvstore里,这里将数据包装成tensor后拿出来
+        
         queried_value = self.kv_store.get_queried_value_cache()
         avg_k = self.avg_k[layer_idx][req_id].to("cpu")
         queried_key = queried_key + avg_k
         queried_key = queried_key.transpose(0,1).contiguous()
         queried_value = queried_value.transpose(0,1).contiguous()
+        
+        
 
         return queried_key[:res_len], queried_value[:res_len]
 
@@ -256,8 +270,8 @@ class LSHServer:
             new_token_orders = [ list(range(self.offload_len)) for _ in range(self.num_key_value_heads)]
             self.persist_strategy[layer_idx] = new_token_orders
             #self.kv_store.write_to_file(self.kv_store_path,
-            self.kv_store.write_to_layer_file(self.kv_store_path,
-            #self.kv_store.write_to_layer_promote_file(self.kv_store_path,
+            #self.kv_store.write_to_layer_file(self.kv_store_path,
+            self.kv_store.write_to_layer_promote_file(self.kv_store_path,
                                             prefix_id, layer_idx, new_token_orders)
         #print(f"Successfully write prefix {prefix_id} to storage in {self.kv_store_path}")
         
@@ -294,8 +308,8 @@ class LSHServer:
             # Save strategy
             self.persist_strategy[layer_idx] = new_token_orders
             #self.kv_store.write_to_file(self.kv_store_path,
-            self.kv_store.write_to_layer_file(self.kv_store_path,
-            #self.kv_store.write_to_layer_promote_file(self.kv_store_path,
+            #self.kv_store.write_to_layer_file(self.kv_store_path,
+            self.kv_store.write_to_layer_promote_file(self.kv_store_path,
                                             prefix_id, layer_idx, new_token_orders)
             #print(f"Successfully write prefix {prefix_id} to storage in {self.kv_store_path}")
         
