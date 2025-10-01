@@ -433,7 +433,7 @@ void KVStore::collect_queried_key_value(
       return;
     }
     
-    std::vector<int> key_order;
+    std::vector<int> token_order;
 
     for(int i = 0; i < this->num_key_value_heads; i++){
         auto head_ind = ind + i * this->max_length;
@@ -457,14 +457,14 @@ void KVStore::collect_queried_key_value(
             auto [start_file_index, start_offset, key_index] = *it; 
             uint64_t prev_file_index = start_file_index;
             uint64_t prev_offset = start_offset;
-            key_order.emplace_back(key_index);
+            token_order.emplace_back(key_index);
             int count = 1;
             ++it;
 
             for (; it != queried_meta_offset.end(); ++it) {
                 //uint64_t cur_file_index = (*it).first; uint64_t cur_offset = (*it).second;
                 auto [cur_file_index, cur_offset, cur_key_index] = *it; 
-                key_order.emplace_back(cur_key_index);
+                token_order.emplace_back(cur_key_index);
                 if (cur_file_index == prev_file_index && cur_offset == prev_offset + entry_size) {
                     count++;
                 } else {
@@ -482,10 +482,10 @@ void KVStore::collect_queried_key_value(
         //this->load_key_value(content, prefix_id, layer_id, i);
         //this->load_key_value_from_file(content, prefix_id, layer_id, i);
 
-        this->load_key_value(content, key_order, prefix_id, layer_id, i);
-        //this->load_key_value_from_file(content, key_order, prefix_id, layer_id, i);
+        this->load_key_value(content, token_order, prefix_id, layer_id, i);
+        //this->load_key_value_from_file(content, token_order, prefix_id, layer_id, i);
 
-        key_order.clear();
+        token_order.clear();
         content.clear();
     }
 }
@@ -586,8 +586,8 @@ void KVStore::merge_collect_queried_key_value(
             if(count * entry_size <= io_size) bitmap = (1 << count) - 1;
             content.emplace_back(start_file_index, start_offset, count * entry_size, bitmap);
         }
-        //this->load_key_value(content, key_order, prefix_id, layer_id, i);
-        //this->load_key_value_from_file(content, key_order, prefix_id, layer_id, i);
+        //this->load_key_value(content, token_order, prefix_id, layer_id, i);
+        //this->load_key_value_from_file(content, token_order, prefix_id, layer_id, i);
         this->merge_load_key_value(content, token_order, prefix_id, layer_id, i);
         //this->merge_load_key_value_from_file(content, token_order, prefix_id, layer_id, i);
         token_order.clear();
@@ -835,7 +835,7 @@ void merge_analyze_content_segments(
 
 void KVStore::load_key_value(
     std::vector<std::tuple<uint64_t, uint64_t, int>> &content,
-    std::vector<int> &key_order,
+    std::vector<int> &token_order,
     int prefix_id,
     int layer_id,
     int head_id)
@@ -908,11 +908,11 @@ void KVStore::load_key_value(
             DTYPE* cur_value = entry + this->head_dim;
 
             // 写入 queried_key 和 queried_value 中对应 head_id 和 position
-            int key_index = key_order[count];
+            int token_index = token_order[count];
             //int key_offset = head_id * this->max_length * this->head_dim + count * this->head_dim;
             //int value_offset = head_id * this->max_length * this->head_dim + count * this->head_dim;
-            int key_offset = head_id * this->max_length * this->head_dim + key_index * this->head_dim;
-            int value_offset = head_id * this->max_length * this->head_dim + key_index * this->head_dim;
+            int key_offset = head_id * this->max_length * this->head_dim + token_index * this->head_dim;
+            int value_offset = head_id * this->max_length * this->head_dim + token_index * this->head_dim;
             memcpy(this->queried_key + key_offset, cur_key, this->head_dim * sizeof(DTYPE));
             memcpy(this->queried_value + value_offset, cur_value, this->head_dim * sizeof(DTYPE));
 
@@ -928,7 +928,7 @@ void KVStore::load_key_value(
 
 void KVStore::load_key_value_from_file(
     std::vector<std::tuple<uint64_t,uint64_t, int>>& content,
-    std::vector<int> &key_order,
+    std::vector<int> &token_order,
     int prefix_id,
     int layer_id,
     int head_id)
@@ -983,9 +983,9 @@ void KVStore::load_key_value_from_file(
             // 写入 queried_key 和 queried_value 中对应 head_id 和 position
             // int key_offset = head_id * this->max_length * this->head_dim + count * this->head_dim;
             // int value_offset = head_id * this->max_length * this->head_dim + count * this->head_dim;
-            int key_index = key_order[count];
-            int key_offset = head_id * this->max_length * this->head_dim + key_index * this->head_dim;
-            int value_offset = head_id * this->max_length * this->head_dim + key_index * this->head_dim;
+            int token_index = token_order[count];
+            int key_offset = head_id * this->max_length * this->head_dim + token_index * this->head_dim;
+            int value_offset = head_id * this->max_length * this->head_dim + token_index * this->head_dim;
 
             memcpy(this->queried_key + key_offset, cur_key, this->head_dim * sizeof(DTYPE));
             memcpy(this->queried_value + value_offset, cur_value, this->head_dim * sizeof(DTYPE));
@@ -1018,7 +1018,7 @@ void KVStore::merge_load_key_value(
     int fd = -1; // 文件描述符
     int count = 0;
 
-    for(auto& [file_index, offset, length, bitmap] : content) {
+    for(const auto& [file_index, offset, length, bitmap] : content) {
         // 如果文件分片改变，则切换文件描述符
         if (file_index != cur_file_index) {
             if (fd != -1) {
@@ -1065,26 +1065,49 @@ void KVStore::merge_load_key_value(
         }
         // Process the actual data we need (starting at read_offset, length bytes)
         char* data_start = reinterpret_cast<char*>(aligned_buffer) + read_offset;
-        int num_entries = length / entry_size;
+        
 
-        while(bitmap != 0){
-            int pos = __builtin_ffs(bitmap) - 1;
-            bitmap &= (bitmap - 1);
+        if(bitmap == -1){ 
+            int num_entries = length / entry_size;
+            for (int i = 0; i < num_entries; i++) {
+                DTYPE* entry = reinterpret_cast<DTYPE*>(data_start + i * entry_size);
+                DTYPE* cur_key = entry;
+                DTYPE* cur_value = entry + this->head_dim;
 
-            DTYPE* entry = reinterpret_cast<DTYPE*>(data_start + pos * entry_size);
-            DTYPE* cur_key = entry;
-            DTYPE* cur_value = entry + this->head_dim;
+                // 写入 queried_key 和 queried_value 中对应 head_id 和 position
+                int token_index = token_order[count];
+                //int key_offset = head_id * this->max_length * this->head_dim + count * this->head_dim;
+                //int value_offset = head_id * this->max_length * this->head_dim + count * this->head_dim;
+                int key_offset = head_id * this->max_length * this->head_dim + token_index * this->head_dim;
+                int value_offset = head_id * this->max_length * this->head_dim + token_index * this->head_dim;
+                memcpy(this->queried_key + key_offset, cur_key, this->head_dim * sizeof(DTYPE));
+                memcpy(this->queried_value + value_offset, cur_value, this->head_dim * sizeof(DTYPE));
 
-            int token_index = token_order[count];
-            int key_offset = head_id * this->max_length * this->head_dim + token_index * this->head_dim;
-            int value_offset = head_id * this->max_length * this->head_dim + token_index * this->head_dim;
-            memcpy(this->queried_key + key_offset, cur_key, this->head_dim * sizeof(DTYPE));
-            memcpy(this->queried_value + value_offset, cur_value, this->head_dim * sizeof(DTYPE));
+                count++;
+            }
+        }else{
+            int tmp_bitmap = bitmap;
+            while(tmp_bitmap != 0){
+                int pos = __builtin_ffs(tmp_bitmap) - 1;
+                tmp_bitmap &= (tmp_bitmap - 1);
 
-            count++;
+                DTYPE* entry = reinterpret_cast<DTYPE*>(data_start + pos * entry_size);
+                DTYPE* cur_key = entry;
+                DTYPE* cur_value = entry + this->head_dim;
+
+                int key_index = token_order[count];
+                int key_offset = head_id * this->max_length * this->head_dim + key_index * this->head_dim;
+                int value_offset = head_id * this->max_length * this->head_dim + key_index * this->head_dim;
+
+                memcpy(this->queried_key + key_offset, cur_key, this->head_dim * sizeof(DTYPE));
+                memcpy(this->queried_value + value_offset, cur_value, this->head_dim * sizeof(DTYPE));
+
+                count++;
+            }
         }
         free(aligned_buffer);
     }
+        
     if (fd != -1) {
         close(fd);
     }
@@ -1106,7 +1129,7 @@ void KVStore::merge_load_key_value_from_file(
     uint64_t cur_file_index = std::numeric_limits<uint64_t>::max();
     std::ifstream file;
 
-    for(auto& [file_index, start_offset, length, bitmap] : content){
+    for(const auto& [file_index, start_offset, length, bitmap] : content){
         // change file
         if(file_index != cur_file_index){
             if (file.is_open()) file.close();
@@ -1145,9 +1168,10 @@ void KVStore::merge_load_key_value_from_file(
                 count++;
             }
         }else{
-            while(bitmap != 0){
-                int pos = __builtin_ffs(bitmap) - 1;
-                bitmap &= (bitmap - 1);
+            int tmp_bitmap = bitmap;
+            while(tmp_bitmap != 0){
+                int pos = __builtin_ffs(tmp_bitmap) - 1;
+                tmp_bitmap &= (tmp_bitmap - 1);
                 
                 DTYPE* entry = reinterpret_cast<DTYPE*>(buffer.data() + pos * entry_size);
                 DTYPE* cur_key = entry;
