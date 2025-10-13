@@ -88,7 +88,7 @@ class Policy:
     comp_cache_config: CompressionConfig
 
     # the ratio of important tokens in prefix kv cache
-    important_ratio: float = 0.3
+    important_ratio: float = 0.4
 
     # Config of Chunk Pool (128, b*n_head, head_dim) * 2
     chunk_size: int = 128
@@ -608,7 +608,7 @@ class SelfAttention:
 
 
                 imp_token_idx = imp_token_idx[0] # 解开batch维度
-
+                logger.info(f"Layer {j}: Selected {len(imp_token_idx)} important tokens.")
                 # logger.info(f"Get Important token indices: {imp_token_idx}")
                 self.update_importance(imp_token_idx, j)
 
@@ -1173,9 +1173,10 @@ class OptLM:
 
         return self.output_ids
 
-    def finish_one_query(self, final=False):
+    def finish_one_query(self, final=False, idx = 0):
         self.sync()
-        self.store_prefix_cache()
+        if idx == 0 and final == False:
+            self.store_prefix_cache()
         self.sync()
         self.chunk_pool.sync()
         logger.info("query finished , now sync the model")
@@ -1734,7 +1735,7 @@ def run_prefix_flexllmgen(args):
             if args.verbose >= 2:
                 print(show_str)
 
-        model.finish_one_query(False)
+        model.finish_one_query(False,0)
 
         print("=" * 50)
 
@@ -1781,7 +1782,7 @@ def run_prefix_flexllmgen(args):
                 print(show_str)
 
         print("=" * 50)  
-        model.finish_one_query(True)
+        model.finish_one_query(True,0)
 
     finally:
         env.close_copy_threads()
@@ -1863,7 +1864,7 @@ def run_dapr_flexllmgen(args):
 
     context, questions = process_dapr()
     
-    inputs = [context[:6144] +  query + "\n" for query in questions]
+    inputs = [context[:8192] + "\n" +  query + "\n" for query in questions]
     inputs_ids = tokenizer(inputs, truncation=True, max_length=max_prompt_len).input_ids
     output_ids = model.generate(
         inputs=[inputs_ids[0]], max_new_tokens = 1, debug_mode=args.debug_mode, 
@@ -1903,7 +1904,7 @@ def run_dapr_flexllmgen(args):
         start_cache_store = torch.cuda.Event(enable_timing=True)
         end_cache_store = torch.cuda.Event(enable_timing=True)
         timers("cache store").start(start_cache_store.record())
-        model.finish_one_query(i == len(inputs) - 1)
+        model.finish_one_query(i == len(inputs) - 1, i)
         end_cache_store.record()
         timers("cache store").stop(end_cache_store.synchronize())
 
