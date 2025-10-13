@@ -12,6 +12,7 @@ import shutil
 
 import numpy as np
 from tqdm import tqdm
+from scipy.interpolate import interp1d
 
 
 @dataclasses.dataclass(frozen=True)
@@ -96,7 +97,7 @@ def get_opt_config(name, **kwargs):
         )
     elif arch_name == "opt-30b":
         config = OptConfig(name=name,
-            max_seq_len=2048, num_hidden_layers=48, n_head=56,
+            max_seq_len=8192, num_hidden_layers=48, n_head=56,
             hidden_size=7168, input_dim=7168, ffn_embed_dim=7168 * 4,
         )
     elif arch_name == "galactica-30b":
@@ -106,7 +107,7 @@ def get_opt_config(name, **kwargs):
         )
     elif arch_name == "opt-66b":
         config = OptConfig(name=name,
-            max_seq_len=2048, num_hidden_layers=64, n_head=72,
+            max_seq_len=8192, num_hidden_layers=64, n_head=72,
             hidden_size=9216, input_dim=9216, ffn_embed_dim=9216 * 4,
         )
     elif arch_name == "opt-175b":
@@ -253,6 +254,34 @@ def download_opt_weights(model_name, path):
                 shutil.copy(param_path, param_path.replace(
                     "decoder.embed_tokens.weight", "lm_head.weight"))
 
+def process_emb_pos():
+    origin_emb_pos = np.load("/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/hyk/opt_weights/opt-66b-np/decoder.embed_positions.weight")
+    print(origin_emb_pos.shape)
+    print(origin_emb_pos)
+    ori_seq_len = origin_emb_pos.shape[0] - 2
+    new_seq_len = 4 * ori_seq_len
+    
+    special_pos = origin_emb_pos[:2]
+    actual_pos = origin_emb_pos[2:]
+    
+    interpolated_positioins = np.zeros((new_seq_len, origin_emb_pos.shape[1]))
+    x_old = np.linspace(0, ori_seq_len - 1, ori_seq_len)
+    x_new = np.linspace(0, ori_seq_len - 1, new_seq_len)
+    
+    for i in range(origin_emb_pos.shape[1]):
+        f = interp1d(x_old, actual_pos[:, i], kind='linear')
+        interpolated_positioins[:, i] = f(x_new)
+      
+    new_emb_pos = np.vstack((special_pos, interpolated_positioins))
+    
+    print(new_emb_pos.shape)
+    path = "/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/hyk/opt_weights/opt-66b-np/decoder.et_embed_positions.weight"
+    with open(path, "wb") as f:
+        np.save(f, new_emb_pos)
+    
+    # return new_emb_pos
+    
+    
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -260,4 +289,5 @@ if __name__ == "__main__":
     parser.add_argument("--path", type=str, default="~/opt_weights")
     args = parser.parse_args()
 
-    download_opt_weights(args.model, args.path)
+    # download_opt_weights(args.model, args.path)
+    process_emb_pos()

@@ -176,7 +176,7 @@ class InputEmbed:
             # w_token
             ((v, h), dtype, path + "decoder.embed_tokens.weight"),
             # w_pos
-            ((s + 2, h), dtype, path + "decoder.embed_positions.weight"),
+            ((s + 2, h), dtype, path + "decoder.et_embed_positions.weight"),
         ]
         weights = init_weight_list(weight_specs, self.policy, self.env)
 
@@ -1465,7 +1465,7 @@ def run_dapr_flexllmgen(args):
     model = OptLM(opt_config, env, args.path, args.offload_dir, policy, args.prompt_len, args.gen_len, args.strategy)
 
     context, questions = process_dapr()
-    context = context[:6144]
+    # context = context[:6144]
     ### feed prefix
     prefix_input = get_tokenized_inputs(context, max_prompt_len=max_prompt_len, tokenizer=tokenizer)
     print(len(prefix_input[0]))
@@ -1714,7 +1714,7 @@ def add_parser_arguments(parser):
              "FlexLLMGen will automatically download them from HuggingFace.")
     parser.add_argument("--offload-dir", type=str, default="/ssd/nsccgz_zgchen_6/flexllmgen_offload_dir",
         help="The directory to offload tensors. ")
-    parser.add_argument("--prompt-len", type=int, default=5120)
+    parser.add_argument("--prompt-len", type=int, default=8000)
     parser.add_argument("--gen-len", type=int, default=32)
     parser.add_argument("--cut-gen-len", type=int,
         help="Cut generation length for fast debugging.")
