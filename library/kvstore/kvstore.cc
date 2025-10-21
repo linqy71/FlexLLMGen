@@ -8,8 +8,9 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <atomic>
 #include <pybind11/stl.h>
-
+#include <omp.h>
 
 KVStore::KVStore(){
     this->allocated = false;
@@ -122,6 +123,7 @@ void KVStore::recover_meta(std::string path, int prefix_id) {
         kv_meta->insert({meta_id, FileOffsetInfo(file_index, offset)});
     }
     file.close();
+    this->persisted = true;
 }
 
 // void KVStore::write_to_storage(
@@ -409,7 +411,7 @@ void KVStore::collect_queried_key_value(
 
     int attn_group = this->num_attention_heads / this->num_key_value_heads;
 
-    std::vector<std::tuple<uint64_t, uint64_t, int>> content; // offset, length in bytes
+    
     size_t entry_size = 2 * this->head_dim * sizeof(DTYPE);
 
     //handle persisted=false case; collect kv from memory
@@ -432,15 +434,15 @@ void KVStore::collect_queried_key_value(
       }
       return;
     }
-    
-    std::vector<int> token_order;
-
+    #pragma omp parallel for schedule(static) num_threads(32)
     for(int i = 0; i < this->num_key_value_heads; i++){
+        std::vector<int> token_order;
+        std::vector<std::tuple<uint64_t, uint64_t, int>> content; // offset, length in bytes
+
         auto head_ind = ind + i * this->max_length;
         //std::set<std::pair<uint64_t, uint64_t>> queried_meta_offset;
         std::set<std::tuple<uint64_t, uint64_t, int>> queried_meta_offset;
         int num_indices = nnz[i];
-
         for (int j = 0; j < num_indices; j++) {
             uint64_t meta_id = get_meta_id(head_ind[j], layer_id, i);
             FileOffsetInfo& info = kv_meta->at(meta_id);
@@ -482,11 +484,10 @@ void KVStore::collect_queried_key_value(
         //this->load_key_value(content, prefix_id, layer_id, i);
         //this->load_key_value_from_file(content, prefix_id, layer_id, i);
 
-        this->load_key_value(content, token_order, prefix_id, layer_id, i);
-        //this->load_key_value_from_file(content, token_order, prefix_id, layer_id, i);
+        //this->load_key_value(content, token_order, prefix_id, layer_id, i);
+        this->load_key_value_from_file(content, token_order, prefix_id, layer_id, i);
 
-        token_order.clear();
-        content.clear();
+        //this->load_key_value_from_file_concurrent(content, token_order, prefix_id, layer_id, i);
     }
 }
 void KVStore::merge_collect_queried_key_value(
@@ -495,6 +496,8 @@ void KVStore::merge_collect_queried_key_value(
     torch::Tensor ind_pt, 
     torch::Tensor nnz_pt
 ) {
+    auto start_time = std::chrono::high_resolution_clock::now();
+
     int * ind = static_cast<int *>(ind_pt.data_ptr());
     int * nnz = static_cast<int *>(nnz_pt.data_ptr());
 
@@ -524,23 +527,36 @@ void KVStore::merge_collect_queried_key_value(
       return;
     }
 
-    std::vector<int> token_order;
-    std::vector<std::tuple<uint64_t, uint64_t, uint64_t, int>> content; //(file_index, start_offset, length, bitmap)
+    // std::vector<int> token_order;
+    // std::vector<std::tuple<uint64_t, uint64_t, uint64_t, int>> content; //(file_index, start_offset, length, bitmap)
 
-
+    #pragma omp parallel for schedule(static) num_threads(32)
     for(int i = 0; i < this->num_key_value_heads; i++){
+        std::vector<int> token_order;
+        std::vector<std::tuple<uint64_t, uint64_t, uint64_t, int>> content; //(file_index, start_offset, length, bitmap)
         auto head_ind  = ind + i * this->max_length;
-        std::set<std::tuple<uint64_t, uint64_t, int>> queried_meta_offset;
+        // std::set<std::tuple<uint64_t, uint64_t, int>> queried_meta_offset;
 
+        // int num_indices = nnz[i];
+
+        // for (int j = 0; j < num_indices; j++) {
+        //     uint64_t meta_id = get_meta_id(head_ind[j], layer_id, i);
+        //     FileOffsetInfo& info = kv_meta->at(meta_id);
+        //     uint64_t file_index = info.file_index;
+        //     uint64_t offset = info.offset;
+        //     queried_meta_offset.insert({file_index, offset, j});
+        // }
         int num_indices = nnz[i];
-
+        std::vector<std::tuple<uint64_t, uint64_t, int>> queried_meta_offset;
+        queried_meta_offset.reserve(num_indices); // 预分配内存
         for (int j = 0; j < num_indices; j++) {
             uint64_t meta_id = get_meta_id(head_ind[j], layer_id, i);
             FileOffsetInfo& info = kv_meta->at(meta_id);
             uint64_t file_index = info.file_index;
             uint64_t offset = info.offset;
-            queried_meta_offset.insert({file_index, offset, j});
+            queried_meta_offset.emplace_back(file_index, offset, j);
         }
+        std::sort(queried_meta_offset.begin(), queried_meta_offset.end());
         
         if(!queried_meta_offset.empty()){
             auto [start_file_index, start_offset, token_index] = *queried_meta_offset.begin();
@@ -588,11 +604,15 @@ void KVStore::merge_collect_queried_key_value(
         }
         //this->load_key_value(content, token_order, prefix_id, layer_id, i);
         //this->load_key_value_from_file(content, token_order, prefix_id, layer_id, i);
-        this->merge_load_key_value(content, token_order, prefix_id, layer_id, i);
-        //this->merge_load_key_value_from_file(content, token_order, prefix_id, layer_id, i);
+        //this->merge_load_key_value(content, token_order, prefix_id, layer_id, i);
+        this->merge_load_key_value_from_file(content, token_order, prefix_id, layer_id, i);
         token_order.clear();
         content.clear();
     }
+    auto end_time = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> duration = end_time - start_time;
+    std::cout << "[TIMER] compute and IO for layer " << layer_id 
+              << " took " << duration.count()  << " seconds." << std::endl;
 }
 
 void analyze_content_segments(const std::vector<std::tuple<uint64_t, uint64_t, int>>& content, int layer_id, int head_id,
@@ -842,7 +862,7 @@ void KVStore::load_key_value(
 {
     //if (layer_id == 1 && head_id == 0){
     if(head_id == 0 || head_id == 1 || head_id == 2){  
-        analyze_content_segments(content, layer_id, head_id, this->layer_stats);
+        //analyze_content_segments(content, layer_id, head_id, this->layer_stats);
     }
     const size_t alignment = 4096; // Should match filesystem block size
     const size_t dtype_size = sizeof(DTYPE);
@@ -944,7 +964,7 @@ void KVStore::load_key_value_from_file(
     //if (layer_id == 1 && head_id == 0){
 
     if (head_id == 0 || head_id == 1 || head_id == 2){  
-        analyze_content_segments(content, layer_id, head_id, this->layer_stats);
+        //analyze_content_segments(content, layer_id, head_id, this->layer_stats);
     }
 
 
@@ -959,8 +979,8 @@ void KVStore::load_key_value_from_file(
         if(file_index != cur_file_index){
             if (file.is_open()) file.close();
             //std::string file_name = this->store_path + "/" + std::to_string(prefix_id) + "_part" + std::to_string(file_index) + ".bin";
-            std::string file_name = this->store_path + "/" + std::to_string(prefix_id) + "_layer" + std::to_string(layer_id)  + "_part" + std::to_string(file_index) + ".bin";
-            //std::string file_name = this->store_path + "/" + std::to_string(prefix_id)  + "_layer" + std::to_string(layer_id) + ".bin";
+            //std::string file_name = this->store_path + "/" + std::to_string(prefix_id) + "_layer" + std::to_string(layer_id)  + "_part" + std::to_string(file_index) + ".bin";
+            std::string file_name = this->store_path + "/" + std::to_string(prefix_id)  + "_layer" + std::to_string(layer_id) + ".bin";
             file.open(file_name, std::ios::binary);
             if (!file.is_open()) {
                 std::cerr << "Failed to open file: " << file_name << std::endl;
@@ -1000,6 +1020,113 @@ void KVStore::load_key_value_from_file(
     // printf("[KVStore::load_key_value_from_file] elapsed time: %.6f seconds\n", elapsed);
 }
 
+void KVStore::load_key_value_from_file_concurrent(
+    std::vector<std::tuple<uint64_t,uint64_t, int>>& content,
+    std::vector<int> &token_order,
+    int prefix_id,
+    int layer_id,
+    int head_id)
+{
+    // Currently no-op; placeholder for potential concurrent loading implementation
+    if (content.empty()) return;
+
+    using TaskIdx = size_t;
+    const size_t dtype_size = sizeof(DTYPE);
+    const size_t entry_size = 2 * this->head_dim * dtype_size; // key + value
+
+
+    struct Task{
+        uint64_t file_index;
+        uint64_t offset;
+        uint64_t length;
+        int start_pos;
+    };
+    std::vector<Task> tasks;
+    tasks.reserve(content.size());
+
+    int cum_entries = 0;
+    for (const auto &seg : content) {
+        uint64_t file_index;
+        uint64_t offset;
+        int length;
+        std::tie(file_index, offset, length) = seg;
+        int entries = static_cast<int>(length / entry_size);
+        tasks.push_back(Task{file_index, offset, length, cum_entries});
+        cum_entries += entries;
+    }
+    if (tasks.empty()) return;
+
+    // Determine number of workers
+    unsigned int hw = std::thread::hardware_concurrency();
+    int num_workers = hw > 0 ? std::min<unsigned int>(hw, static_cast<unsigned int>(tasks.size())) : std::min<int>(4, static_cast<int>(tasks.size()));
+    if (num_workers <= 0) num_workers = 1;
+    
+    num_workers = 4;
+
+    std::atomic<TaskIdx> next_idx(0);
+
+    auto worker = [&](int worker_id){
+        // Per-worker fd cache to avoid frequent open/close
+        std::unordered_map<uint64_t, int> fd_cache;
+
+        std::vector<char> local_buf; // will be resized per task as needed
+
+        while(true){
+            TaskIdx idx = next_idx.fetch_add(1);
+            if (idx >= tasks.size()) break;
+            const Task &t = tasks[idx];
+
+            //std::string file_name= this->store_path + "/" + std::to_string(prefix_id) + "_layer" + std::to_string(layer_id) + "_part" + std::to_string(t.file_index) + ".bin";
+            std::string file_name = this->store_path + "/" + std::to_string(prefix_id) + "_layer" + std::to_string(layer_id) + ".bin";
+
+            int fd = -1;
+            auto it = fd_cache.find(t.file_index);
+            if (it != fd_cache.end()) {
+                fd = it->second;
+            } else {
+                fd = open(file_name.c_str(), O_RDONLY);
+                if (fd == -1) {
+                    perror(("open failed for " + file_name).c_str());
+                    continue;
+                }
+                fd_cache[t.file_index] = fd;
+            }
+            if ((int)local_buf.size() < t.length) local_buf.resize(t.length);
+            ssize_t got = pread(fd, local_buf.data(), t.length, static_cast<off_t>(t.offset));
+
+            if (got <= 0) {
+                perror("pread failed");
+                continue;
+            }
+            int num_entries = t.length / static_cast<int>(entry_size);
+
+            for (int e = 0; e < num_entries; ++e) {
+                DTYPE* entry_ptr = reinterpret_cast<DTYPE*>(local_buf.data() + e * entry_size);
+                DTYPE* cur_key = entry_ptr;
+                DTYPE* cur_value = entry_ptr + this->head_dim;
+
+                int token_pos_in_order = token_order[t.start_pos + e]; // unique write slot
+                size_t key_offset = static_cast<size_t>(head_id) * this->max_length * this->head_dim + static_cast<size_t>(token_pos_in_order) * this->head_dim;
+
+                // memcpy into queried buffers (no locks required: non-overlapping)
+                memcpy(this->queried_key + key_offset, cur_key, this->head_dim * sizeof(DTYPE));
+                memcpy(this->queried_value + key_offset, cur_value, this->head_dim * sizeof(DTYPE));
+            }
+        }
+        // close cached fds
+        for (auto &p : fd_cache) {
+            if (p.second != -1) close(p.second);
+        }
+    };
+    // spawn workers
+    std::vector<std::thread> workers;
+    workers.reserve(num_workers);
+    for (int w = 0; w < num_workers; ++w) workers.emplace_back(worker, w);
+    for (auto &th : workers) if (th.joinable()) th.join();
+    return;
+}
+
+
 void KVStore::merge_load_key_value(
     std::vector<std::tuple<uint64_t, uint64_t, uint64_t, int>> &content,
     std::vector<int> &token_order,
@@ -1008,7 +1135,7 @@ void KVStore::merge_load_key_value(
     int head_id)
 {
     if(head_id == 0 || head_id == 1 || head_id == 2){  
-        merge_analyze_content_segments(content, layer_id, head_id, this->layer_stats);
+        //merge_analyze_content_segments(content, layer_id, head_id, this->layer_stats);
     }
     const size_t alignment = 4096; // Should match filesystem block size
     const size_t dtype_size = sizeof(DTYPE);
@@ -1121,7 +1248,7 @@ void KVStore::merge_load_key_value_from_file(
     int head_id
 ) {
     if(head_id == 0 || head_id == 5){
-        merge_analyze_content_segments(content, layer_id, head_id, this->layer_stats);
+        //merge_analyze_content_segments(content, layer_id, head_id, this->layer_stats);
     }
     size_t entry_size = 2 * this->head_dim * sizeof(DTYPE); // key + value
     int count = 0;
@@ -1281,6 +1408,278 @@ torch::Tensor KVStore::get_queried_value_cache()
     return tensor;
 }
 
+void KVStore::concurrent_merge_collect_queried_key_value(
+    int prefix_id,
+    int layer_id, 
+    torch::Tensor ind_pt, 
+    torch::Tensor nnz_pt
+){
+    auto start_time = std::chrono::high_resolution_clock::now();
+
+    int * ind = static_cast<int *>(ind_pt.data_ptr());
+    int * nnz = static_cast<int *>(nnz_pt.data_ptr());
+
+    int attn_group = this->num_attention_heads / this->num_key_value_heads;
+
+    uint64_t io_size = 4096;
+    size_t entry_size = 2 * this->head_dim * sizeof(DTYPE);
+    //handle persisted=false case; collect kv from memory
+    if (this->persisted == false) {
+      int stride = this->max_length * this->head_dim; // 一个头完整数据的长度
+      DTYPE* key = this->key_cache[layer_id];
+      DTYPE* value = this->value_cache[layer_id];
+      for (int i = 0; i < this->num_key_value_heads; i++) {
+        auto head_ind = ind + i * this->max_length;
+        int num_indices = nnz[i];
+        auto queried_key_ptr = this->queried_key + i * stride; // 当前头要查询的数据位置
+        auto queried_value_ptr = this->queried_value + i * stride;
+        auto key_ptr = key + i * stride; // 当前头完整数据位置
+        auto value_ptr = value + i * stride;
+        for (int j = 0; j < num_indices; j++) {
+          auto cur_ind = head_ind[j];
+          memcpy(queried_key_ptr + j * this->head_dim, key_ptr + cur_ind * this->head_dim, this->head_dim * sizeof(DTYPE));
+          memcpy(queried_value_ptr + j * this->head_dim, value_ptr + cur_ind * this->head_dim, this->head_dim * sizeof(DTYPE));
+        }
+      }
+      return;
+    }
+
+    std::vector<std::vector<IOTask>> tasks_per_head(this->num_key_value_heads);
+    
+    int tot_task = 0;
+    uint64_t max_file_index = 0;
+    #pragma omp parallel for schedule(static) num_threads(36)
+    for(int i = 0; i < this->num_key_value_heads; i++){
+        auto head_ind = ind + i * this->max_length;
+        int num_indices = nnz[i];
+
+        std::vector<std::tuple<uint64_t, uint64_t, int>> queried_meta_offset;
+        queried_meta_offset.reserve(num_indices); // 预分配内存
+
+        for (int j = 0; j < num_indices; j++) {
+            uint64_t meta_id = get_meta_id(head_ind[j], layer_id, i);
+            FileOffsetInfo& info = kv_meta->at(meta_id);
+            uint64_t file_index = info.file_index;
+            uint64_t offset = info.offset;
+            queried_meta_offset.emplace_back(file_index, offset, j);
+
+            max_file_index = std::max(max_file_index, file_index);
+        }
+        std::sort(queried_meta_offset.begin(), queried_meta_offset.end());
+
+        std::vector<IOTask> local_task;
+        
+    
+        if(!queried_meta_offset.empty()){
+            auto [start_file_index, start_offset, token_index] = *queried_meta_offset.begin();
+            uint64_t prev_file_index = start_file_index;  uint64_t prev_offset = start_offset;
+            
+            std::vector<int> seg_tokens;  seg_tokens.push_back(token_index);
+
+            int count = 1;
+            for(auto it = next(queried_meta_offset.begin()); it != queried_meta_offset.end(); it++){
+                auto [cur_file_index, cur_offset, token_index] = *it;
+
+                if(prev_file_index == cur_file_index && prev_offset + entry_size == cur_offset){
+                    count++;
+                    seg_tokens.push_back(token_index);
+                }else{
+                    if(local_task.empty()){
+                        int bitmap = -1;
+                        if(count * entry_size <= io_size) bitmap = (1<<count) - 1;
+                        
+                        IOTask t;
+                        t.file_index = start_file_index; t.offset = start_offset;
+                        t.length = count * entry_size; t.bitmap = bitmap;
+                        t.head_id = i;
+
+                        t.token_indices = std::move(seg_tokens);
+                        seg_tokens.clear();
+
+                        local_task.push_back(std::move(t));
+                    }else{
+                        auto &last_task = local_task.back();
+                        uint64_t &last_file_index = last_task.file_index, last_start_offset = last_task.offset;
+                        uint64_t &last_length = last_task.length, last_end_offset = last_start_offset + last_length;
+                        int &last_bitmap = last_task.bitmap;
+                        uint64_t  gap = start_offset - last_end_offset;  
+                        if(last_file_index == start_file_index && last_length + gap + count * entry_size <= io_size){
+                            int start_bit = last_length / entry_size + gap / entry_size;
+                            int end_bit = start_bit + count;
+                            for(int b = start_bit; b < end_bit; b++) last_task.bitmap |= (1 << b);
+
+                            last_task.length += gap + count * entry_size;
+
+                            last_task.token_indices.insert(last_task.token_indices.end(), seg_tokens.begin(),seg_tokens.end());
+                            seg_tokens.clear();
+                        
+                        }else{
+                            int bitmap = -1;
+                            if(count * entry_size <= io_size) bitmap = (1<<count) - 1;
+                            IOTask t;
+                            t.file_index = prev_file_index; t.offset = start_offset;
+                            t.length = count * entry_size; t.bitmap = bitmap;
+                            t.head_id = i;
+
+                            t.token_indices = std::move(seg_tokens);
+                            seg_tokens.clear();
+
+                            local_task.push_back(std::move(t));
+                            
+                        }
+                    }
+                    start_file_index = cur_file_index;
+                    start_offset = cur_offset;
+                    count = 1;
+                    seg_tokens.push_back(token_index);
+                }
+                prev_file_index = cur_file_index, prev_offset = cur_offset;
+            }
+            int bitmap = -1;
+            if(count * entry_size <= io_size) bitmap = (1<<count) - 1;
+            IOTask t;
+            t.file_index = prev_file_index; t.offset = start_offset;
+            t.length = count * entry_size; t.bitmap = bitmap;
+            t.head_id = i;
+
+            t.token_indices = std::move(seg_tokens);
+            seg_tokens.clear();
+
+            local_task.push_back(std::move(t));
+        }
+
+        tasks_per_head[i] = std::move(local_task);
+        tot_task += tasks_per_head[i].size();
+    }
+    std::vector<IOTask> all_tasks;
+    all_tasks.reserve(tot_task);
+    for(int i=0;i<this->num_key_value_heads;i++){
+        for(auto &t : tasks_per_head[i]){
+            all_tasks.push_back(std::move(t));
+        }
+    }
+
+    // auto end_time = std::chrono::high_resolution_clock::now();
+    // std::chrono::duration<double> duration = end_time - start_time;
+    // std::cout << "[TIMER] compute for layer " << layer_id 
+    //           << " took " << duration.count()  << " seconds." << std::endl;
+
+    this->concurrent_merge_load_key_value_from_file(all_tasks, max_file_index, prefix_id, layer_id);
+}
+
+void KVStore::concurrent_merge_load_key_value_from_file(
+    std::vector<IOTask> &all_tasks,
+    uint64_t max_file_index,
+    int prefix_id,
+    int layer_id
+) {
+    if(all_tasks.empty()) return;
+
+    auto start_time = std::chrono::high_resolution_clock::now();
+
+    size_t entry_size = 2 * this->head_dim * sizeof(DTYPE); // key + value
+
+    std::vector<int> fd_table(max_file_index + 1, -1);
+    for(uint64_t i = 0; i <= max_file_index; i++){
+        std::string file_name = this->store_path + "/" + std::to_string(prefix_id) + "_layer" + std::to_string(layer_id) + "_part" + std::to_string(i) + ".bin";
+        int fd = open(file_name.c_str(), O_RDONLY);
+        if (fd < 0) {
+            fd_table[i] = -1;
+            std::cerr << "concurrent_phaseB: open failed for " << file_name << " errno=" << errno << " : " << strerror(errno) << "\n";
+        } else {
+            fd_table[i] = fd;
+        }
+    }
+
+    unsigned int hw = std::thread::hardware_concurrency();
+    if (hw == 0) hw = 4;
+    unsigned int num_workers = std::min<unsigned int>(hw * 2, std::max<unsigned int>(1, (unsigned)all_tasks.size()));
+    num_workers = std::min(72, (int)all_tasks.size());
+
+    size_t N = all_tasks.size();
+    std::vector<size_t> range_start(num_workers);
+    std::vector<size_t> range_end(num_workers);
+    for (unsigned int w = 0; w < num_workers; ++w) {
+        size_t s = (N * w) / num_workers;
+        size_t e = (N * (w + 1)) / num_workers;
+        range_start[w] = s;
+        range_end[w] = e;
+    }
+
+    auto worker = [&](unsigned int wid){
+        size_t s = range_start[wid];
+        size_t e = range_end[wid];
+        
+        std::vector<char> buf;
+        for(size_t idx = s; idx < e; idx++){
+            IOTask &task = all_tasks[idx];
+
+            int count = 0;
+
+            uint64_t file_index = task.file_index, offset = task.offset, length = task.length;
+            int bitmap = task.bitmap;
+            int head_id = task.head_id;
+
+            int fd = fd_table[file_index];
+
+            if (buf.size() < task.length) buf.resize(task.length);
+
+            int num_entries = length / entry_size;
+            ssize_t n = pread(fd, buf.data(), length, offset);
+            if (n < 0) {
+                std::cerr << " pread failed: " << strerror(errno) << "\n";
+            }
+            if(bitmap == -1){
+                for (int i = 0; i < num_entries; i++) {
+                    DTYPE* entry = reinterpret_cast<DTYPE*>(buf.data() + i * entry_size);
+                    DTYPE* cur_key = entry;
+                    DTYPE* cur_value = entry + this->head_dim;
+
+                    int key_index = task.token_indices[count++];
+
+                    int key_offset = head_id * this->max_length * this->head_dim + key_index * this->head_dim;
+                    int value_offset = head_id * this->max_length * this->head_dim + key_index * this->head_dim;
+
+                    memcpy(this->queried_key + key_offset, cur_key, this->head_dim * sizeof(DTYPE));
+                    memcpy(this->queried_value + value_offset, cur_value, this->head_dim * sizeof(DTYPE));
+                }
+            }else{
+                int tmp_bitmap = bitmap;
+                while(tmp_bitmap != 0){
+                    int pos = __builtin_ffs(tmp_bitmap) - 1;
+                    tmp_bitmap &= (tmp_bitmap - 1);
+
+                    DTYPE* entry = reinterpret_cast<DTYPE*>(buf.data() + pos * entry_size);
+                    DTYPE* cur_key = entry;
+                    DTYPE* cur_value = entry + this->head_dim;
+                    int key_index = task.token_indices[count++];
+
+                    int key_offset = head_id * this->max_length * this->head_dim + key_index * this->head_dim;
+                    int value_offset = head_id * this->max_length * this->head_dim + key_index * this->head_dim;
+
+                    memcpy(this->queried_key + key_offset, cur_key, this->head_dim * sizeof(DTYPE));
+                    memcpy(this->queried_value + value_offset, cur_value, this->head_dim * sizeof(DTYPE));
+                }
+            }
+        }
+    };
+
+    std::vector<std::thread> threads;
+    threads.reserve(num_workers);
+    for (unsigned int w = 0; w < num_workers; ++w) threads.emplace_back(worker, w);
+
+    for (auto &th : threads) if (th.joinable()) th.join();
+
+    for (size_t fi = 0; fi < fd_table.size(); ++fi) {
+        if (fd_table[fi] >= 0) ::close(fd_table[fi]);
+    }
+
+    auto end_time = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> duration = end_time - start_time;
+    // std::cout << "[TIMER] IO for layer " << layer_id 
+    //           << " took " << duration.count()  << " seconds." << std::endl;
+}
+
 
 PYBIND11_MODULE(kvstore, m) {
     py::class_<KVStore>(m, "KVStore")
@@ -1295,6 +1694,7 @@ PYBIND11_MODULE(kvstore, m) {
         .def("write_to_layer_file", &KVStore::write_to_layer_file)
         .def("collect_queried_key_value", &KVStore::collect_queried_key_value)
         .def("merge_collect_queried_key_value", &KVStore::merge_collect_queried_key_value)
+        .def("concurrent_merge_collect_queried_key_value", &KVStore::concurrent_merge_collect_queried_key_value)
         .def("get_queried_key_cache", &KVStore::get_queried_key_cache)
         .def("promote_persist", &KVStore::promote_persist)
         .def("get_queried_value_cache", &KVStore::get_queried_value_cache)

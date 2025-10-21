@@ -85,7 +85,7 @@ class Policy:
     comp_cache_config: CompressionConfig
 
     # the ratio of important tokens in prefix kv cache
-    important_ratio: float = 0.2
+    important_ratio: float = 0.3
 
     # Config of Chunk Pool
     chunk_size: int = 256
@@ -1658,7 +1658,7 @@ def run_dapr_flexllmgen(args):
 
     context, questions = process_dapr()
     
-    inputs = [context[:4096] +  query + "\n" for query in questions]
+    inputs = [context[:8192] +  query + "\n" for query in questions]
     inputs_ids = tokenizer(inputs, truncation=True, max_length=max_prompt_len).input_ids
     output_ids = model.generate(
         inputs=[inputs_ids[1]], max_new_tokens = 1, debug_mode=args.debug_mode, 

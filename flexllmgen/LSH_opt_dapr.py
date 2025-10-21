@@ -536,7 +536,6 @@ class SelfAttention:
              (w_ln, _), (b_ln, _)) = weight_read_buf.val
 
         if i == 0:  # prefill
-            timers("compute").start()
             mask, donate[1] = attention_mask.val.smart_copy(self.compute)
             if not self.task.prefix_only:
                 ### should get important kv first
@@ -572,10 +571,12 @@ class SelfAttention:
                 print(f"get {avg_n_imp} important tokens")
 
                 # print(imp_token_idx[:3])
+                timers("compute").start()
                 h, new_k_cache, new_v_cache = self.compute.mha_prefill_with_kv(h, mask, w_q, b_q,
                     w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln, n_head, k_cache, v_cache, donate,
                     self.policy.compress_cache, self.policy.comp_cache_config, matched_prefix, 
                     imp_token_idx, self.kv_server.K, self.kv_server.L)
+                timers("compute").stop()
                 self.prefill_cache_shape = new_k_cache.shape[0]
                 # logger.info(f"SelfAttention Prefix cache shape: {self.prefill_cache_shape}")
             else:
@@ -588,7 +589,7 @@ class SelfAttention:
                 # logger.info(f"SelfAttention Prefix cache shape: {self.prefill_cache_shape}")
             # 存入的cache shape可能是(s, b * n_head, head_dim) 也可能是 (n_imp + s - common_prefix_len[0], ..., ...)
             cache_write_buf.store((new_k_cache, new_v_cache))
-            timers("compute").stop()
+            
         else:  # decoding
             imp_token_idx, _ = self.kv_server.get_imp_idx(self.layer_id)
             mask, donate[1] = attention_mask.val.smart_copy(self.attention_compute)
@@ -1105,7 +1106,7 @@ class OptLM:
                 raise ValueError(f"Invalid strategy: {self.persist_strategy}")
         else:
             pass
-            self.kv_server.promote_persist(self.task.new_prefix_id)
+            #self.kv_server.promote_persist(self.task.new_prefix_id)
         self.kv_server.reset(switch=False)
 
         try:
@@ -1490,7 +1491,7 @@ def run_dapr_flexllmgen(args):
     model = OptLM(opt_config, env, args.path, args.offload_dir, policy, args.prompt_len, args.gen_len, args.strategy)
 
     context, questions = process_dapr()
-    context = context[:6144]
+    context = context[:8192]
     ### feed prefix
     prefix_input = get_tokenized_inputs(context, max_prompt_len=max_prompt_len, tokenizer=tokenizer)
     print(len(prefix_input[0]))
@@ -1536,6 +1537,13 @@ def run_dapr_flexllmgen(args):
         start_cache_store = torch.cuda.Event(enable_timing=True)
         end_cache_store = torch.cuda.Event(enable_timing=True)
         timers("cache store").start(start_cache_store.record())
+
+        if i==len(inputs)-1:
+            model.kv_server.persist_kv_store_meta(1)
+            model.kv_server.persist_queried_result(1);
+        
+
+
         model.finish_one_query(i == len(inputs) - 1)
         end_cache_store.record()
         timers("cache store").stop(end_cache_store.synchronize())
@@ -1543,23 +1551,23 @@ def run_dapr_flexllmgen(args):
         print("imp io average:",timers("imp io").elapsed("average"))
         print("imp io sum:",timers("imp io").elapsed("sum"))
         print("imp calc average:",timers("imp calc").elapsed("average"))
-        print("imp calc sum:",timers("imp calc").elapsed("sum"))
+        print("imp calc sum:",timers("imp calc").elapsed("sum")) #hash comp
         #print("imp io:{}",timers("imp io").costs)
         #print("imp calc:{}",timers("imp calc").costs)
-        print("compute average:",timers("compute").elapsed("average"))
+        print("compute average:",timers("compute").elapsed("average")) # attn comp
         print("compute sum:",timers("compute").elapsed("sum"))
-        #print("compute:{}",timers("compute").costs)
+        print("compute:{}",timers("compute").costs)
         print("prefill:",timers("generate").costs[0])
         print((timers("imp io").elapsed("sum") + timers("imp calc").elapsed("sum"))/timers("generate").costs[0] * 100)
 
-        print("imp load avg:",timers("imp load and compute").elapsed("average"))
+        print("imp load avg:",timers("imp load and compute").elapsed("average")) 
         print("imp load sum:",timers("imp load and compute").elapsed("sum"))
         print("store cache:",timers("cache store").costs)
         print("generate:", timers("generate").costs)
         print("generate sum:", timers("generate").elapsed("sum"))
 
         print("io part test:", timers("io part test").costs)
-        print("io part test avg:", timers("io part test").elapsed("average"))
+        print("io part test avg:", timers("io part test").elapsed("average"))#attn load
         print("io part test sum:", timers("io part test").elapsed("sum"))
         # print("total io token:", io_bytes)
         # print("total continue token", cur_continue_addr)

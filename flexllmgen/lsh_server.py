@@ -220,20 +220,23 @@ class LSHServer:
         prefix_id: int):
         if not self.offloaded or prefix_id == 0:
             return None, None
-        
-        
-        
+        timers("io part test").start()       
         ### collect key value from kv_store
-        timers("io part test").start()
-        #self.kv_store.collect_queried_key_value(prefix_id, layer_idx, self.results_lsh_cpu, self.nnz)
-        self.kv_store.merge_collect_queried_key_value(prefix_id, layer_idx, self.results_lsh_cpu, self.nnz)
+        #timers("io part test").start()
+        self.kv_store.collect_queried_key_value(prefix_id, layer_idx, self.results_lsh_cpu, self.nnz)
+        #self.kv_store.merge_collect_queried_key_value(prefix_id, layer_idx, self.results_lsh_cpu, self.nnz)
+        
+        #self.kv_store.concurrent_merge_collect_queried_key_value(prefix_id, layer_idx, self.results_lsh_cpu, self.nnz)
         timers("io part test").stop()
+        #timers("io part test").stop()
         ### shape : n_head, max_length, head_dim
         res_len = self.nnz.max().data
         queried_key = self.kv_store.get_queried_key_cache()  # collect后保存在kvstore里,这里将数据包装成tensor后拿出来
-        
         queried_value = self.kv_store.get_queried_value_cache()
+        
         avg_k = self.avg_k[layer_idx][req_id].to("cpu")
+
+        
         queried_key = queried_key + avg_k
         queried_key = queried_key.transpose(0,1).contiguous()
         queried_value = queried_value.transpose(0,1).contiguous()
@@ -270,8 +273,8 @@ class LSHServer:
             new_token_orders = [ list(range(self.offload_len)) for _ in range(self.num_key_value_heads)]
             self.persist_strategy[layer_idx] = new_token_orders
             #self.kv_store.write_to_file(self.kv_store_path,
-            #self.kv_store.write_to_layer_file(self.kv_store_path,
-            self.kv_store.write_to_layer_promote_file(self.kv_store_path,
+            self.kv_store.write_to_layer_file(self.kv_store_path,
+            #self.kv_store.write_to_layer_promote_file(self.kv_store_path,
                                             prefix_id, layer_idx, new_token_orders)
         #print(f"Successfully write prefix {prefix_id} to storage in {self.kv_store_path}")
         
@@ -308,8 +311,8 @@ class LSHServer:
             # Save strategy
             self.persist_strategy[layer_idx] = new_token_orders
             #self.kv_store.write_to_file(self.kv_store_path,
-            #self.kv_store.write_to_layer_file(self.kv_store_path,
-            self.kv_store.write_to_layer_promote_file(self.kv_store_path,
+            self.kv_store.write_to_layer_file(self.kv_store_path,
+            #self.kv_store.write_to_layer_promote_file(self.kv_store_path,
                                             prefix_id, layer_idx, new_token_orders)
             #print(f"Successfully write prefix {prefix_id} to storage in {self.kv_store_path}")
         
@@ -391,8 +394,37 @@ class LSHServer:
         self.query_results = [(torch.zeros_like(self.nnz), torch.zeros_like(self.results_lsh_cpu)) for _ in range(self.num_layers)]
 
     ### TODO ----- handle recover
-    # def persist_kv_store_meta(self, prefix_id):
-    #     self.kv_store.persist_meta(prefix_id)
+    def persist_kv_store_meta(self, prefix_id):
+        self.kv_store.persist_meta(prefix_id)
+    
+    def persist_queried_result(self, prefix_id):
+        for layer_idx in range(self.num_layers):
+            nnz, results = self.query_results[layer_idx]
+            file_path = os.path.join(self.kv_store_path, f"queried_results_prefix_{prefix_id}_layer_{layer_idx}.pt")
+            data_to_save = {
+                'nnz': nnz,
+                'results': results
+            }
+            torch.save(data_to_save, file_path)
+    def recover_kv_store_meta(self, prefix_id):
+        self.offloaded = True
+        self.kv_store.recover_meta(self.kv_store_path, prefix_id)
+    
+    def recover_queried_result(self, prefix_id):
+        for layer_idx in range(self.num_layers):
+            file_path = os.path.join(self.kv_store_path, f"queried_results_prefix_{prefix_id}_layer_{layer_idx}.pt")
+            if os.path.exists(file_path):
+                data_loaded = torch.load(file_path, map_location="cpu")
+                nnz = data_loaded['nnz']
+                results = data_loaded['results']
+                # print(f"--- Debug: Recovering Layer {layer_idx} ---")
+                # print(f"  Loaded nnz (shape: {nnz.shape}):")
+                # print(nnz)
+                # print(f"  Loaded results (shape: {results.shape}):")
+                # print(results) 
+                self.query_results[layer_idx] = (nnz.to(self.nnz.device), results.to(self.results_lsh_cpu.device))
+            else:
+                print(f"File {file_path} does not exist. Cannot recover queried results for layer {layer_idx}.")
     
     # def recover_kv_store_meta(self, prefix_id:int):
     #     self.offloaded = True

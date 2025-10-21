@@ -35,6 +35,18 @@ struct LayerStats{
     void update_time(double new_time) { tot_time += new_time; }
 };
 
+struct IOTask{
+    uint64_t file_index;
+    uint64_t offset;
+    uint64_t length;
+
+    int bitmap;
+
+    std::vector<int> token_indices;
+
+    int head_id;
+};
+
 class KVStore{
 
     public:
@@ -55,7 +67,17 @@ class KVStore{
 
         void merge_collect_queried_key_value(int prefix_id, int layer_id, torch::Tensor ind_pt, torch::Tensor nnz_pt);
 
+        void concurrent_merge_collect_queried_key_value(int prefix_id, int layer_id, torch::Tensor ind_pt, torch::Tensor nnz_pt);
+        void concurrent_merge_load_key_value_from_file(
+            std::vector<IOTask> &all_tasks,
+            uint64_t max_file_index,
+            int prefix_id,
+            int layer_id
+        );
+
         void load_key_value_from_file(std::vector<std::tuple<uint64_t,uint64_t, int>>& content, std::vector<int> &key_order, int prefix_id, int layer_id, int head_id);
+
+        void load_key_value_from_file_concurrent(std::vector<std::tuple<uint64_t, uint64_t, int>>& content, std::vector<int> &key_order, int prefix_id, int layer_id, int head_id);
         
         void merge_load_key_value_from_file(std::vector<std::tuple<uint64_t, uint64_t, uint64_t, int>>& content, std::vector<int> &token_order, int prefix_id, int layer_id, int head_id);
         
@@ -79,7 +101,7 @@ class KVStore{
         int offload_len;
         
         bool allocated;
-        std::vector<DTYPE *>key_cache;// 每一层的 一个kv_head*max_length*head_dim的开辟好的空间
+        std::vector<DTYPE *>key_cache;// 每一层的 一个kv_head*max_length*head_dim的开辟好的空间  lsh_server存下来的用于持久化
         std::vector<DTYPE *>value_cache;
         DTYPE* queried_key; //返回request所需要的kv
         DTYPE* queried_value;

@@ -9,25 +9,29 @@ python setup.py install
 
 cd ../../
 
-python3 -m flexllmgen.LSH_opt_dapr --model facebook/opt-30b \
-        --percent 100 0 100 0 100 0 \
-        --path /HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/hyk/opt_weights  \
-        --prompt-len 2016 \
-        --gen-len 32 \
-        --strategy query \
-        --offload-dir /ssd/nsccgz_zgchen_6/flexllmgen_offload_dir/gathering  > log/layer_gather_qry_f8.log 2>&1
 
 rm /ssd/nsccgz_zgchen_6/flexllmgen_offload_dir/gathering/kv_store/1_*
+rm /ssd/nsccgz_zgchen_6/flexllmgen_offload_dir/gathering/kv_store/q*
+
+python3 -m flexllmgen.LSH_opt_dapr --model facebook/opt-66b \
+        --percent 25 75 100 0 100 0 \
+        --path /HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/hyk/opt_weights  \
+        --prompt-len 2024 \
+        --gen-len 24 \
+        --strategy seq \
+        --offload-dir /ssd/nsccgz_zgchen_6/flexllmgen_offload_dir/gathering  > log/66b_layer_seq_f_8192_concur_1.log 2>&1
+
+#rm /ssd/nsccgz_zgchen_6/flexllmgen_offload_dir/gathering/kv_store/1_*
 
 
 
-# python3 -m flexllmgen.LSH_opt_dapr --model facebook/opt-30b \
-#         --percent 100 0 100 0 100 0 \
+# python3 -m flexllmgen.LSH_opt_dapr --model facebook/opt-66b \
+#         --percent 25 75 100 0 100 0 \
 #         --path /HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/hyk/opt_weights  \
-#         --prompt-len 2016 \
-#         --gen-len 32 \
+#         --prompt-len 2032 \
+#         --gen-len 16 \
 #         --strategy seq \
-#         --offload-dir /ssd/nsccgz_zgchen_6/flexllmgen_offload_dir/gathering  > log/layer_gather_seq_f7.log 2>&1
+#         --offload-dir /ssd/nsccgz_zgchen_6/flexllmgen_offload_dir/gathering  > log/66b_layer_seq_d0_8192.log 2>&1
 
 
 

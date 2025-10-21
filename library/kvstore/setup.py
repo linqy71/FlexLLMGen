@@ -9,7 +9,8 @@ setup(
             name="kvstore",
             sources=["kvstore.cc"],
             include_dirs=["."],
-            extra_compile_args=["-std=c++17", "-g", "-O0", "-D_GNU_SOURCE"],
+            extra_compile_args=["-std=c++17", "-g", "-O0", "-D_GNU_SOURCE","-fopenmp"],
+            extra_link_args=['-fopenmp', '-O0', '-g'],
         )
     ],
     cmdclass={
