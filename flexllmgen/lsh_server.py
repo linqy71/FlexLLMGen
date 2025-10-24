@@ -4,7 +4,7 @@ from kvstore import KVStore
 import os
 from flexllmgen.timer import timers
 
-torch.cuda.set_device(6)
+# torch.cuda.set_device(0)
 
 class LSHServer:
 
@@ -16,7 +16,7 @@ class LSHServer:
         L: int = 150, 
         batch_size: int = 1,
         max_length: int = 8192,
-        device: str = 'cuda:6',
+        device: str = 'cuda:0',
         dtype = torch.float16,
         ):
         # 2^K=哈希表桶数，L=哈希表个数
@@ -84,6 +84,8 @@ class LSHServer:
 
         ### store token group strategy of each layer
         self.persist_strategy = [None for i in range(self.num_layers)]
+
+        self.copy_stream = torch.cuda.Stream(priority=-1)
     
 
     ### alloc buffer for offloaded tokens, seq_len is # of offloaded tokens
@@ -178,6 +180,7 @@ class LSHServer:
             res[i, :].copy_(torch.arange(0, self.offload_len))
         return res
 
+    
     ### get important kv by queries through lsh
     ### req_id: requst id inside a batch
     ### layer_idx: layer index
@@ -194,23 +197,25 @@ class LSHServer:
         max_index: int):
         if not self.offloaded or prefix_id == 0:
             return None, None
-        q_len, _, _ = query_states.shape
-        query_states = query_states.transpose(0,1) # num_heads, q_len, head_dim
-        ### compute hashcode of queries
-        norm_q = query_states.reshape(-1, self.head_dim)
-        norm_q = norm_q / norm_q.norm(p=2, dim=-1, keepdim=True)
-        q_hashcode = torch.matmul(norm_q, self.hash_func).gt(0)
-        q_hashcode = q_hashcode.reshape(-1, self.K).to(torch.float16)
-        q_hashcode = torch.mv(q_hashcode, self.binary_pack).int()
-        q_hashcode = q_hashcode.reshape(self.num_attention_heads, q_len, self.L)
+        with torch.cuda.stream(self.copy_stream):
+            q_len, _, _ = query_states.shape
+            query_states = query_states.transpose(0,1).contiguous() # num_heads, q_len, head_dim
+            ### compute hashcode of queries
+            norm_q = query_states.reshape(-1, self.head_dim)
+            norm_q = norm_q / norm_q.norm(p=2, dim=-1, keepdim=True)
+            q_hashcode = torch.matmul(norm_q, self.hash_func).gt(0)
+            q_hashcode = q_hashcode.reshape(-1, self.K).to(torch.float16)
+            q_hashcode = torch.mv(q_hashcode, self.binary_pack).int()
+            q_hashcode = q_hashcode.reshape(self.num_attention_heads, q_len, self.L)
+            
+            self.pinned_hashcode_multi[...,:q_len,:].copy_(q_hashcode, non_blocking=True)
         
-        self.pinned_hashcode_multi[...,:q_len,:].copy_(q_hashcode)
         ### get results from lsh hashtables
         # self.results_lsh_cpu.zero_()
         # self.nnz.zero_()
         self.lsh_retriever.batch_retrieve_multi(layer_idx, self.pinned_hashcode_multi, q_len ,self.results_lsh_cpu, self.nnz, max_index)
-        for i in range(self.num_attention_heads):
-            self.results_lsh_cpu[i][:self.nnz[i]], _ = torch.sort(self.results_lsh_cpu[i][:self.nnz[i]])
+        # for i in range(self.num_attention_heads):
+        #     self.results_lsh_cpu[i][:self.nnz[i]], _ = torch.sort(self.results_lsh_cpu[i][:self.nnz[i]])
         #print(self.nnz)
         self.record_query_results(layer_idx)
     
@@ -235,15 +240,11 @@ class LSHServer:
         queried_value = self.kv_store.get_queried_value_cache()
         
         avg_k = self.avg_k[layer_idx][req_id].to("cpu")
-
-        
         queried_key = queried_key + avg_k
-        queried_key = queried_key.transpose(0,1).contiguous()
-        queried_value = queried_value.transpose(0,1).contiguous()
-        
-        
+        queried_key = queried_key[...,:res_len,:].transpose(0,1)
+        queried_value = queried_value[...,:res_len,:].transpose(0,1)
 
-        return queried_key[:res_len], queried_value[:res_len]
+        return queried_key, queried_value
 
     ### for debug...
     ### get full kv from kv_store by generating indices of range(offloaded_len)
