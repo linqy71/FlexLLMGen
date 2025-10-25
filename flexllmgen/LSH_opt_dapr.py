@@ -1106,7 +1106,7 @@ class OptLM:
                 raise ValueError(f"Invalid strategy: {self.persist_strategy}")
         else:
             pass
-            #self.kv_server.promote_persist(self.task.new_prefix_id)
+            self.kv_server.promote_persist(self.task.new_prefix_id)
         self.kv_server.reset(switch=False)
 
         try:
@@ -1459,7 +1459,7 @@ def run_dapr_flexllmgen(args):
      
     num_prompts = args.num_gpu_batches * args.gpu_batch_size
     max_prompt_len, gen_len, cut_gen_len = args.prompt_len, args.gen_len, args.cut_gen_len
-    
+    logger.info(f"{args.overlap}")
     gpu = TorchDevice("cuda:6")
     cpu = TorchDevice("cpu")
     disk = TorchDisk(args.offload_dir)
@@ -1522,6 +1522,10 @@ def run_dapr_flexllmgen(args):
 
         timers("io part test").reset()
 
+        timers("retrieve1 test").reset()
+        timers("retrieve2 test").reset()
+        timers("retrieve3 test").reset()
+
         output_ids = model.generate(
             inputs=[inputs_ids[i]], max_new_tokens = args.gen_len, debug_mode=args.debug_mode, 
             cut_gen_len=cut_gen_len, verbose=args.verbose)
@@ -1556,7 +1560,7 @@ def run_dapr_flexllmgen(args):
         #print("imp calc:{}",timers("imp calc").costs)
         print("compute average:",timers("compute").elapsed("average")) # attn comp
         print("compute sum:",timers("compute").elapsed("sum"))
-        print("compute:{}",timers("compute").costs)
+        print("compute:",timers("compute").costs)
         print("prefill:",timers("generate").costs[0])
         print((timers("imp io").elapsed("sum") + timers("imp calc").elapsed("sum"))/timers("generate").costs[0] * 100)
 
@@ -1569,6 +1573,16 @@ def run_dapr_flexllmgen(args):
         print("io part test:", timers("io part test").costs)
         print("io part test avg:", timers("io part test").elapsed("average"))#attn load
         print("io part test sum:", timers("io part test").elapsed("sum"))
+
+
+        print("retrieve1 test:", timers("retrieve1 test").costs)
+        print("retrieve1 test sum:", timers("retrieve1 test").elapsed("sum"))
+
+        print("retrieve2 test:", timers("retrieve2 test").costs)
+        print("retrieve2 test sum:", timers("retrieve2 test").elapsed("sum"))
+
+        print("retrieve3 test:", timers("retrieve3 test").costs)
+        print("retrieve3 test sum:", timers("retrieve3 test").elapsed("sum"))
         # print("total io token:", io_bytes)
         # print("total continue token", cur_continue_addr)
         # if i!=0:

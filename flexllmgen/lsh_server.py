@@ -16,7 +16,7 @@ class LSHServer:
         L: int = 150, 
         batch_size: int = 1,
         max_length: int = 8192,
-        device: str = 'cuda:6',
+        device: str = 'cuda:7',
         dtype = torch.float16,
         ):
         # 2^K=哈希表桶数，L=哈希表个数
@@ -194,25 +194,39 @@ class LSHServer:
         max_index: int):
         if not self.offloaded or prefix_id == 0:
             return None, None
+        
+        timers("retrieve1 test").start()
         q_len, _, _ = query_states.shape
         query_states = query_states.transpose(0,1) # num_heads, q_len, head_dim
         ### compute hashcode of queries
         norm_q = query_states.reshape(-1, self.head_dim)
+        timers("retrieve1 test").stop()
+
+        timers("retrieve2 test").start()
         norm_q = norm_q / norm_q.norm(p=2, dim=-1, keepdim=True)
         q_hashcode = torch.matmul(norm_q, self.hash_func).gt(0)
+        
+
+        
         q_hashcode = q_hashcode.reshape(-1, self.K).to(torch.float16)
         q_hashcode = torch.mv(q_hashcode, self.binary_pack).int()
         q_hashcode = q_hashcode.reshape(self.num_attention_heads, q_len, self.L)
-        
-        self.pinned_hashcode_multi[...,:q_len,:].copy_(q_hashcode)
+        timers("retrieve2 test").stop()
+        timers("retrieve3 test").start()
+        self.pinned_hashcode_multi[...,:q_len,:].copy_(q_hashcode, non_blocking=True)  
         ### get results from lsh hashtables
         # self.results_lsh_cpu.zero_()
         # self.nnz.zero_()
+        timers("retrieve3 test").stop()
         self.lsh_retriever.batch_retrieve_multi(layer_idx, self.pinned_hashcode_multi, q_len ,self.results_lsh_cpu, self.nnz, max_index)
+
+
         for i in range(self.num_attention_heads):
             self.results_lsh_cpu[i][:self.nnz[i]], _ = torch.sort(self.results_lsh_cpu[i][:self.nnz[i]])
+        
         #print(self.nnz)
         self.record_query_results(layer_idx)
+        
     
     def load_kv(self, 
         req_id: int, 
@@ -223,8 +237,8 @@ class LSHServer:
         timers("io part test").start()       
         ### collect key value from kv_store
         #timers("io part test").start()
-        self.kv_store.collect_queried_key_value(prefix_id, layer_idx, self.results_lsh_cpu, self.nnz)
-        #self.kv_store.merge_collect_queried_key_value(prefix_id, layer_idx, self.results_lsh_cpu, self.nnz)
+        #self.kv_store.collect_queried_key_value(prefix_id, layer_idx, self.results_lsh_cpu, self.nnz)
+        self.kv_store.merge_collect_queried_key_value(prefix_id, layer_idx, self.results_lsh_cpu, self.nnz)
         
         #self.kv_store.concurrent_merge_collect_queried_key_value(prefix_id, layer_idx, self.results_lsh_cpu, self.nnz)
         timers("io part test").stop()
@@ -273,8 +287,8 @@ class LSHServer:
             new_token_orders = [ list(range(self.offload_len)) for _ in range(self.num_key_value_heads)]
             self.persist_strategy[layer_idx] = new_token_orders
             #self.kv_store.write_to_file(self.kv_store_path,
-            self.kv_store.write_to_layer_file(self.kv_store_path,
-            #self.kv_store.write_to_layer_promote_file(self.kv_store_path,
+            #self.kv_store.write_to_layer_file(self.kv_store_path,
+            self.kv_store.write_to_layer_promote_file(self.kv_store_path,
                                             prefix_id, layer_idx, new_token_orders)
         #print(f"Successfully write prefix {prefix_id} to storage in {self.kv_store_path}")
         
@@ -311,8 +325,8 @@ class LSHServer:
             # Save strategy
             self.persist_strategy[layer_idx] = new_token_orders
             #self.kv_store.write_to_file(self.kv_store_path,
-            self.kv_store.write_to_layer_file(self.kv_store_path,
-            #self.kv_store.write_to_layer_promote_file(self.kv_store_path,
+            #self.kv_store.write_to_layer_file(self.kv_store_path,
+            self.kv_store.write_to_layer_promote_file(self.kv_store_path,
                                             prefix_id, layer_idx, new_token_orders)
             #print(f"Successfully write prefix {prefix_id} to storage in {self.kv_store_path}")
         
