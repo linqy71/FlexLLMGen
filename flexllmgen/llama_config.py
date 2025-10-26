@@ -7,7 +7,7 @@ import dataclasses
 
 @dataclasses.dataclass(frozen=True)
 class LlamaConfig:
-    name: str = "llama3.1-8b"
+    name: str = "Llama-3.1-8B-Instruct"
     num_hidden_layers: int = 32
     vocab_size: int = 128256
     max_position_embeddings: int = 131072
@@ -43,7 +43,7 @@ class LlamaConfig:
 
 def preset_llama3_config():
     config = LlamaConfig(
-        name = "llama3.1-8b",
+        name = "Llama-3.1-8B-Instruct",
         num_hidden_layers = 32,
         max_position_embeddings = 131072,
         hidden_size = 4096,
@@ -132,5 +132,5 @@ def convert_local_llama_weights(model_dir, output_dir):
     
 
 if __name__ == "__main__":
-    convert_local_llama_weights("/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/lqy/HF_HOME/hub/models--meta-llama--Meta-Llama-3.1-8B-Instruct/snapshots/0e9e39f249a16976918f6564b8830bc894c89659",
-        "/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/lqy/HF_HOME/hub/llama3.1-8b-np")
+    convert_local_llama_weights("/home/gexr/.cache/huggingface/hub/models--meta-llama--Llama-3.1-8B-Instruct/snapshots/0e9e39f249a16976918f6564b8830bc894c89659",
+        "/home/gexr/opt_weights/Llama-3.1-8B-Instruct-np")

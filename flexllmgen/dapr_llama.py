@@ -1,6 +1,8 @@
 """
 Usage:
-python3 -m flexllmgen.flex_llama --model meta/llama3.1-8b --gpu-batch-size 32 --percent 100 0 100 0 100 0 --path=/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/lqy/HF_HOME/hub --overlap=False
+python3 -m flexllmgen.dapr_llama --model meta-llama/Llama-3.1-8B-Instruct --gpu-batch-size 32 --percent 100 0 100 0 100 0  --overlap=False
+
+/home/gexr/.cache/huggingface/hub/models--meta-llama--Llama-3.1-8B-Instruct/snapshots/0e9e39f249a16976918f6564b8830bc894c89659
 """
 
 import argparse
@@ -1362,7 +1364,7 @@ def get_tokenized_inputs(prompt, max_prompt_len, tokenizer):
 
 def run_flexllmgen(args):
     print(f"<run_flexllmgen>: args.model: {args.model}")
-    tokenizer = AutoTokenizer.from_pretrained("/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/lqy/HF_HOME/hub/models--meta-llama--Meta-Llama-3.1-8B-Instruct/snapshots/0e9e39f249a16976918f6564b8830bc894c89659")
+    tokenizer = AutoTokenizer.from_pretrained("/home/gexr/.cache/huggingface/hub/models--meta-llama--Llama-3.1-8B-Instruct/snapshots/0e9e39f249a16976918f6564b8830bc894c89659")
 
     # if args.model == "facebook/galactica-30b":
     #     tokenizer = AutoTokenizer.from_pretrained("facebook/galactica-30b", padding_side="left")
@@ -1495,7 +1497,7 @@ def process_dapr():
 
 def run_dapr_flexllmgen(args):
     print(f"<run_llama_dapr_flexllmgen>: args.model: {args.model}")
-    tokenizer = AutoTokenizer.from_pretrained("/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/lqy/HF_HOME/hub/models--meta-llama--Meta-Llama-3.1-8B-Instruct/snapshots/0e9e39f249a16976918f6564b8830bc894c89659")
+    tokenizer = AutoTokenizer.from_pretrained("/home/gexr/.cache/huggingface/hub/models--meta-llama--Llama-3.1-8B-Instruct/snapshots/0e9e39f249a16976918f6564b8830bc894c89659")
 
     num_prompts = args.num_gpu_batches * args.gpu_batch_size
     max_prompt_len, gen_len, cut_gen_len = args.prompt_len, args.gen_len, args.cut_gen_len
@@ -1530,7 +1532,7 @@ def run_dapr_flexllmgen(args):
     max_length = 4096
     model = LLAMA(llama_config, env, args.path, policy, max_length, max_prompt_len, gen_len)
 
-    context, questions = process_dapr()
+    # context, questions = process_dapr()
 
     # inputs = [context +  query + "\n" for query in questions]
     inputs = ["The capital city of France is", "The capital city of China is", "The capital city of American is"]
@@ -1567,7 +1569,7 @@ def run_dapr_flexllmgen(args):
 def add_parser_arguments(parser):
     parser.add_argument("--model", type=str, default="facebook/opt-6.7b",
         help="The model name.")
-    parser.add_argument("--path", type=str, default="~/opt_weights",
+    parser.add_argument("--path", type=str, default="/home/gexr/opt_weights",
         help="The path to the model weights. If there are no cached weights, "
              "FlexLLMGen will automatically download them from HuggingFace.")
     parser.add_argument("--offload-dir", type=str, default="~/flexllmgen_offload_dir",
@@ -1616,5 +1618,5 @@ if __name__ == "__main__":
 
     assert len(args.percent) == 6
 
-    #run_prefix_flexllmgen(args)
+    # run_flexllmgen(args)
     run_dapr_flexllmgen(args)
