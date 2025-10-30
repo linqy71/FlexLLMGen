@@ -31,7 +31,7 @@ fix_recursive_import()
 
 DUMMY_WEIGHT = "_DUMMY_"  # Use dummy weights for benchmark purposes
 
-torch.cuda.set_device(6)
+# torch.cuda.set_device(0)
 #os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
 from collections import defaultdict
@@ -301,7 +301,8 @@ class SelfAttention:
             else self.env.gpu)
 
         self.task = None
-
+        self.copy_stream = torch.cuda.Stream(priority=-1)
+        # self.cpu2gpu_stream = torch.cuda.Stream()
         self.prefill_cache_shape = 0 #prefill阶段的cache第一维长度，可能是n_imp + NR(jaccard超过threshold)  可能是R+NR(没有超过threshold)
 
     def set_task(self, task):
@@ -392,7 +393,7 @@ class SelfAttention:
         assert(dst.device.device_type == DeviceType.CPU or DeviceType.CUDA)
         length = src.shape[0]
         dst = dst.data[start: start + length]
-        dst.copy_(src, non_blocking=False)
+        dst.copy_(src, non_blocking=True)
         return length
 
 
@@ -545,6 +546,7 @@ class SelfAttention:
                 k_cache, v_cache = self.alloc_prefix_kv(matched_prefix)
 
                 cur_pos = 0
+                
                 for prefix_id, max_common_len in matched_prefix.items():
                     ## j is layer_id
                     ## get query_states from compute
@@ -555,13 +557,15 @@ class SelfAttention:
                     self.kv_server.lsh_retrieve(0, self.layer_id, query_states, prefix_id, max_common_len)
                     timers("imp calc").stop()
                     timers("imp load and compute").start()
+                    
                     k_cache_data, v_cache_data = self.kv_server.load_kv(0, self.layer_id, prefix_id)
+                        
                     # k_cache_data, v_cache_data = self.kv_server.get_full_kv(0, self.layer_id, query_states, prefix_id)
                     # print(k_cache_data)
-                    
-                    # k_cache_data, v_cache_data = self.kv_server.get_full_kv(0, j, query_states, prefix_id)
-                    length = self.copy_prefix(k_cache, k_cache_data, cur_pos)
-                    length = self.copy_prefix(v_cache, v_cache_data, cur_pos)
+                    with torch.cuda.stream(self.copy_stream):
+                        # k_cache_data, v_cache_data = self.kv_server.get_full_kv(0, j, query_states, prefix_id)
+                        length = self.copy_prefix(k_cache, k_cache_data, cur_pos)
+                        length = self.copy_prefix(v_cache, v_cache_data, cur_pos)
                     timers("imp load and compute").stop()
                     cur_pos += length
                 # n_imp = cur_pos
@@ -572,6 +576,7 @@ class SelfAttention:
 
                 # print(imp_token_idx[:3])
                 timers("compute").start()
+                self.copy_stream.synchronize()
                 h, new_k_cache, new_v_cache = self.compute.mha_prefill_with_kv(h, mask, w_q, b_q,
                     w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln, n_head, k_cache, v_cache, donate,
                     self.policy.compress_cache, self.policy.comp_cache_config, matched_prefix, 
@@ -800,7 +805,7 @@ class OptLM:
         self.kv_store_path = os.path.join(offload_dir, "kv_store")
         if not os.path.exists(self.kv_store_path):
             os.makedirs(self.kv_store_path)
-        self.kv_server = LSHServer(self.config, self.num_hidden_layers, self.kv_store_path, K=10, L=100, batch_size=1, max_length=8192, device='cuda:6')
+        self.kv_server = LSHServer(self.config, self.num_hidden_layers, self.kv_store_path, K=10, L=100, batch_size=1, max_length=8192, device='cuda:0')
         self.set_kv_server()
         
         for j in range(num_layers):
@@ -1459,8 +1464,8 @@ def run_dapr_flexllmgen(args):
      
     num_prompts = args.num_gpu_batches * args.gpu_batch_size
     max_prompt_len, gen_len, cut_gen_len = args.prompt_len, args.gen_len, args.cut_gen_len
-    logger.info(f"{args.overlap}")
-    gpu = TorchDevice("cuda:6")
+    
+    gpu = TorchDevice("cuda:0")
     cpu = TorchDevice("cpu")
     disk = TorchDisk(args.offload_dir)
     env = ExecutionEnv(gpu=gpu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gpu, cpu, disk]))
@@ -1608,7 +1613,7 @@ def run_prefix_flexllmgen(args):
     num_prompts = args.num_gpu_batches * args.gpu_batch_size
     max_prompt_len, gen_len, cut_gen_len = args.prompt_len, args.gen_len, args.cut_gen_len
     
-    gpu = TorchDevice("cuda:6")
+    gpu = TorchDevice("cuda:0")
     cpu = TorchDevice("cpu")
     disk = TorchDisk(args.offload_dir)
     env = ExecutionEnv(gpu=gpu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gpu, cpu, disk]))

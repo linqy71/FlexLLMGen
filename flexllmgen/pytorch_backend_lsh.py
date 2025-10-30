@@ -27,7 +27,7 @@ from flexllmgen.utils import (GB, T, cpu_mem_stats, vector_gather,
 general_copy_compressed = TorchCompressedDevice = None
 global_cpu_device = None
 global_disk_device = None
-torch.cuda.set_device(6)
+# torch.cuda.set_device(6)
 
 def fix_recursive_import():
     global general_copy_compressed, TorchCompressedDevice, global_cpu_device

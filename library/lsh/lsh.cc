@@ -466,6 +466,7 @@ int LSH::retrieve_multi(
     }
   }
   offset = result_ptr - result;
+  std::sort(result, result + offset);
   return offset;
 }
 

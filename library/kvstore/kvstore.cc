@@ -21,11 +21,13 @@ KVStore::KVStore(){
 KVStore::~KVStore(){
     if (this->allocated) {
         for (int i = 0; i < this->num_layers; ++i)
-            {
-                delete [] this->key_cache[i];
-                delete [] this->value_cache[i];
-            }
+        {
+            delete [] this->key_cache[i];
+            delete [] this->value_cache[i];
+        }
         delete kv_meta;
+        delete this->queried_key;
+        delete this->queried_value;
         this->allocated = false;
     }
 }

@@ -10,7 +10,7 @@
 #include<vector>
 #include<math.h>
 #include<immintrin.h>
-#define LSH_THREADS 32
+#define LSH_THREADS 64
 
 class LSH{
     public: 
