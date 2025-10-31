@@ -34,6 +34,9 @@ class Task:
     # prefix_seq: Union[np.array, List[List[RadixToken]]]
     common_prefix_len: int # 每个请求的prefix长度
     common_prefix_kv_ptr: List[List[CachePointer]] # shape(prefix_len, num_layers)
+    
+    req_id: int = None
+    save_res: bool = None
 
     ### for lsh, dict: prefix_id, max_common_len
     matched_prefix: dict = None

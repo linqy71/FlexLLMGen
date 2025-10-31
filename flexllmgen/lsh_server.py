@@ -194,7 +194,8 @@ class LSHServer:
         layer_idx: int, 
         query_states: torch.Tensor,
         prefix_id: int,
-        max_index: int):
+        max_index: int,
+        save_res: bool):
         if not self.offloaded or prefix_id == 0:
             return None, None
         with torch.cuda.stream(self.copy_stream):
@@ -211,9 +212,18 @@ class LSHServer:
             self.pinned_hashcode_multi[...,:q_len,:].copy_(q_hashcode, non_blocking=True)
         
         ### get results from lsh hashtables
-        # self.results_lsh_cpu.zero_()
-        # self.nnz.zero_()
+        self.results_lsh_cpu.zero_()
+        self.nnz.zero_()
         self.lsh_retriever.batch_retrieve_multi(layer_idx, self.pinned_hashcode_multi, q_len ,self.results_lsh_cpu, self.nnz, max_index)
+        
+        if save_res:
+            save_dir = "/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/lqy/llm_infer/FlexLLMGen/analyze/sim_66b/" + str(req_id)
+            if not os.path.exists(save_dir):
+                os.mkdir(save_dir)
+            res = (self.nnz, self.results_lsh_cpu)
+            file_name = save_dir + f"/layer_{layer_idx}_prefill_imp_token_idx.pt"
+            torch.save(res, file_name)
+        
         # for i in range(self.num_attention_heads):
         #     self.results_lsh_cpu[i][:self.nnz[i]], _ = torch.sort(self.results_lsh_cpu[i][:self.nnz[i]])
         #print(self.nnz)

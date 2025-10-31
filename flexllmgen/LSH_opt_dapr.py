@@ -554,7 +554,7 @@ class SelfAttention:
                         w_ln, b_ln, n_head, k_cache, donate, self.policy.compress_cache, 
                         self.policy.comp_cache_config, matched_prefix)
                     timers("imp calc").start()
-                    self.kv_server.lsh_retrieve(0, self.layer_id, query_states, prefix_id, max_common_len)
+                    self.kv_server.lsh_retrieve(self.task.req_id, self.layer_id, query_states, prefix_id, max_common_len, self.task.save_res)
                     timers("imp calc").stop()
                     timers("imp load and compute").start()
                     
@@ -1017,6 +1017,8 @@ class OptLM:
                  stop: Optional[int] = None,
                  debug_mode: Optional[str] = None,
                  cut_gen_len: Optional[int] = None,
+                 req_id: int = 0,
+                 save_res: bool = False,
                  verbose: int = 0):
         matched_prefix = self.radix_tree.match(inputs[0])
         prefix_only = False
@@ -1038,7 +1040,9 @@ class OptLM:
             common_prefix_len=None,
             matched_prefix=matched_prefix,
             prefix_only=prefix_only,
-            new_prefix_id = new_prefix_id
+            new_prefix_id = new_prefix_id,
+            req_id = req_id,
+            save_res = save_res
         )
         logger.info(f"generate: Task={task}")
         num_layers = self.num_layers
@@ -1529,7 +1533,7 @@ def run_dapr_flexllmgen(args):
 
         output_ids = model.generate(
             inputs=[inputs_ids[i]], max_new_tokens = args.gen_len, debug_mode=args.debug_mode, 
-            cut_gen_len=cut_gen_len, verbose=args.verbose)
+            cut_gen_len=cut_gen_len, verbose=args.verbose, req_id=i, save_res=args.save_res)
         if DUMMY_WEIGHT not in args.path:
             outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
             show_str = "Outputs:\n" + 70 * '-' + "\n"
@@ -1794,7 +1798,8 @@ def add_parser_arguments(parser):
 
     parser.add_argument("--overlap", type=str2bool, nargs='?',
         const=True, default=False)
-    
+    parser.add_argument("--save-res", type=str2bool, nargs='?',
+        const=True, default=False)
     ## query for query_group_persist; seq for sequential_persist
     parser.add_argument("--strategy", type=str, default="query")
 
