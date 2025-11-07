@@ -217,7 +217,7 @@ class LSHServer:
         self.lsh_retriever.batch_retrieve_multi(layer_idx, self.pinned_hashcode_multi, q_len ,self.results_lsh_cpu, self.nnz, max_index)
         
         if save_res:
-            save_dir = "/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/lqy/llm_infer/FlexLLMGen/analyze/sim_66b/" + str(req_id)
+            save_dir = "/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/lqy/llm_infer/FlexLLMGen/analyze/longbench_sim_66b/" + str(req_id)
             if not os.path.exists(save_dir):
                 os.mkdir(save_dir)
             res = (self.nnz, self.results_lsh_cpu)

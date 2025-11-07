@@ -177,7 +177,7 @@ class InputEmbed:
             # w_token
             ((v, h), dtype, path + "decoder.embed_tokens.weight"),
             # w_pos
-            ((s + 2, h), dtype, path + "decoder.embed_positions.weight"),
+            ((s + 2, h), dtype, path + "decoder.et_embed_positions.weight"),
         ]
         weights = init_weight_list(weight_specs, self.policy, self.env)
 
@@ -805,7 +805,7 @@ class OptLM:
         self.kv_store_path = os.path.join(offload_dir, "kv_store")
         if not os.path.exists(self.kv_store_path):
             os.makedirs(self.kv_store_path)
-        self.kv_server = LSHServer(self.config, self.num_hidden_layers, self.kv_store_path, K=10, L=100, batch_size=1, max_length=8192, device='cuda:0')
+        self.kv_server = LSHServer(self.config, self.num_hidden_layers, self.kv_store_path, K=10, L=180, batch_size=1, max_length=8192, device='cuda:0')
         self.set_kv_server()
         
         for j in range(num_layers):
@@ -1424,41 +1424,36 @@ def get_tokenized_inputs(prompt, max_prompt_len, tokenizer):
     inputs_ids = tokenizer(prompt, max_length=max_prompt_len, truncation=True).input_ids
     return inputs_ids
 
-def process_dapr():
-    RootPath = "/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/lqy/HF_HOME/datasets/"
-    docs = load_dataset(RootPath + "UKPLab___dapr/ConditionalQA-docs/0.0.0/67ae3daa13596700976d20605630f5f9db3bd732/", split="test")
-    qrels = load_dataset(RootPath + "UKPLab___dapr/ConditionalQA-qrels/0.0.0/67ae3daa13596700976d20605630f5f9db3bd732/", split="test")
-    queries = load_dataset(RootPath + "UKPLab___dapr/ConditionalQA-queries/0.0.0/67ae3daa13596700976d20605630f5f9db3bd732/", split="test")
-    print(queries)
-    qrels_dict = defaultdict(set)
-
-    for row in qrels:
-        corpus_id = row["corpus_id"]
-        doc_id = corpus_id.split('-')[0]
-        qrels_dict[doc_id].add(row["query_id"])
+def process_longbench():
+    RootPath = "/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/lqy/HF_HOME/datasets/THUDM___long_bench/data/"
+    task = "narrativeqa"
+    file_path = RootPath + task + ".jsonl"
+    # print(file_path)
+    dataset = load_dataset('json', data_files=file_path)["train"]
     
-    doc_id, query_ids = None, None
-    for k, v in qrels_dict.items():
-        if (len(v) > 10):
-            doc_id, query_ids = k, v
+    context_to_questions = defaultdict(set)
+    
+    for row in dataset:
+        context = row["context"]
+        question = row["input"]
+        context_to_questions[context].add(question)
+    
+    max_count = 0
+    max_context = None
+    questions = set()
+    for ctx, qs in context_to_questions.items():
+        if (len(qs)) > 10:
+            max_count = len(qs)
+            max_context = ctx
+            questions = qs
             break
-    #print(doc_id)
-    docs = docs.filter(lambda row: row["doc_id"] == doc_id)
 
-    passages = docs[0]["passages"]
-    context = ""
-    for psg in passages:
-        context += psg + "\n"
-    #print(context)
-    questions = []
-    target_queries = queries.filter(lambda q: q["_id"] in query_ids)
-    for q in target_queries:
-        questions.append(q["text"])
-    #print(questions)
+    # max_context = max_context.replace(" ", "")
 
-    return context, questions
+    return max_context[:10240], questions
 
-def run_dapr_flexllmgen(args):
+
+def run_longbench_flexllmgen(args):
     print(f"<run_dapr_flexllmgen>: args.model: {args.model}")
     if args.model == "facebook/galactica-30b":
         tokenizer = AutoTokenizer.from_pretrained("facebook/galactica-30b", padding_side="left")
@@ -1499,8 +1494,8 @@ def run_dapr_flexllmgen(args):
 
     model = OptLM(opt_config, env, args.path, args.offload_dir, policy, args.prompt_len, args.gen_len, args.strategy)
 
-    context, questions = process_dapr()
-    context = context[:8192]
+    context, questions = process_longbench()
+    # context = context[:2048]
     ### feed prefix
     prefix_input = get_tokenized_inputs(context, max_prompt_len=max_prompt_len, tokenizer=tokenizer)
     print(len(prefix_input[0]))
@@ -1510,9 +1505,10 @@ def run_dapr_flexllmgen(args):
     )
     model.sync()
 
-    inputs = [context +  query + "\n" for query in questions]
-    inputs_ids = tokenizer(inputs, truncation=True, max_length=max_prompt_len).input_ids
-    
+    inputs = [context + " " + query + "\n" for query in questions]
+    # inputs_ids = tokenizer(inputs, truncation=False, max_length=max_prompt_len).input_ids
+    inputs_ids = get_tokenized_inputs(inputs, max_prompt_len=max_prompt_len, tokenizer=tokenizer)
+
     for i in range(len(inputs)):
         global io_bytes 
         io_bytes = 0
@@ -1763,7 +1759,7 @@ def add_parser_arguments(parser):
              "FlexLLMGen will automatically download them from HuggingFace.")
     parser.add_argument("--offload-dir", type=str, default="/ssd/nsccgz_zgchen_6/flexllmgen_offload_dir",
         help="The directory to offload tensors. ")
-    parser.add_argument("--prompt-len", type=int, default=5120)
+    parser.add_argument("--prompt-len", type=int, default=8000)
     parser.add_argument("--gen-len", type=int, default=32)
     parser.add_argument("--cut-gen-len", type=int,
         help="Cut generation length for fast debugging.")
@@ -1812,4 +1808,4 @@ if __name__ == "__main__":
     assert len(args.percent) == 6
 
     # run_prefix_flexllmgen(args)
-    run_dapr_flexllmgen(args)
+    run_longbench_flexllmgen(args)
