@@ -1,6 +1,6 @@
 """
 Usage:
-python3 -m flexllmgen.flex_llama --model meta/llama3.1-8b --gpu-batch-size 32 --percent 100 0 100 0 100 0 --path=/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/lqy/HF_HOME/hub --overlap=False
+python3 -m flexllmgen.flex_llama --model meta/llama3.1-8b --gpu-batch-size 1 --percent 100 0 100 0 100 0 --path=/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/lqy/HF_HOME/hub --overlap=False
 """
 
 import argparse
@@ -430,19 +430,31 @@ class SelfAttention:
         else:
             ((i_n, _), (w_q, _), (w_k, _), (w_v, _), (w_out, _)) = weight_read_buf.val
 
+        cos_cached, sin_cached = freqs_cis
+
         if i == 0:  # prefill
             mask, donate[1] = attention_mask.val.smart_copy(self.compute)
+
+            s = self.task.prompt_len
+            cos = cos_cached[:s]
+            sin = sin_cached[:s]
+            sliced_freqs_cis = freqs_cis[:s]
             h, new_k_cache, new_v_cache = self.compute.gqa(h, mask, i_n, w_q,
-                w_k, w_v, w_out, self.rms_norm_eps, freqs_cis,
+                w_k, w_v, w_out, self.rms_norm_eps, (cos,sin),
                 n_head, num_key_value_heads, donate, self.policy.compress_cache, self.policy.comp_cache_config)
             cache_write_buf.store((new_k_cache, new_v_cache))
         else:  # decoding
             mask, donate[1] = attention_mask.val.smart_copy(self.attention_compute)
             (k_cache, donate[7]), (v_cache, donate[8]) = cache_read_buf.pop()
+
+            pos = self.task.prompt_len + i
+            cos = cos_cached[pos-1:pos]
+            sin = sin_cached[pos-1:pos]
+            sliced_freqs_cis = freqs_cis[pos-1:pos]
             h, new_k_cache, new_v_cache = self.compute.gqa_gen(h, mask, i_n, w_q,
-                w_k, w_v, w_out, self.rms_norm_eps, freqs_cis,
+                w_k, w_v, w_out, self.rms_norm_eps, (cos,sin),
                 n_head, num_key_value_heads, k_cache, v_cache, donate,
-                self.policy.compress_cache, self.policy.comp_cache_config)
+                self.policy.compress_cache, self.policy.comp_cache_config, pos=pos)
             cache_write_buf.store((new_k_cache, new_v_cache))
 
         hidden.val = h

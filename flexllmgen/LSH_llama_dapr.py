@@ -191,7 +191,7 @@ class InputEmbed:
         return (batch_size, seq_len), np.int64
 
     def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
-                cache_write_buf, i, k, position_ids):
+                cache_write_buf, i, k, freqs_cis):
         # Compute input embedding
         donate = [False] * 2
         h, donate[0] = hidden.val, True
@@ -259,7 +259,7 @@ class OutputEmbed:
         return (batch_size, seq_len, self.config.hidden_size), self.config.dtype
 
     def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
-                cache_write_buf, i, k, position_ids):
+                cache_write_buf, i, k, freqs_cis):
         donate = [False] * 3
         h, donate[0] = hidden.val, True
 
@@ -481,7 +481,7 @@ class SelfAttention:
         return (batch_size, seq_len, self.config.hidden_size), self.config.dtype
 
     def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
-                cache_write_buf, i, k, position_ids):
+                cache_write_buf, i, k, freqs_cis):
         n_head = self.config.n_head
         num_key_value_heads = self.config.num_key_value_heads
 
@@ -494,6 +494,8 @@ class SelfAttention:
                     (w_out, donate[6])) = weight_read_buf.pop()
         else:
             ((i_n, _), (w_q, _), (w_k, _), (w_v, _), (w_out, _)) = weight_read_buf.val
+
+        cos_cached, sin_cached = freqs_cis
 
         if i == 0:  # prefill
             mask, donate[1] = attention_mask.val.smart_copy(self.compute)
@@ -510,7 +512,7 @@ class SelfAttention:
                     ## get query_states from compute
                     ## -------todo:get_suffix_query_states_llama
                     query_states = self.compute.get_suffix_query_states(h, mask, i_n, w_q,
-                        w_k, w_v, w_out, self.rms_norm_eps, position_ids,n_head, num_key_value_heads,
+                        w_k, w_v, w_out, self.rms_norm_eps, freqs_cis,n_head, num_key_value_heads,
                         donate, self.policy.compress_cache, self.policy.comp_cache_config, matched_prefix)
                     
                     # self.kv_server.lsh_retrieve(0, self.layer_id, query_states, prefix_id, max_common_len)
@@ -527,7 +529,7 @@ class SelfAttention:
                 imp_token_idx, avg_n_imp = self.kv_server.get_full_idx(self.layer_id)
                 print(f"get {avg_n_imp} important tokens")
                 h, new_k_cache, new_v_cache = self.compute.gqa_prefill_with_kv(h, mask, i_n, w_q,
-                        w_k, w_v, w_out, self.rms_norm_eps, position_ids,n_head, num_key_value_heads,
+                        w_k, w_v, w_out, self.rms_norm_eps, freqs_cis,n_head, num_key_value_heads,
                         k_cache, v_cache,
                         donate, self.policy.compress_cache, self.policy.comp_cache_config, matched_prefix,
                         imp_token_idx)
@@ -535,8 +537,11 @@ class SelfAttention:
                 print(f"self.prefill_cache_shape: {self.prefill_cache_shape}")
             else:
                 ### only compute prefix kv
+                s = self.task.prompt_len
+                cos = cos_cached[:s]
+                sin = sin_cached[:s]
                 h, new_k_cache, new_v_cache = self.compute.gqa(h, mask, i_n, w_q,
-                    w_k, w_v, w_out, self.rms_norm_eps, position_ids,
+                    w_k, w_v, w_out, self.rms_norm_eps, (cos,sin),
                     n_head, num_key_value_heads, donate, self.policy.compress_cache, self.policy.comp_cache_config)
                 self.prefill_cache_shape = new_k_cache.shape[0]
 
@@ -544,11 +549,16 @@ class SelfAttention:
         else:  # decoding
             mask, donate[1] = attention_mask.val.smart_copy(self.attention_compute)
             (k_cache, donate[7]), (v_cache, donate[8]) = cache_read_buf.pop()
+
+            pos = self.task.prompt_len + i
+            cos = cos_cached[pos-1:pos]
+            sin = sin_cached[pos-1:pos]
+
             h, new_k_cache, new_v_cache = self.compute.gqa_gen(h, mask, i_n, w_q,
-                w_k, w_v, w_out, self.rms_norm_eps, position_ids,
+                w_k, w_v, w_out, self.rms_norm_eps, (cos, sin),
                 n_head, num_key_value_heads, k_cache, v_cache, donate,
                 self.policy.compress_cache, self.policy.comp_cache_config,
-                pos=self.prefill_cache_shape+i)
+                pos=pos)
             cache_write_buf.store((new_k_cache, new_v_cache))
 
         hidden.val = h
@@ -628,7 +638,7 @@ class MLP:
         return (batch_size, seq_len, self.config.hidden_size), self.config.dtype
 
     def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
-                cache_write_buf, i, k, position_ids):
+                cache_write_buf, i, k, freqs_cis):
         donate = [False] * 5
         h, donate[0] = hidden.val, True
 
@@ -680,15 +690,15 @@ class TransformerLayer:
         self.attention.store_cache(cache_home, cache_write_buf, i)
 
     def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
-                cache_write_buf, i, k, position_ids):
+                cache_write_buf, i, k, freqs_cis):
         if k == self.policy.num_gpu_batches - 1:
             read_buf1, read_buf2 = weight_read_buf.pop()
         else:
             read_buf1, read_buf2 = weight_read_buf.val
 
         self.attention.forward(hidden, cache_read_buf, read_buf1, attention_mask,
-                               cache_write_buf, i, k, position_ids)
-        self.mlp.forward(hidden, None, read_buf2, attention_mask, None, i, k, position_ids)
+                               cache_write_buf, i, k, freqs_cis)
+        self.mlp.forward(hidden, None, read_buf2, attention_mask, None, i, k, freqs_cis)
 
 
 class LLAMA:
@@ -711,12 +721,12 @@ class LLAMA:
         self.persist_strategy = persist_strategy
         
         self.max_length = max_prompt_len + max_gen_len
-        # self.freqs_cis = precompute_freqs_cis(
-        #     self.config.hidden_size // self.config.n_head,
-        #     self.max_length * 2,
-        #     self.config.rope_theta
-        # )
-        self.position_ids = torch.arange(self.max_length)
+        self.freqs_cis = precompute_freqs_cis(
+            self.config.hidden_size // self.config.n_head,
+            self.max_length * 2,
+            self.config.rope_theta
+        )
+        # self.position_ids = torch.arange(self.max_length)
 
         layers = []
         layers.append(InputEmbed(self.config, self.env, self.policy))
@@ -773,7 +783,7 @@ class LLAMA:
                 self.cache_home[j][k].clear()
                 self.cache_read_buf[j][k].clear()
                 self.cache_write_buf[j][k].clear()
-                self.init_cache(j, k, max_gen_len, max_prompt_len)
+                self.init_cache(j, k, max_prompt_len, max_gen_len)
         if self.policy.cpu_cache_compute:
             self.env.cpu.init_attention_compute_workspace(self.config, self.task, self.policy, max_gen_len, max_prompt_len)
 
@@ -821,8 +831,8 @@ class LLAMA:
                 else:
                     x.delete()
 
-    def init_cache(self, j, k, max_gen_len, max_prompt_len):
-        self.layers[j].init_cache_one_gpu_batch(self.cache_home[j][k], max_gen_len, max_prompt_len)
+    def init_cache(self, j, k, max_prompt_len, max_gen_len):
+        self.layers[j].init_cache_one_gpu_batch(self.cache_home[j][k], max_prompt_len, max_gen_len)
 
     def load_cache(self, i, j, k, overlap=True):
         # Handle corner cases
@@ -936,7 +946,7 @@ class LLAMA:
         # Run layer computation
         self.layers[j].forward(self.hidden[i][j][k], self.cache_read_buf[j][k],
             self.weight_read_buf[j], self.attention_mask[k],
-            self.cache_write_buf[j][k], i, k, self.position_ids)
+            self.cache_write_buf[j][k], i, k, self.freqs_cis)
 
     def sync(self):
         self.env.disk.synchronize()
@@ -1366,7 +1376,7 @@ def get_test_inputs(prompt_len, num_prompts, tokenizer):
 
 def get_tokenized_inputs(prompt, max_prompt_len, tokenizer):
     prompt = [prompt] if isinstance(prompt, str) else prompt
-    inputs_ids = tokenizer(prompt, max_length=max_prompt_len, truncation=True).input_ids
+    inputs_ids = tokenizer(prompt, max_length=max_prompt_len, truncation=False).input_ids
     return inputs_ids
 
 def process_dapr():
@@ -1439,7 +1449,7 @@ def run_dapr_flexllmgen(args):
     model = LLAMA(llama_config, env, args.path, args.offload_dir, policy, args.prompt_len, args.gen_len, args.strategy)
     
     context, questions = process_dapr()
-    # context = context[:10240]
+    context = context[:4096]
     ### feed prefix
     # context_input = context_template.format(context)
     prefix_input = get_tokenized_inputs(context, max_prompt_len=max_prompt_len, tokenizer=tokenizer)
@@ -1448,12 +1458,21 @@ def run_dapr_flexllmgen(args):
         prefix_input, max_new_tokens=1, debug_mode=args.debug_mode,
         cut_gen_len=cut_gen_len, verbose=args.verbose
     )
+    if DUMMY_WEIGHT not in args.path:
+        outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
+        show_str = "Outputs:\n" + 70 * '-' + "\n"
+        for j in range(0, len(outputs)):
+            show_str += f"{j}: {outputs[j]}\n"    
+            show_str += "-" * 70 + "\n"
+        if args.verbose >= 2:
+            print(show_str)
     model.sync()
 
     inputs = [context +  query + "\n" for query in questions]
-    inputs_ids = tokenizer(inputs, truncation=True, max_length=max_prompt_len).input_ids
+    inputs_ids = get_tokenized_inputs(inputs, max_prompt_len=max_prompt_len, tokenizer=tokenizer)
+    # inputs_ids = tokenizer(inputs, truncation=False, max_length=max_prompt_len).input_ids
     
-    for i in range(len(inputs)):
+    for i in range(1):
         global io_bytes 
         io_bytes = 0
         global last_id,last_offset,cur_continue_addr,average_continue_addr
@@ -1691,7 +1710,7 @@ def add_parser_arguments(parser):
              "FlexLLMGen will automatically download them from HuggingFace.")
     parser.add_argument("--offload-dir", type=str, default="/ssd/nsccgz_zgchen_6/flexllmgen_offload_dir",
         help="The directory to offload tensors. ")
-    parser.add_argument("--prompt-len", type=int, default=10240)
+    parser.add_argument("--prompt-len", type=int, default=4000)
     parser.add_argument("--gen-len", type=int, default=32)
     parser.add_argument("--cut-gen-len", type=int,
         help="Cut generation length for fast debugging.")

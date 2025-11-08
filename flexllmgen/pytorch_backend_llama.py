@@ -36,42 +36,41 @@ def fix_recursive_import():
     general_copy_compressed = compression.general_copy_compressed
     TorchCompressedDevice = compression.TorchCompressedDevice
 
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = torch.arange(end, device=freqs.device, dtype=torch.float32)
-    freqs = torch.outer(t, freqs)
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
-    return freqs_cis
+def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, device: str = "cpu"):
+    """
+    Precomputes the cosine and sine frequencies for rotary position embeddings.
+    This is adapted from the Hugging Face Llama implementation.
+    """
+    inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, device=device, dtype=torch.float32) / dim))
+    t = torch.arange(end, device=device, dtype=torch.float32)
+    freqs = torch.outer(t, inv_freq)
+    emb = torch.cat((freqs, freqs), dim=-1)
+    
+    cos_cached = emb.cos()
+    sin_cached = emb.sin()
+    return cos_cached, sin_cached
 
+def rotate_half(x):
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
 
-def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
-    ndim = x.ndim
-    assert 0 <= 1 < ndim
-    assert freqs_cis.shape == (x.shape[1], x.shape[-1])
-    shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
-    return freqs_cis.view(*shape)
-
-### from https://github.com/meta-llama/llama3/blob/main/llama/model.py
-# def apply_rotary_emb(
-#     xq: torch.Tensor,
-#     xk: torch.Tensor,
-#     freqs_cis: torch.Tensor,
-# ) -> Tuple[torch.Tensor, torch.Tensor]:
-#     xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
-#     xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-#     freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
-#     xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
-#     xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
-#     return xq_out.type_as(xq), xk_out.type_as(xk)
 
 def apply_rotary_emb(
     x: torch.Tensor,
-    freqs_cis: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    x_ = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
-    freqs_cis = reshape_for_broadcast(freqs_cis, x_)
-    x_out = torch.view_as_real(x_ * freqs_cis).flatten(3)
-    return x_out.type_as(x)
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Applies Rotary Position Embedding to a tensor.
+    """
+    # cos/sin shape: (s, head_dim) -> (1, s, 1, head_dim) for broadcasting
+    cos = cos.unsqueeze(0).unsqueeze(2)
+    sin = sin.unsqueeze(0).unsqueeze(2)
+    original_dtype = x.dtype
+    x_embed = (x * cos) + (rotate_half(x) * sin)
+    return x_embed.to(original_dtype) 
 
 class DeviceType(Enum):
     CPU = auto()
@@ -412,7 +411,7 @@ class TorchDevice:
         num_head, num_key_value_heads, hidden_size, prompt_len, gen_len, gpu_batch_size = (
             config.n_head, config.num_key_value_heads, config.input_dim, max_prompt_len, max_gen_len,
             policy.gpu_batch_size)
-        shape = (max_prompt_len + max_gen_len - 1, gpu_batch_size * num_key_value_heads, hidden_size // num_head)
+        shape = (prompt_len + gen_len - 1, gpu_batch_size * num_key_value_heads, hidden_size // num_head)
         # NOTE: disable pin_memory due to high memory overhead
         pin_memory = False
         k_cache = self.allocate(shape, np.float16, pin_memory=pin_memory)
@@ -444,7 +443,9 @@ class TorchDevice:
         b, s, h = inputs.shape
         head_dim = h // n_head
         
-        freqs_cis = freqs_cis[:s].to(self.dev)
+        cos, sin = freqs_cis
+        cos = cos.to(self.dev)
+        sin = sin.to(self.dev) 
 
         # input_layernorm
         hidden = F.rms_norm(inputs.data, (h,), weight=i_n.data, eps=eps)
@@ -459,8 +460,9 @@ class TorchDevice:
         v = v.view(b, s, n_kv_head, head_dim)
         
         # RotaryEmbedding
-        q = apply_rotary_emb(q, freqs_cis)
-        k = apply_rotary_emb(k, freqs_cis)
+        # q, k = apply_rotary_emb(q, k, freqs_cis)
+        q = apply_rotary_emb(q, cos, sin)
+        k = apply_rotary_emb(k, cos, sin)
 
         ori_k = k.transpose(0,1).reshape(s, b*n_kv_head, head_dim)
         ori_v = v.transpose(0,1).reshape(s, b*n_kv_head, head_dim)
@@ -512,7 +514,9 @@ class TorchDevice:
         head_dim = h // n_head
         common_prefix_len = sum(matched_prefix.values())
         
-        freqs_cis = freqs_cis[common_prefix_len:s].to(self.dev)
+        cos, sin = freqs_cis
+        cos = cos[common_prefix_len:s].to(self.dev)
+        sin = sin[common_prefix_len:s].to(self.dev)
 
         # input_layernorm
         hidden = F.rms_norm(inputs.data, (h,), weight=i_n.data, eps=eps)
@@ -524,7 +528,7 @@ class TorchDevice:
         q = q.view(b, s - common_prefix_len, n_head, head_dim)
         
         # RotaryEmbedding
-        q = apply_rotary_emb(q, freqs_cis)
+        q = apply_rotary_emb(q, cos, sin)
         return q[0]
 
     def gqa_prefill_with_kv(self, inputs, attention_mask, i_n, w_q, w_k, w_v, w_out, eps,
@@ -555,7 +559,10 @@ class TorchDevice:
         k = k[:n_imp]
         v = v[:n_imp]
 
-        freqs_cis = freqs_cis.to(self.dev)
+        cos, sin = freqs_cis
+        cos = cos.to(self.dev)
+        sin = sin.to(self.dev) 
+        # freqs_cis = freqs_cis.to(self.dev)
         repeat_kv = n_head // n_kv_head
         
         #input_layernorm
@@ -571,8 +578,10 @@ class TorchDevice:
         v_new = v_new.view(b, suffix_len, n_kv_head, head_dim)
         
         # RotaryEmbedding
-        q = apply_rotary_emb(q, freqs_cis[:s])
-        k_new = apply_rotary_emb(k_new, freqs_cis[common_prefix_len:s])
+        q = apply_rotary_emb(q, cos[:s], sin[:s])
+        k_new = apply_rotary_emb(k_new, cos[common_prefix_len:s], sin[common_prefix_len:s])
+        # q = apply_rotary_emb(q, freqs_cis[:s])
+        # k_new = apply_rotary_emb(k_new, freqs_cis[common_prefix_len:s])
         # q, k_new = apply_rotary_emb(q, k_new, freqs_cis)
         # k_new = k_new[:, common_prefix_len:s, :, :]
 
@@ -637,7 +646,10 @@ class TorchDevice:
         src_s = pos
         head_dim = h // n_head
         
-        freqs_cis = freqs_cis[src_s - 1 : src_s - 1 + tgt_s].to(self.dev)
+        # freqs_cis = freqs_cis.to(self.dev)
+        cos, sin = freqs_cis
+        cos = cos.to(self.dev)
+        sin = sin.to(self.dev) 
 
         repeat_kv = n_head // n_kv_head
 
@@ -653,8 +665,9 @@ class TorchDevice:
         v = v.view(b, tgt_s, n_kv_head, head_dim)
 
         # Rotary
-        q = apply_rotary_emb(q, freqs_cis)
-        k = apply_rotary_emb(k, freqs_cis)
+        # q, k = apply_rotary_emb(q, k, freqs_cis)
+        q = apply_rotary_emb(q, cos, sin)
+        k = apply_rotary_emb(k, cos, sin)
 
         q = q.permute(0, 2, 1, 3).reshape(b * n_head, tgt_s, head_dim)
         k_new = k.permute(1, 0, 2, 3).reshape(tgt_s, b * n_kv_head, head_dim)
@@ -1024,9 +1037,9 @@ class TorchDisk:
         if os.path.exists(tensor.data) and tensor.delete_file:
             os.remove(tensor.data)
 
-    def init_cache_one_gpu_batch_llama(self, config, task, policy):
+    def init_cache_one_gpu_batch_llama(self, config, task, policy, max_prompt_len, max_gen_len):
         n_head, num_key_value_heads, hidden_size, prompt_len, gen_len, gpu_batch_size = (
-            config.n_head, config.num_key_value_heads, config.input_dim, task.prompt_len, task.gen_len,
+            config.n_head, config.num_key_value_heads, config.input_dim, max_prompt_len, max_gen_len,
             policy.gpu_batch_size)
         shape = (prompt_len + gen_len - 1, gpu_batch_size, num_key_value_heads, hidden_size // num_head)
         k_cache = self.allocate(shape, np.float16)
@@ -1104,9 +1117,9 @@ class TorchMixedDevice:
             if x:
                 x.delete()
 
-    def init_cache_one_gpu_batch_llama(self, config, task, policy):
+    def init_cache_one_gpu_batch_llama(self, config, task, policy, max_prompt_len, max_gen_len):
         num_head, num_key_value_heads, hidden_size, prompt_len, gen_len, gpu_batch_size = (
-            config.n_head, config.num_key_value_heads, config.input_dim, task.prompt_len, task.gen_len,
+            config.n_head, config.num_key_value_heads, config.input_dim, max_prompt_len, max_gen_len,
             policy.gpu_batch_size)
         shape = (prompt_len + gen_len - 1, gpu_batch_size, num_key_value_heads, hidden_size // num_head)
 
