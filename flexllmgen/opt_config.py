@@ -96,7 +96,7 @@ def get_opt_config(name, **kwargs):
         )
     elif arch_name == "opt-30b":
         config = OptConfig(name=name,
-            max_seq_len=8192, num_hidden_layers=48, n_head=56,
+            max_seq_len=2048, num_hidden_layers=48, n_head=56,
             hidden_size=7168, input_dim=7168, ffn_embed_dim=7168 * 4,
         )
     elif arch_name == "galactica-30b":
@@ -106,7 +106,7 @@ def get_opt_config(name, **kwargs):
         )
     elif arch_name == "opt-66b":
         config = OptConfig(name=name,
-            max_seq_len=8192, num_hidden_layers=64, n_head=72,
+            max_seq_len=2048, num_hidden_layers=64, n_head=72,
             hidden_size=9216, input_dim=9216, ffn_embed_dim=9216 * 4,
         )
     elif arch_name == "opt-175b":

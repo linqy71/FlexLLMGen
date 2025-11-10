@@ -33,6 +33,28 @@ DUMMY_WEIGHT = "_DUMMY_"  # Use dummy weights for benchmark purposes
 
 # torch.cuda.set_device(0)
 #os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+import psutil
+def set_cpu_affinity(gpu_id, cpu_cores=None):
+    """
+    设置进程CPU亲和性到指定核心
+    """
+    pid = os.getpid()
+    process = psutil.Process(pid)
+    
+    if cpu_cores is None:
+        # 根据GPU ID自动选择核心
+        if gpu_id < 4:
+            cpu_cores = list(range(0, 32)) + list(range(64, 96))  # GPU0/1/2/3的亲和CPU
+        else:
+            cpu_cores = list(range(12, 24)) + list(range(36, 48))  # GPU4/5/6/7的亲和CPU
+    
+    try:
+        process.cpu_affinity(cpu_cores)
+        print(f"GPU{gpu_id} process binding to cpu cores: {cpu_cores}")
+    except Exception as e:
+        print(f"Set CPU affinity failed: {e}")
+
+set_cpu_affinity(0)
 
 from collections import defaultdict
 from datasets import load_dataset
