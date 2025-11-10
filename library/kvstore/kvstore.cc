@@ -532,7 +532,7 @@ void KVStore::merge_collect_queried_key_value(
     // std::vector<int> token_order;
     // std::vector<std::tuple<uint64_t, uint64_t, uint64_t, int>> content; //(file_index, start_offset, length, bitmap)
 
-    #pragma omp parallel for schedule(static) num_threads(32)
+    #pragma omp parallel for schedule(static) num_threads(64)
     for(int i = 0; i < this->num_key_value_heads; i++){
         std::vector<int> token_order;
         std::vector<std::tuple<uint64_t, uint64_t, uint64_t, int>> content; //(file_index, start_offset, length, bitmap)
@@ -1319,6 +1319,57 @@ void KVStore::merge_load_key_value_from_file(
     }
     if (file.is_open()) file.close();
 }
+void KVStore::reorder_persist(std::string path, int prefix_id, int layer_id, const torch::Tensor &reorder_token_info){
+    if (reorder_token_info.numel() == 0) {
+        return; // 没有需要重排的token，直接返回
+    }
+
+    this->store_path = path;
+    const size_t entry_size = 2 * this->head_dim * sizeof(DTYPE);
+
+    std::string file_name0 = this->store_path + "/" + std::to_string(prefix_id) + "_layer" + std::to_string(layer_id)  + "_part0" + ".bin";
+    std::string file_name1 = this->store_path + "/" + std::to_string(prefix_id) + "_layer" + std::to_string(layer_id)  + "_part1" + ".bin";
+
+    std::ifstream source_file(file_name0, std::ios::binary);
+    // 使用追加模式打开目标文件
+    std::ofstream dest_file(file_name1, std::ios::binary | std::ios::app);
+
+    if (!source_file.is_open() || !dest_file.is_open()) {
+        std::cerr << "Error opening source or destination file for promotion." << std::endl;
+    }
+
+    std::vector<char> buffer(entry_size);
+
+    auto accessor = reorder_token_info.accessor<long, 2>();
+    for (int i = 0; i < accessor.size(0); i++){
+        int head_id = accessor[i][0];
+        int token_id = accessor[i][1];
+
+        uint64_t meta_id = get_meta_id(token_id, layer_id, head_id);
+
+        if(kv_meta->find(meta_id) != kv_meta->end()){
+            FileOffsetInfo& info = kv_meta->at(meta_id);
+            if(info.file_index == 0) {
+                uint64_t source_offset = info.offset;
+                // a. 从源文件读取KV数据
+                source_file.seekg(source_offset, std::ios::beg);
+                source_file.read(buffer.data(), entry_size);
+
+                // b. 获取目标文件的当前末尾位置，作为新的offset
+                std::streampos new_offset = dest_file.tellp();
+
+                // c. 将数据追加写入到目标文件
+                dest_file.write(buffer.data(), entry_size);
+                
+                info.file_index = 1;
+                info.offset = static_cast<uint64_t>(new_offset);
+            }  
+        }
+    }
+    source_file.close();
+    dest_file.flush();
+    dest_file.close();
+}
 
 void KVStore::promote_persist(std::string path, int prefix_id, int layer_id, const torch::Tensor &promote_token_info){
     if (promote_token_info.numel() == 0) {
@@ -1699,6 +1750,7 @@ PYBIND11_MODULE(kvstore, m) {
         .def("concurrent_merge_collect_queried_key_value", &KVStore::concurrent_merge_collect_queried_key_value)
         .def("get_queried_key_cache", &KVStore::get_queried_key_cache)
         .def("promote_persist", &KVStore::promote_persist)
+        .def("reorder_persist", &KVStore::reorder_persist)
         .def("get_queried_value_cache", &KVStore::get_queried_value_cache)
         .def("clear", &KVStore::clear);
 }

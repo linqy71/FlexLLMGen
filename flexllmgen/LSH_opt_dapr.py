@@ -1138,6 +1138,7 @@ class OptLM:
         else:
             pass
             #self.kv_server.promote_persist(self.task.new_prefix_id)
+            #self.kv_server.reorder_persist(self.task.new_prefix_id)
         self.kv_server.reset(switch=False)
 
         try:

@@ -346,7 +346,19 @@ class LSHServer:
                                           layer_idx, promote_token_tensor)
             #print(f"Successfully promote prefix {prefix_id} to storage in {self.kv_store_path}")
         
-
+    def reorder_persist(self, prefix_id):
+        for layer_idx in range(self.num_layers):
+            promote_token_info =[]
+            nnz, results = self.query_results[layer_idx]
+            for head_id in range(self.num_key_value_heads):
+                n = nnz[head_id].item()
+                ind = results[head_id][:n].view(-1).tolist()
+                for token_id in ind:
+                    promote_token_info.append( (head_id, token_id) )
+            promote_token_tensor = torch.tensor(promote_token_info, dtype=torch.long, device="cpu")
+            self.kv_store.reorder_persist(self.kv_store_path, prefix_id, 
+                                          layer_idx, promote_token_tensor)
+            #print(f"Successfully promote prefix {prefix_id} to storage in {self.kv_store_path}") 
     ### arrange tokens into groups according to first req's query results
     # def single_query_group_strategy(self, layer_idx, q_hashcode, offload_len, prefix_id):
     #     _, q_len, _ = q_hashcode.shape
