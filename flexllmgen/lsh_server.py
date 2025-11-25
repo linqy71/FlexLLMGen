@@ -60,7 +60,7 @@ class LSHServer:
             self.hash_func = torch.load(hash_func_path,map_location=self.device)
         else :
             self.hash_func = torch.randn((self.head_dim, self.K * self.L), device=self.device, dtype=self.dtype)
-            torch.save(self.hash_func, hash_func_path)
+            # torch.save(self.hash_func, hash_func_path)
         self.binary_pack = [int(2**i) for i in range(self.K)] # 可能是用来快速判断属于哪个桶
         self.binary_pack = torch.Tensor(self.binary_pack).to(device=self.device, dtype=torch.float16)
         
@@ -198,18 +198,18 @@ class LSHServer:
         save_res: bool):
         if not self.offloaded or prefix_id == 0:
             return None, None
-        with torch.cuda.stream(self.copy_stream):
-            q_len, _, _ = query_states.shape
-            query_states = query_states.transpose(0,1).contiguous() # num_heads, q_len, head_dim
-            ### compute hashcode of queries
-            norm_q = query_states.reshape(-1, self.head_dim)
-            norm_q = norm_q / norm_q.norm(p=2, dim=-1, keepdim=True)
-            q_hashcode = torch.matmul(norm_q, self.hash_func).gt(0)
-            q_hashcode = q_hashcode.reshape(-1, self.K).to(torch.float16)
-            q_hashcode = torch.mv(q_hashcode, self.binary_pack).int()
-            q_hashcode = q_hashcode.reshape(self.num_attention_heads, q_len, self.L)
-            
-            self.pinned_hashcode_multi[...,:q_len,:].copy_(q_hashcode, non_blocking=True)
+        # with torch.cuda.stream(self.copy_stream):
+        q_len, _, _ = query_states.shape
+        query_states = query_states.transpose(0,1).contiguous() # num_heads, q_len, head_dim
+        ### compute hashcode of queries
+        norm_q = query_states.reshape(-1, self.head_dim)
+        norm_q = norm_q / norm_q.norm(p=2, dim=-1, keepdim=True)
+        q_hashcode = torch.matmul(norm_q, self.hash_func).gt(0)
+        q_hashcode = q_hashcode.reshape(-1, self.K).to(torch.float16)
+        q_hashcode = torch.mv(q_hashcode, self.binary_pack).int()
+        q_hashcode = q_hashcode.reshape(self.num_attention_heads, q_len, self.L)
+        
+        self.pinned_hashcode_multi[...,:q_len,:].copy_(q_hashcode, non_blocking=True)
         
         ### get results from lsh hashtables
         self.results_lsh_cpu.zero_()
@@ -258,13 +258,13 @@ class LSHServer:
 
     ### for debug...
     ### get full kv from kv_store by generating indices of range(offloaded_len)
-    def get_full_kv(self, req_id, layer_idx, query_states, prefix_id):
+    def get_full_kv(self, req_id, layer_idx, query_states, prefix_id, common_len):
         if not self.offloaded:
             return None, None
         ### generating indices covering offloaded_len
         for head_id in range(self.num_key_value_heads):
-            self.nnz[head_id] = self.offload_len
-            self.results_lsh_cpu[head_id][:self.offload_len].copy_(torch.arange(self.offload_len))
+            self.nnz[head_id] = common_len
+            self.results_lsh_cpu[head_id][:common_len].copy_(torch.arange(common_len))
         self.record_query_results(layer_idx)
         self.kv_store.collect_queried_key_value(prefix_id, layer_idx, self.results_lsh_cpu, self.nnz)
         queried_key = self.kv_store.get_queried_key_cache()
@@ -290,8 +290,7 @@ class LSHServer:
         #print(f"Successfully write prefix {prefix_id} to storage in {self.kv_store_path}")
         
         ## persist hash table
-        self.lsh_retriever.save_to_file(self.kv_store_path + "/lsh_table_" + str(prefix_id))
-
+        # self.lsh_retriever.save_to_file(self.kv_store_path + "/lsh_table_" + str(prefix_id))
         self.persisted = True
 
 
@@ -404,10 +403,13 @@ class LSHServer:
         # if self.current_prefix_id not in self.prefix_to_server:
         #     self.prefix_to_server[self.current_prefix_id] = (self.lsh_retriever, self.kv_store)
         if switch:
-            self.lsh_retriever = LSH()
-            self.lsh_retriever.alloc(self.K, self.L, self.num_layers, self.num_attention_heads, self.num_key_value_heads, self.batch_size, self.max_length)
-            self.kv_store = KVStore()
-            self.kv_store.alloc(self.num_layers, self.num_attention_heads, self.num_key_value_heads, self.head_dim, self.max_length)
+            self.kv_store.clear()
+            self.lsh_retriever.clear()
+            # self.lsh_retriever = LSH()
+            # self.lsh_retriever.alloc(self.K, self.L, self.num_layers, self.num_attention_heads, self.num_key_value_heads, self.batch_size, self.max_length)
+            # self.kv_store = KVStore()
+            # self.kv_store.alloc(self.num_layers, self.num_attention_heads, self.num_key_value_heads, self.head_dim, self.max_length)
+        
         
         self.nnz.zero_()
         self.results_lsh_cpu.zero_()

@@ -43,6 +43,8 @@ class Task:
     prefix_only: bool = None
     new_prefix_id: int = None
 
+    is_logits_task: bool = False
+
 @dataclasses.dataclass(frozen=True)
 class ExecutionEnv:
     """Hardware environment."""

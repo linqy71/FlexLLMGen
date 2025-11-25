@@ -282,6 +282,9 @@ class TorchDevice:
 
         # output embedding
         logits = F.linear(hidden, w_token.data)
+        if not do_sample:
+            return TorchTensor.create_from_torch(logits.to(torch.float32), self)
+        
         last_token_logits = logits[:,-1,:]
 
         if do_sample and not temperature < 1e-5:

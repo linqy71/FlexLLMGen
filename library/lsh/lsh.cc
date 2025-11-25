@@ -448,9 +448,9 @@ int LSH::retrieve_multi(
       for (int j = start_pos; j < end_pos; ++j)
       {
         int idx = m_content[j];
-        // if (idx >= max_index) {
-        //   break;
-        // }
+        if (idx >= max_index) {
+          break;
+        }
         uint8_t mask_val = tmask[idx];
         // 提示编译器 mask_val == 0 是更可能的情况
         if (__builtin_expect(mask_val == 0, 1))

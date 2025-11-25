@@ -46,7 +46,7 @@ def set_cpu_affinity(gpu_id, cpu_cores=None):
         if gpu_id < 4:
             cpu_cores = list(range(0, 32)) + list(range(64, 96))  # GPU0/1/2/3的亲和CPU
         else:
-            cpu_cores = list(range(12, 24)) + list(range(36, 48))  # GPU4/5/6/7的亲和CPU
+            cpu_cores = list(range(32, 63)) + list(range(96, 128))  # GPU4/5/6/7的亲和CPU
     
     try:
         process.cpu_affinity(cpu_cores)
@@ -305,9 +305,24 @@ class OutputEmbed:
         else:
             (w_ln, _), (b_ln, _), (w_token, _) = weight_read_buf.val
 
-        h = self.compute.opt_output_embed(h, w_ln, b_ln, w_token, donate,
-            self.task.do_sample, self.task.temperature)
-        hidden.val = h
+        # MODIFICADO: 为计算logits添加条件逻辑
+        # 当这是一个计算logits的任务时 (这总是在prefill阶段, i=0),
+        # 我们需要确保计算的是整个序列的logits。
+        # 否则，使用原始的生成路径。
+        is_logits_prefill = (i == 0 and self.task.is_logits_task)
+        current_do_sample = False if is_logits_prefill else self.task.do_sample
+        
+        output_tensor = self.compute.opt_output_embed(
+            h, w_ln, b_ln, w_token, donate,
+            do_sample=current_do_sample,
+            temperature=self.task.temperature
+        )
+        
+        hidden.val = output_tensor
+
+        # h = self.compute.opt_output_embed(h, w_ln, b_ln, w_token, donate,
+        #     self.task.do_sample, self.task.temperature)
+        # hidden.val = h
 
 
 class SelfAttention:
@@ -323,7 +338,7 @@ class SelfAttention:
             else self.env.gpu)
 
         self.task = None
-        self.copy_stream = torch.cuda.Stream(priority=-1)
+        # self.copy_stream = torch.cuda.Stream(priority=-1)
         # self.cpu2gpu_stream = torch.cuda.Stream()
         self.prefill_cache_shape = 0 #prefill阶段的cache第一维长度，可能是n_imp + NR(jaccard超过threshold)  可能是R+NR(没有超过threshold)
 
@@ -570,25 +585,26 @@ class SelfAttention:
                 cur_pos = 0
                 
                 for prefix_id, max_common_len in matched_prefix.items():
+                    print(f"max common len {max_common_len} for prefix {prefix_id}")
                     ## j is layer_id
                     ## get query_states from compute
                     query_states = self.compute.get_suffix_query_states(h, mask, w_q, b_q, 
                         w_ln, b_ln, n_head, k_cache, donate, self.policy.compress_cache, 
                         self.policy.comp_cache_config, matched_prefix)
-                    timers("imp calc").start()
+                    # timers("imp calc").start()
                     self.kv_server.lsh_retrieve(self.task.req_id, self.layer_id, query_states, prefix_id, max_common_len, self.task.save_res)
-                    timers("imp calc").stop()
-                    timers("imp load and compute").start()
+                    # timers("imp calc").stop()
+                    # timers("imp load and compute").start()
                     
                     k_cache_data, v_cache_data = self.kv_server.load_kv(0, self.layer_id, prefix_id)
                         
-                    # k_cache_data, v_cache_data = self.kv_server.get_full_kv(0, self.layer_id, query_states, prefix_id)
+                    # k_cache_data, v_cache_data = self.kv_server.get_full_kv(0, self.layer_id, query_states, prefix_id, max_common_len)
                     # print(k_cache_data)
-                    with torch.cuda.stream(self.copy_stream):
+                    # with torch.cuda.stream(self.copy_stream):
                         # k_cache_data, v_cache_data = self.kv_server.get_full_kv(0, j, query_states, prefix_id)
-                        length = self.copy_prefix(k_cache, k_cache_data, cur_pos)
-                        length = self.copy_prefix(v_cache, v_cache_data, cur_pos)
-                    timers("imp load and compute").stop()
+                    length = self.copy_prefix(k_cache, k_cache_data, cur_pos)
+                    length = self.copy_prefix(v_cache, v_cache_data, cur_pos)
+                    # timers("imp load and compute").stop()
                     cur_pos += length
                 # n_imp = cur_pos
                 ### kv_server的layer统一用layer_id管理
@@ -598,7 +614,7 @@ class SelfAttention:
 
                 # print(imp_token_idx[:3])
                 timers("compute").start()
-                self.copy_stream.synchronize()
+                # self.copy_stream.synchronize()
                 h, new_k_cache, new_v_cache = self.compute.mha_prefill_with_kv(h, mask, w_q, b_q,
                     w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln, n_head, k_cache, v_cache, donate,
                     self.policy.compress_cache, self.policy.comp_cache_config, matched_prefix, 
@@ -766,7 +782,9 @@ class OptLM:
                  policy: Policy,
                  max_prompt_len: int,
                  max_gen_len: int,
-                 persist_strategy: str):
+                 persist_strategy: str,
+                 K: int,
+                 L: int):
         if isinstance(config, str):
             config = get_opt_config(config)
         self.config = config
@@ -827,7 +845,7 @@ class OptLM:
         self.kv_store_path = os.path.join(offload_dir, "kv_store")
         if not os.path.exists(self.kv_store_path):
             os.makedirs(self.kv_store_path)
-        self.kv_server = LSHServer(self.config, self.num_hidden_layers, self.kv_store_path, K=10, L=100, batch_size=1, max_length=8192, device='cuda:0')
+        self.kv_server = LSHServer(self.config, self.num_hidden_layers, self.kv_store_path, K=K, L=L, batch_size=1, max_length=8192, device='cuda:0')
         self.set_kv_server()
         
         for j in range(num_layers):
@@ -1030,6 +1048,182 @@ class OptLM:
             (self.policy.gpu_batch_size, self.task.prompt_len), bool)
         val.load_from_np((input_ids != self.config.pad_token_id))
         self.attention_mask[k].store(val)
+
+    def get_logits(self,
+                 inputs: Union[np.array, List[int]],
+                 temperature: float = 1.0,
+                 req_id: int = 0):
+        matched_prefix = self.radix_tree.match(inputs[0])
+        prefix_only = False
+        new_prefix_id = 0
+        common_len = sum(matched_prefix.values())
+        if common_len < 10:
+            # reset radix tree
+            del self.radix_tree
+            self.radix_tree = RadixTree()
+            self.kv_server.reset(switch=True)
+            prefix_only = True
+            new_prefix_id = self.radix_tree.insert(inputs[0])
+        else:
+            self.kv_server.reset(switch=False)
+            new_prefix_id = list(matched_prefix.keys())[0]
+        task = Task(
+            inputs=inputs,
+            prompt_len=len(inputs[0]),
+            gen_len=1,
+            cut_gen_len=1,
+            do_sample=False,
+            temperature=temperature,
+            stop=None,
+            common_prefix_kv_ptr=None,
+            common_prefix_len=None,
+            matched_prefix=matched_prefix,
+            prefix_only=prefix_only,
+            new_prefix_id = new_prefix_id,
+            req_id = req_id,
+            is_logits_task=True,
+        )
+        # logger.info(f"generate: Task={task}")
+        num_layers = self.num_layers
+        num_gpu_batches = self.num_gpu_batches
+        gpu_batch_size = self.policy.gpu_batch_size
+        overlap = self.policy.overlap
+        prompt_len, gen_len = task.prompt_len, task.gen_len
+        self.execute_gen_len = task.cut_gen_len if task.cut_gen_len else task.gen_len
+
+        # Output token ids
+        self.output_ids = np.full((len(task.inputs), prompt_len + gen_len),
+            self.config.pad_token_id, dtype=np.int32)
+        self.stopped = np.zeros((len(task.inputs), 1), dtype=bool)
+        self.output_ids[:, :prompt_len] = np.asarray(task.inputs)
+        assert gpu_batch_size * num_gpu_batches == len(task.inputs)
+
+        # Intermediate tensors
+        # The following buffers store values used
+        # for the i-th token, j-th layer, k-th gpu batch.
+        num_layers, num_gpu_batches = self.num_layers, self.policy.num_gpu_batches
+
+        # 清理中间张量
+        for j in range(num_layers):
+            for k in range(num_gpu_batches):
+                # self.cache_home[j][k].clear()
+                self.cache_read_buf[j][k].clear()
+                self.cache_write_buf[j][k].clear()
+        
+        for j in range(num_layers):
+            self.weight_read_buf[j].clear()
+        for k in range(num_gpu_batches):
+            self.attention_mask[k].clear()
+        self.hidden = array_3d(gen_len, num_layers, num_gpu_batches, ValueHolder)
+
+        self.set_task(task) 
+        # assert(num_gpu_batches == 1)
+        logits_tensor = self.logits_loop_normal()
+        return logits_tensor
+    
+    def logits_loop_normal(self):
+        """
+        用于计算logits的常规循环（仅prefill）。
+        """
+        # 我们只对prefill阶段 (i=0) 感兴趣
+        i = 0
+        for k in range(self.num_gpu_batches):
+            self.update_attention_mask(i, k)
+        
+        for j in range(self.num_layers):
+            # 加载权重
+            for k in range(self.num_gpu_batches):
+                self.load_weight(i, j, k, overlap=False)
+
+            # 计算层
+            for k in range(self.num_gpu_batches):
+                self.load_cache(i, j, k, overlap=False) # 在prefill时无操作
+                self.load_hidden(i, j, k)
+                self.compute_layer(i, j, k)
+                # 对于logits计算，我们不需要存储hidden或cache，
+                # 但在最后一层之后，hidden状态包含了logits
+                if j == self.num_layers - 1:
+                    # 在最后一层之后，不要将hidden移走，因为它包含了最终结果
+                    pass
+                else:
+                    self.store_hidden(i, j, k)
+                
+                # store_cache 在 prefill 后填充KV缓存，对logits任务非必需，但保持流程完整
+                self.store_cache(i, j, k, overlap=False)
+
+        # 从最后一层的hidden状态中提取logits
+        return self._extract_logits_from_hidden()
+
+    def logits_loop_overlap_single_batch(self):
+        """
+        Single batch overlap logits computation loop.
+        Returns logits from the last layer for all positions.
+        """
+        # Prologue
+        for k in range(self.num_gpu_batches):
+            self.load_weight(0, 0, k)
+        self.sync()
+
+        # Prefill only (i=0) for logits computation
+        i = 0
+        self.update_attention_mask(i, 0)
+        for j in range(self.num_layers):
+            self.load_weight(i, j+1, 0)
+            self.load_cache(i, j+1, 0)
+            self.load_hidden(i, j, 0)
+            self.compute_layer(i, j, 0)
+            self.store_cache(i, j-1, 0)
+            self.store_hidden(i, j, 0)
+            self.sync()
+
+        # Extract logits from the last layer
+        return self._extract_logits_from_hidden()
+
+    def _extract_logits_from_hidden(self):
+        """
+        从最后一层的隐藏状态中提取logits。
+        此函数作为“质检员”，确保只处理和返回符合预期的、
+        正确的三维浮点数张量。
+        """
+        # 1. 找到模型最后一层的位置（索引）
+        last_layer_idx = self.num_layers - 1
+        
+        # 2. 创建一个空列表，用来存放从每个GPU批次中提取出的logits
+        batch_logits = [] 
+        
+        # 3. 遍历模型处理的每一个GPU批次
+        for k in range(self.num_gpu_batches):
+            # 从内部存储区 self.hidden 中，获取属于当前批次(k)、最后一层(last_layer_idx)的计算结果。
+            # 这个结果是一个我们自己封装的 TorchTensor 对象。
+            hidden_tensor = self.hidden[0][last_layer_idx][k].val
+            
+            # 4. 检查并处理取出的结果
+            if hidden_tensor is not None:
+                # a. 从封装对象中取出真正的PyTorch张量(.data)，并把它从GPU内存复制到CPU内存(.cpu())。
+                # .detach() 是为了切断计算图，因为我们只关心数值本身。
+                logits_data = hidden_tensor.data.detach().cpu()
+                
+                # b. 【核心检查】在这里，我们做一个严格的“质量检查”，确保拿到的数据没问题。
+                #    - 检查张量是不是三维的。
+                #    - 检查数据类型是不是浮点数（float32或float16都可以）。
+                if logits_data.dim() == 3 and logits_data.dtype in [torch.float32, torch.float16]:
+                    # 如果检查通过，说明数据是正确的。我们把它转换成标准的32位浮点数以保证后续计算的稳定，然后加到列表中。
+                    batch_logits.append(logits_data.to(torch.float32))
+                else:
+                    # 如果检查失败，说明上游的计算流程肯定还有问题。
+                    # 我们立即抛出一个明确的错误，告诉开发者哪里出了问题，方便快速定位和修复。
+                    raise RuntimeError(f"程序错误：_extract_logits_from_hidden函数收到的张量类型或形状不正确。"
+                                    f"当前形状: {logits_data.shape}, 当前类型: {logits_data.dtype}")
+            else:
+                # 如果连结果都拿不到（是None），这也是一个严重的程序错误。
+                raise RuntimeError(f"程序错误：_extract_logits_from_hidden函数在处理批次 {k} 时收到了一个空值(None)。")
+
+        # 5. 最后一步：整合所有批次的结果
+        if not batch_logits:
+            # 如果遍历完所有批次后，列表还是空的，说明一个logits都没提取出来，这也是个错误。
+            raise RuntimeError("程序错误：未能从任何GPU批次中提取出logits。")
+
+        return torch.cat(batch_logits, dim=0) 
 
     def generate(self,
                  inputs: Union[np.array, List[int]],
@@ -1422,6 +1616,49 @@ class OptLM:
     def __del__(self):
         self.delete_all_weights()
 
+
+def get_model(args):
+    print(f"<get_flexllmgen_model>: args.model: {args.model}")
+    if args.model == "facebook/galactica-30b":
+        tokenizer = AutoTokenizer.from_pretrained("facebook/galactica-30b", padding_side="left")
+    else:
+        #tokenizer = AutoTokenizer.from_pretrained("facebook/opt-30b", padding_side="left")
+        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path, truncation_side="left")
+     
+    num_prompts = args.num_gpu_batches * args.gpu_batch_size
+    max_prompt_len, gen_len, cut_gen_len = args.prompt_len, args.gen_len, args.cut_gen_len
+    
+    gpu = TorchDevice("cuda:0")
+    cpu = TorchDevice("cpu")
+    disk = TorchDisk(args.offload_dir)
+    env = ExecutionEnv(gpu=gpu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gpu, cpu, disk]))
+
+    policy = Policy(args.gpu_batch_size, args.num_gpu_batches,
+                    args.percent[0], args.percent[1],
+                    args.percent[2], args.percent[3],
+                    args.percent[4], args.percent[5],
+                    args.overlap, args.sep_layer, args.pin_weight,
+                    args.cpu_cache_compute, args.attn_sparsity,
+                    args.compress_weight,
+                    CompressionConfig(num_bits=4, group_size=64,
+                                      group_dim=0, symmetric=False),
+                    args.compress_cache,
+                    CompressionConfig(num_bits=4, group_size=64,
+                                      group_dim=2, symmetric=False))
+    assert not (args.compress_cache and args.attn_sparsity < 1.0), "Not implemented"
+
+    opt_config = get_opt_config(args.model)
+    cache_size = opt_config.cache_bytes(num_prompts, max_prompt_len + gen_len)
+    hidden_size = opt_config.hidden_bytes(num_prompts, max_prompt_len + gen_len)
+    print(f"model size: {opt_config.model_bytes()/GB:.3f} GB, "
+          f"cache size: {cache_size/GB:.3f} GB, "
+          f"hidden size (prefill): {hidden_size/GB:.3f} GB")
+    
+    print("init weight...init_cache_home...")
+
+    model = OptLM(opt_config, env, args.path, args.offload_dir, policy, args.prompt_len, args.gen_len, args.strategy, args.K, args.L)
+
+    return model
 
 def get_filename(args):
     model_size = args.model.split('-')[-1]
@@ -1825,6 +2062,9 @@ def add_parser_arguments(parser):
         const=True, default=False)
     ## query for query_group_persist; seq for sequential_persist
     parser.add_argument("--strategy", type=str, default="query")
+    parser.add_argument("--K", type=int, default=9)
+    parser.add_argument("--L", type=int, default=200)
+
 
 
 if __name__ == "__main__":
