@@ -13,15 +13,15 @@
 rm /ssd/nsccgz_zgchen_6/lqy/flexllmgen_offload_dir/gathering/kv_store/1_*
 rm /ssd/nsccgz_zgchen_6/lqy/flexllmgen_offload_dir/gathering/kv_store/q*
 
-python3 -m flexllmgen.LSH_opt_dapr --model facebook/opt-30b \
+nsys launch python3 -m flexllmgen.LSH_opt_dapr --model facebook/opt-30b \
         --percent 100 0 100 0 100 0 \
-        --path /HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/hyk/opt_weights  \
+        --path /HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/hyk/opt_weights \
         --prompt-len 2024 \
         --gen-len 24 \
         --strategy seq \
         --overlap=True \
         --save-res=False \
-        --offload-dir /ssd/nsccgz_zgchen_6/lqy/flexllmgen_offload_dir/gathering  > log/30b_layer_seq_f_8192_dapr_affinity_1.log 2>&1
+        --offload-dir /ssd/nsccgz_zgchen_6/lqy/flexllmgen_offload_dir/gathering  > log/6.7b_layer_seq_f_8192_dapr_saveLSH.log 2>&1
 
 
 # python3 -m flexllmgen.LSH_opt_dapr --model facebook/opt-30b \

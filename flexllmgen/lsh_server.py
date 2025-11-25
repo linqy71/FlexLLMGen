@@ -157,6 +157,9 @@ class LSHServer:
             self.sorted_hash_values_buffer[i].copy_(sorted_hash_values)
             self.sorted_hash_indices_buffer[i].copy_(sorted_hash_indices)
         
+        torch.save(self.sorted_hash_values_buffer, self.kv_store_path + "/hash_values" + str(layer_idx))
+        torch.save(self.sorted_hash_indices_buffer, self.kv_store_path + "/hash_indices" + str(layer_idx))
+        
         self.lsh_retriever.fill(layer_idx, request_id,
                     self.sorted_hash_values_buffer, 
                     self.sorted_hash_indices_buffer)
@@ -290,7 +293,7 @@ class LSHServer:
         #print(f"Successfully write prefix {prefix_id} to storage in {self.kv_store_path}")
         
         ## persist hash table
-        self.lsh_retriever.save_to_file(self.kv_store_path + "/lsh_table_" + str(prefix_id))
+        # self.lsh_retriever.save_to_file(self.kv_store_path + "/lsh_table_" + str(prefix_id))
 
         self.persisted = True
 

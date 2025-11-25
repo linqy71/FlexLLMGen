@@ -39,3 +39,6 @@ flexllmgen_offload_dir
 today_job.sh
 
 analyze/
+log/
+lm_eval/datasets/
+lm_eval/logits/

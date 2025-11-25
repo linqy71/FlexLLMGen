@@ -210,8 +210,7 @@ void LSH::fill(
   }
 }
 
-// 保存到文件
-void LSH::save_to_file(const std::string filename) {
+void LSH::save_to_file(const std::string& filename) {
     std::ofstream out(filename, std::ios::binary);
     if (!out) {
         throw std::runtime_error("Cannot open file for writing");
@@ -226,25 +225,46 @@ void LSH::save_to_file(const std::string filename) {
     out.write(reinterpret_cast<const char*>(&batch_size), sizeof(batch_size));
     out.write(reinterpret_cast<const char*>(&max_length), sizeof(max_length));
 
-    // 写入表数据
+    // 压缩保存表数据
     for (int i = 0; i < num_layers; ++i) {
-        out.write(reinterpret_cast<const char*>(table_start[i]), 
-                 batch_size * num_key_value_heads * L * num_buckets * sizeof(int));
-        out.write(reinterpret_cast<const char*>(table_end[i]), 
-                 batch_size * num_key_value_heads * L * num_buckets * sizeof(int));
-        out.write(reinterpret_cast<const char*>(table[i]), 
-                 batch_size * num_key_value_heads * L * max_length * sizeof(int));
+        // 保存table_start的非零数据
+        save_sparse_array(out, table_start[i], 
+                         batch_size * num_key_value_heads * L * num_buckets);
+        
+        // 保存table_end的非零数据  
+        save_sparse_array(out, table_end[i],
+                         batch_size * num_key_value_heads * L * num_buckets);
+        
+        // 保存table的非零数据
+        save_sparse_array(out, table[i],
+                         batch_size * num_key_value_heads * L * max_length);
     }
-
-    // 写入mask
-    out.write(reinterpret_cast<const char*>(mask), 
-             batch_size * num_attention_heads * max_length * sizeof(uint8_t));
 
     out.close();
 }
 
-// 从文件加载
-void LSH::load_from_file(const std::string filename) {
+void LSH::save_sparse_array(std::ofstream& out, const int* data, size_t size) {
+    // 统计非零元素数量和位置
+    std::vector<std::pair<size_t, int>> non_zero_entries;
+    for (size_t i = 0; i < size; ++i) {
+        if (data[i] != 0) {
+            non_zero_entries.emplace_back(i, data[i]);
+        }
+    }
+    
+    // 写入非零元素数量
+    size_t non_zero_count = non_zero_entries.size();
+    out.write(reinterpret_cast<const char*>(&non_zero_count), sizeof(non_zero_count));
+    
+    // 写入非零元素
+    for (const auto& entry : non_zero_entries) {
+        out.write(reinterpret_cast<const char*>(&entry.first), sizeof(entry.first));
+        out.write(reinterpret_cast<const char*>(&entry.second), sizeof(entry.second));
+    }
+}
+
+// 从文件加载（优化版本）
+void LSH::load_from_file(const std::string& filename) {
     std::ifstream in(filename, std::ios::binary);
     if (!in) {
         throw std::runtime_error("Cannot open file for reading");
@@ -263,24 +283,41 @@ void LSH::load_from_file(const std::string filename) {
     num_buckets = static_cast<int>(pow(2, K));
     num_attention_groups = static_cast<int>(num_attention_heads / num_key_value_heads);
 
-    // 分配内存
+    // 分配内存（初始化为0）
     alloc(K, L, num_layers, num_attention_heads, num_key_value_heads, batch_size, max_length);
 
-    // 读取表数据
+    // 读取稀疏表数据
     for (int i = 0; i < num_layers; ++i) {
-        in.read(reinterpret_cast<char*>(table_start[i]), 
-               batch_size * num_key_value_heads * L * num_buckets * sizeof(int));
-        in.read(reinterpret_cast<char*>(table_end[i]), 
-               batch_size * num_key_value_heads * L * num_buckets * sizeof(int));
-        in.read(reinterpret_cast<char*>(table[i]), 
-               batch_size * num_key_value_heads * L * max_length * sizeof(int));
+        load_sparse_array(in, table_start[i], 
+                         batch_size * num_key_value_heads * L * num_buckets);
+        load_sparse_array(in, table_end[i], 
+                         batch_size * num_key_value_heads * L * num_buckets);
+        load_sparse_array(in, table[i], 
+                         batch_size * num_key_value_heads * L * max_length);
     }
 
-    // 读取mask
-    in.read(reinterpret_cast<char*>(mask), 
-           batch_size * num_attention_heads * max_length * sizeof(uint8_t));
-
     in.close();
+}
+
+// 加载稀疏数组的辅助函数
+void LSH::load_sparse_array(std::ifstream& in, int* data, size_t total_size) {
+    // 读取非零元素数量
+    size_t non_zero_count;
+    in.read(reinterpret_cast<char*>(&non_zero_count), sizeof(non_zero_count));
+    
+    // 读取非零元素并放置到正确位置
+    for (size_t i = 0; i < non_zero_count; ++i) {
+        size_t index;
+        int value;
+        in.read(reinterpret_cast<char*>(&index), sizeof(index));
+        in.read(reinterpret_cast<char*>(&value), sizeof(value));
+        
+        if (index < total_size) {
+            data[index] = value;
+        } else {
+            throw std::runtime_error("Index out of bounds while loading sparse array");
+        }
+    }
 }
 
 void LSH::copy(
