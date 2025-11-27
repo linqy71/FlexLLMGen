@@ -20,11 +20,11 @@ class CachePointer:
 
 class RadixToken:
     token_count = count()
-    def __init__(self, token_id:int, token_name = None, importance:int = 0, kv_ptr:List[CachePointer] = None):
+    def __init__(self, token_id:int, token_name = None, importance:int = 0, kv_ptr:List[CachePointer] = None, probe_ptr:List[CachePointer] = None):
         self.token_id = token_id
         
         self.kv_ptr = kv_ptr  # 为该token所有层的chunk_id. kv_ptr[i]表示第i层的缓存的CachePointer
-        
+        self.probe_ptr = probe_ptr
         self.importance = importance
 
         self.token_name = token_name or RadixToken.next_token_name()
@@ -33,6 +33,7 @@ class RadixToken:
 
     def __repr__(self):
         return f"(id={self.token_id},imp={self.importance})"
+        #return f"(id={self.token_id}, probe_ptr={self.probe_ptr})\n"
 
     @classmethod
     def next_token_name(cls):
@@ -64,11 +65,11 @@ class RadixTreeNode:
 
     
     @classmethod
-    def create_from_token_id(cls,tokens:List[int], kv_ptr=None):
+    def create_from_token_id(cls,tokens:List[int], kv_ptr=None, probe_ptr=None):
         if kv_ptr is None:
             tokens = [RadixToken(token_id=x) for x in tokens]
         else:
-            tokens = [RadixToken(token_id=tokens[i], kv_ptr=kv_ptr[i]) for i in range(len(tokens))]
+            tokens = [RadixToken(token_id=tokens[i], kv_ptr=kv_ptr[i], probe_ptr=probe_ptr[i]) for i in range(len(tokens))]
         return cls(tokens)
 
 
@@ -89,7 +90,7 @@ class RadixTree:
     
     # 插入新的序列,同时插入新节点的kv_ptr
     # kv_ptr:List[List[CachePointer]]  kv_ptr[i]表示NR中第i个token在每一层的缓存的位置
-    def insert(self, key:List[int], kv_ptr = None):
+    def insert(self, key:List[int], kv_ptr = None, probe_ptr = None):
         if len(key) == 0:
             return
         current = self.root
@@ -118,7 +119,7 @@ class RadixTree:
                     remaining = remaining[common_len:]
                     current = new_node
             else:
-                new_node = RadixTreeNode.create_from_token_id(remaining, kv_ptr)
+                new_node = RadixTreeNode.create_from_token_id(remaining, kv_ptr, probe_ptr)
                 current.children[next_token] = new_node
                 break
 

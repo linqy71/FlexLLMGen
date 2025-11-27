@@ -110,6 +110,7 @@ class TorchTensor:
     def create_from_torch(cls, data, device, name=None):
         return cls(data.shape, data.dtype, data, device, name=name)
 
+
     def delete(self):
         assert self.device is not None, "already deleted"
         if self.device.device_type == DeviceType.DISK:
@@ -395,8 +396,6 @@ class TorchDevice:
             对attn_sum在dim=1上求topk,得到每个头的重要token下标(b * n_probe_head, n_important)
             计算平均jaccard指数,超过threshold返回第1个头的重要token下标集
             没超过返回range(common_prefix_len)表示后续要使用所有token的KV缓存
-
-            注意力掩码部分没理清,是乱写的0.0
         '''
         if compress_cache:
             # shape: (common_prefix_len, b * n_probe_head, head_dim)
@@ -404,6 +403,8 @@ class TorchDevice:
         else:
             # shape: (common_prefix_len, b * n_probe_head, head_dim)
             k = k_cache.data
+        
+        timers("imp choose1").start()
 
         n_probe_head = 3
         b, s, h = inputs.shape
@@ -434,6 +435,9 @@ class TorchDevice:
         # shape:(b * n_probe_head, head_dim, common_prefix_len)
         k = k.permute(1, 2, 0).reshape(b * n_probe_head, head_dim, common_prefix_len)
 
+        timers("imp choose1").stop()
+
+        timers("imp choose2").start()
         # shape: (b * n_probe_head, s, common_prefix_len)
         attn_weights = torch.bmm(q, k)
         
@@ -451,10 +455,15 @@ class TorchDevice:
         _, topk_idx = torch.topk(attn_sum, k=n_important, dim=1)
         topk_idx = topk_idx.view(b, n_probe_head, n_important)
 
+        timers("imp choose2").stop()
+
+        timers("imp choose3").start()
+        cpu_topk_idx = topk_idx.cpu().numpy()
+
         S_imp = [[] for _ in range(b)]
         for i in range(b):
             for j in range(n_probe_head):
-                idx_set = { int(x) for x in topk_idx[i,j]}
+                idx_set = { int(x) for x in cpu_topk_idx[i,j]}
                 S_imp[i].append(idx_set)
 
         #logger.info(f"IMP_Token Set:{S_imp}")
@@ -477,6 +486,8 @@ class TorchDevice:
                 imp_token_idx.append(list(range(common_prefix_len))) #表示加载全部kv
 
         k_cache.delete()
+
+        timers("imp choose3").stop()
 
         return imp_token_idx
         
@@ -1107,6 +1118,20 @@ def cut_indices(indices, start, stop, base=0):
 def map_to_torch_tensor(tensor, indices):
     if tensor.device.device_type == DeviceType.DISK:
         data = torch.from_numpy(np.lib.format.open_memmap(tensor.data))
+        #data = torch.from_numpy(np.load(tensor.data))
+    else:
+        data = tensor.data
+
+    # BC: this is supposed to only handle the sparse v_cache case
+    if torch.is_tensor(indices):
+        return vector_gather(data, indices)
+    return data[indices] if indices else data
+
+
+def read_torch_tensor(tensor, indices):
+    if tensor.device.device_type == DeviceType.DISK:
+        #data = torch.from_numpy(np.lib.format.open_memmap(tensor.data))
+        data = torch.from_numpy(np.load(tensor.data)).pin_memory()
     else:
         data = tensor.data
 
@@ -1148,6 +1173,45 @@ def copy_worker_func(queue, cuda_id):
                 dst_data.copy_(src_data)
 
             queue.task_done()
+
+
+
+def sync_general_read(dst: TorchTensor, dst_indices: Tuple[slice],
+                 src: TorchTensor, src_indices: Tuple[slice], cpu_buf):
+    """synchronous copy between two tensors.
+    Only supporting copy among pinned tensors on gpu, cpu, or disk.
+    """
+    src_dev = src.device.device_type
+    dst_dev = dst.device.device_type
+    if dst_dev == DeviceType.DISK:    
+        src_data = map_to_torch_tensor(src, src_indices)
+        dst_data = map_to_torch_tensor(dst, dst_indices)
+
+        if (src_dev == DeviceType.CUDA or
+            dst_dev == DeviceType.CUDA):
+            # Use a pinned cpu buffer as a relay
+            size = np.prod(src_data.shape)
+            tmp_cpu_buf = cpu_buf[:size].view(src_data.shape)
+            tmp_cpu_buf.copy_(src_data)
+            dst_data.copy_(tmp_cpu_buf, non_blocking=True)
+        else:
+            dst_data.copy_(src_data)
+    elif src_dev == DeviceType.DISK:
+        src_data = read_torch_tensor(src, src_indices)
+        dst_data = map_to_torch_tensor(dst, dst_indices)
+        
+        dst_data.copy_(src_data)
+    elif src_dev == DeviceType.CPU and dst_dev == DeviceType.CUDA and not src.data.is_pinned():
+        # The cpu tensor is not pinned, use pin_memory as a relay
+        src = src.data[src_indices] if src_indices else src.data
+        dst = dst.data[dst_indices] if dst_indices else dst.data
+        src = src.pin_memory()
+        dst.copy_(src, non_blocking=True)
+    else:
+        # The normal path
+        src = src.data[src_indices] if src_indices else src.data
+        dst = dst.data[dst_indices] if dst_indices else dst.data
+        dst.copy_(src, non_blocking=True)
 
 def sync_general_copy(dst: TorchTensor, dst_indices: Tuple[slice],
                  src: TorchTensor, src_indices: Tuple[slice], cpu_buf):

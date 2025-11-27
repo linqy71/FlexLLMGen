@@ -27,7 +27,7 @@ from flexllmgen.utils import (Task, ExecutionEnv, GB, T, ValueHolder,
     read_benchmark_log)
 
 from flexllmgen.metadata_manage import RadixTree, RadixTreeNode, RadixToken, CachePointer
-from flexllmgen.kv_cache_manage import ChunkPool
+from flexllmgen.kv_cache_manage import ChunkPool, ProbeChunkPool
 fix_recursive_import()
 
 DUMMY_WEIGHT = "_DUMMY_"  # Use dummy weights for benchmark purposes
@@ -35,11 +35,35 @@ DUMMY_WEIGHT = "_DUMMY_"  # Use dummy weights for benchmark purposes
 from collections import defaultdict
 from datasets import load_dataset
 import logging
+import psutil
 
 logging.basicConfig(#filename="test.log", filemode="w",
                     format="%(asctime)s %(name)s:%(levelname)s:%(message)s", 
                     datefmt="%m-%d %H:%M:%S", level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+def set_cpu_affinity(gpu_id, cpu_cores=None):
+    """
+    设置进程CPU亲和性到指定核心
+    """
+    pid = os.getpid()
+    process = psutil.Process(pid)
+    
+    if cpu_cores is None:
+        # 根据GPU ID自动选择核心
+        if gpu_id < 4:
+            cpu_cores = list(range(0, 32)) + list(range(64, 96))  # GPU0/1/2/3的亲和CPU
+        else:
+            cpu_cores = list(range(12, 24)) + list(range(36, 48))  # GPU4/5/6/7的亲和CPU
+    
+    try:
+        process.cpu_affinity(cpu_cores)
+        print(f"GPU{gpu_id} process binding to cpu cores: {cpu_cores}")
+    except Exception as e:
+        print(f"Set CPU affinity failed: {e}")
+
+set_cpu_affinity(0)
+
 
 io_bytes = 0
 
@@ -88,10 +112,11 @@ class Policy:
     comp_cache_config: CompressionConfig
 
     # the ratio of important tokens in prefix kv cache
-    important_ratio: float = 0.4
+    important_ratio: float = 0.3
 
     # Config of Chunk Pool (128, b*n_head, head_dim) * 2
-    chunk_size: int = 128
+    chunk_size: int = 256
+    probe_chunk_size: int = 8196
     gpu_heap_size: int = 0
     cpu_heap_size: int = 0
 
@@ -174,7 +199,7 @@ class InputEmbed:
     def set_task(self, task):
         self.task = task
 
-    def set_chunk_pool(self, chunk_pool):
+    def set_chunk_pool(self, chunk_pool, probe_chunk_pool):
         pass
 
     def init_weight(self, weight_home, path):
@@ -185,7 +210,7 @@ class InputEmbed:
             # w_token
             ((v, h), dtype, path + "decoder.embed_tokens.weight"),
             # w_pos
-            ((s + 2, h), dtype, path + "decoder.embed_positions.weight"),
+            ((s + 2, h), dtype, path + "decoder.et_embed_positions.weight"),
         ]
         weights = init_weight_list(weight_specs, self.policy, self.env)
 
@@ -241,7 +266,7 @@ class OutputEmbed:
     def set_task(self, task):
         self.task = task
 
-    def set_chunk_pool(self, chunk_pool):
+    def set_chunk_pool(self, chunk_pool, probe_chunk_pool):
         pass
     
     def init_weight(self, weight_home, path):
@@ -315,8 +340,9 @@ class SelfAttention:
     def set_task(self, task):
         self.task = task
     
-    def set_chunk_pool(self, chunk_pool):
+    def set_chunk_pool(self, chunk_pool, probe_chunk_pool):
         self.chunk_pool = chunk_pool
+        self.probe_chunk_pool = probe_chunk_pool
 
     def init_weight(self, weight_home, path):
         h, dtype = (self.config.input_dim, self.config.dtype)
@@ -395,14 +421,27 @@ class SelfAttention:
         pin_memory = True if dst.device_type == DeviceType.CPU else False
         k_cache = dst.allocate(probe_cache_shape, np.float16, pin_memory=pin_memory)
 
-        # 第0个batch的第j个token的第i层的kv_ptr
+        #第0个batch的第j个token的第i层的kv_ptr
+        # for t_idx in range(self.task.common_prefix_len):
+        #     kv_ptr = self.task.common_prefix_token[t_idx].kv_ptr[j]
+        #     chunk_id, offset = kv_ptr.chunk_id, kv_ptr.offset
+        #     #logger.info(f"In load_probe_cahe token:{t_idx} layer:{j}: kv_ptr = {kv_ptr}")
+        #     timers("probe_cache").start()
+        #     self.chunk_pool.get_probe_cache(k_cache, t_idx, chunk_id, offset)
+        #     timers("probe_cache").stop()
+        req = defaultdict(list)
         for t_idx in range(self.task.common_prefix_len):
-            kv_ptr = self.task.common_prefix_token[t_idx].kv_ptr[j]
-            chunk_id, offset = kv_ptr.chunk_id, kv_ptr.offset
-            #logger.info(f"In load_probe_cahe token:{t_idx} layer:{j}: kv_ptr = {kv_ptr}")
+            #logger.info(f"shape:{len(self.task.common_prefix_token)}   In load_probe_cache token:{t_idx} layer:{j}")
+            #logger.info(f"Shape of self.task.common_prefix_token[{t_idx}].probe_ptr: {len(self.task.common_prefix_token[t_idx].probe_ptr)}")
+            probe_k_ptr = self.task.common_prefix_token[t_idx].probe_ptr[j]
+            chunk_id, offset = probe_k_ptr.chunk_id, probe_k_ptr.offset
+            req[chunk_id].append((offset, t_idx))
+        
+        for chunk_id, store_ptr in req.items():
             timers("probe_cache").start()
-            self.chunk_pool.get_probe_cache(k_cache, t_idx, chunk_id, offset)
+            self.probe_chunk_pool.get_probe_cache(k_cache, chunk_id, store_ptr)
             timers("probe_cache").stop()
+
         self.env.disk.synchronize()
         end_event_load_probe.record(torch.cuda.current_stream())
         timers("imp io").stop(end_event_load_probe.synchronize())
@@ -429,15 +468,16 @@ class SelfAttention:
             kv_ptr = self.task.common_prefix_token[imp_token_idx[j]].kv_ptr[layer]
             chunk_id, offset = kv_ptr.chunk_id, kv_ptr.offset
             req[chunk_id].append((offset, j))
+        timers("full_cache").start()
+        # for chunk_id, store_ptr in req.items():
+        #     #logger.info(f"Get Prefix KV: len(store_ptr)={len(store_ptr)}")
+        #     self.chunk_pool.get_full_head_cache_load(k_cache, v_cache, chunk_id, store_ptr)
 
-        for chunk_id, store_ptr in req.items():
-            #logger.info(f"Get Prefix KV: len(store_ptr)={len(store_ptr)}")
-            timers("full_cache").start()
-            self.chunk_pool.get_full_head_cache_impress(k_cache, v_cache, chunk_id, store_ptr)
-            timers("full_cache").stop()
-
-        global chunk_cnt
-        chunk_cnt.append(len(req))
+        self.chunk_pool.get_full_head_cache_concurrent(k_cache, v_cache, req)
+        timers("full_cache").stop()
+        
+        # global chunk_cnt
+        # chunk_cnt.append(len(req))
 
         # global io_bytes
         # io_bytes += n_important
@@ -591,12 +631,12 @@ class SelfAttention:
 
         if i == 0:  # prefill        
             end_event_compute = torch.cuda.Event(enable_timing=True)
-            timers("compute").start()
+            
             mask, donate[1] = attention_mask.val.smart_copy(self.compute)
             if self.task.common_prefix_len > 0:
                 (k_cache, donate[12]) = cache_read_buf.pop()
 
-                #start_get_imp = torch.cuda.Event(enable_timing=True)
+                start_get_imp = torch.cuda.Event(enable_timing=True)
                 end_event_get_imp   = torch.cuda.Event(enable_timing=True)
 
                 timers("imp calc").start()
@@ -608,9 +648,12 @@ class SelfAttention:
 
 
                 imp_token_idx = imp_token_idx[0] # 解开batch维度
+
+                # imp_token_idx = list(range(self.task.common_prefix_len))
+                
                 logger.info(f"Layer {j}: Selected {len(imp_token_idx)} important tokens.")
-                # logger.info(f"Get Important token indices: {imp_token_idx}")
-                self.update_importance(imp_token_idx, j)
+                #logger.info(f"Get Important token indices: {imp_token_idx}")
+                #self.update_importance(imp_token_idx, j)
 
                 end_event_atn_load = torch.cuda.Event(enable_timing=True)
                 timers("imp load and compute").start()
@@ -620,25 +663,30 @@ class SelfAttention:
                 #logger.info(f"Prefix KV cache shape: {k_cache}, {v_cache}, common_prefix_len: {self.task.common_prefix_len}")
                 #logger.info(f"Prefix KV cache: {k_cache.data[:,:3,:10]}")
                 timers("imp load and compute").stop(end_event_atn_load.synchronize())
+                
+                timers("compute").start()
+                
                 h, new_k_cache, new_v_cache = self.compute.mha_prefill(h, mask, w_q, b_q,
                     w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln, n_head, k_cache, v_cache, donate,
                     self.policy.compress_cache, self.policy.comp_cache_config, self.task.common_prefix_len, imp_token_idx)
                 
-                
+                end_event_compute.record(torch.cuda.current_stream())
+                timers("compute").stop(end_event_compute.synchronize())
 
                 self.prefill_cache_shape = new_k_cache.shape[0]
                 #logger.info(f"SelfAttention Prefix cache shape: {self.prefill_cache_shape}")
             else:
+                timers("compute").start()
                 h, new_k_cache, new_v_cache = self.compute.mha(h, mask, w_q, b_q,
                     w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln, n_head, donate,
                     self.policy.compress_cache, self.policy.comp_cache_config)
-                
+                end_event_compute.record(torch.cuda.current_stream())
+                timers("compute").stop(end_event_compute.synchronize())
                 self.prefill_cache_shape = self.task.prompt_len
                 #logger.info(f"SelfAttention Prefix cache shape: {self.prefill_cache_shape}")
             # 存入的cache shape可能是(s, b * n_head, head_dim) 也可能是 (n_imp + s - common_prefix_len[0], ..., ...)
             cache_write_buf.store((new_k_cache, new_v_cache))
-            end_event_compute.record(torch.cuda.current_stream())
-            timers("compute").stop(end_event_compute.synchronize())
+
         else:  # decoding
             mask, donate[1] = attention_mask.val.smart_copy(self.attention_compute)
             (k_cache, donate[12]), (v_cache, donate[13]) = cache_read_buf.pop()
@@ -668,7 +716,7 @@ class MLP:
     def set_task(self, task):
         self.task = task
     
-    def set_chunk_pool(self, chunk_pool):
+    def set_chunk_pool(self, chunk_pool, probe_chunk_pool):
         pass
 
     def init_weight(self, weight_home, path):
@@ -741,8 +789,8 @@ class TransformerLayer:
         self.attention.set_task(task)
         self.mlp.set_task(task)
     
-    def set_chunk_pool(self, chunk_pool):
-        self.attention.set_chunk_pool(chunk_pool)
+    def set_chunk_pool(self, chunk_pool, probe_chunk_pool):
+        self.attention.set_chunk_pool(chunk_pool, probe_chunk_pool)
         #self.mlp.set_chunk_pool(chunk_pool)
 
     def init_weight(self, weight_home, path):
@@ -842,7 +890,7 @@ class OptLM:
 
         self.radix_tree = RadixTree() 
         self.chunk_pool = ChunkPool(self.env, self.config, self.policy.gpu_batch_size, self.policy.chunk_size, self.policy.gpu_heap_size, self.policy.cpu_heap_size) # Initialize chunk pool
-
+        self.probe_chunk_pool = ProbeChunkPool(self.env, self.config, self.policy.gpu_batch_size, self.policy.probe_chunk_size)
         self.set_chunk_pool()
         for j in range(num_layers):
             for k in range(num_gpu_batches):
@@ -861,7 +909,7 @@ class OptLM:
 
     def set_chunk_pool(self):
         for l in self.layers:
-            l.set_chunk_pool(self.chunk_pool)
+            l.set_chunk_pool(self.chunk_pool, self.probe_chunk_pool)
 
     def init_weight(self, j):
         expanded_path = os.path.abspath(os.path.expanduser(
@@ -1056,17 +1104,23 @@ class OptLM:
         prompt_len = self.task.prompt_len
         
         kv_ptr = [[] for _ in range(common_prefix_len, prompt_len)]
+        probe_ptr = [[] for _ in range(common_prefix_len, prompt_len)]
 
         for layer in range(self.num_layers):
             for t_idx in range(common_prefix_len, prompt_len):
                 if isinstance(self.layers[layer], SelfAttention) == False:
                     kv_ptr[t_idx - common_prefix_len].append(None)
+                    probe_ptr[t_idx - common_prefix_len].append(None)
                     continue
                 for b in range(self.policy.num_gpu_batches):
                     src = self.cache_home[layer][b]
                     k_cache, v_cache = src.val
                     ptr = self.chunk_pool.store_kv_cache(k_cache, v_cache, self.layers[layer].prefill_cache_shape + t_idx - prompt_len) 
-                    kv_ptr[t_idx - common_prefix_len].append(ptr)               
+                    kv_ptr[t_idx - common_prefix_len].append(ptr)   
+                    
+                    pr_ptr = self.probe_chunk_pool.store_probe_k(k_cache, self.layers[layer].prefill_cache_shape + t_idx - prompt_len)
+                    probe_ptr[t_idx - common_prefix_len].append(pr_ptr)    
+
         # cache_home 里存储的缓存形状是：(prefill_cache_shape + suffix_len + gen_len - 1, b * n_head, head_dim)
         # n_imp部分的已经持久化了，只需要持久化suffix_len部分的。
         # for t_idx in range(common_prefix_len,  prompt_len):
@@ -1091,7 +1145,7 @@ class OptLM:
         logging.info(f"kv_ptr:{len(kv_ptr)}")
         #logging.info(f"common_prefix_len={common_prefix_len}, prompt_len={prompt_len}")
 
-        self.radix_tree.insert(inputs, kv_ptr)
+        self.radix_tree.insert(inputs, kv_ptr, probe_ptr)
         
     def generate(self,
                  inputs: Union[np.array, List[List[int]]],
@@ -1832,7 +1886,7 @@ def run_dapr_flexllmgen(args):
     num_prompts = args.num_gpu_batches * args.gpu_batch_size
     max_prompt_len, gen_len, cut_gen_len = args.prompt_len, args.gen_len, args.cut_gen_len
     
-    gpu = TorchDevice("cuda:7")
+    gpu = TorchDevice("cuda:0")
     cpu = TorchDevice("cpu")
     disk = TorchDisk(args.offload_dir)
     env = ExecutionEnv(gpu=gpu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gpu, cpu, disk]))
@@ -1851,7 +1905,7 @@ def run_dapr_flexllmgen(args):
                                       group_dim=2, symmetric=False))
     assert not (args.compress_cache and args.attn_sparsity < 1.0), "Not implemented"
 
-    opt_config = get_opt_config(args.model)
+    opt_config = get_opt_config(args.model,max_seq_len=8192)
     cache_size = opt_config.cache_bytes(num_prompts, max_prompt_len + gen_len)
     hidden_size = opt_config.hidden_bytes(num_prompts, max_prompt_len + gen_len)
     print(f"model size: {opt_config.model_bytes()/GB:.3f} GB, "
@@ -1864,12 +1918,17 @@ def run_dapr_flexllmgen(args):
 
     context, questions = process_dapr()
     
-    inputs = [context[:8192] + "\n" +  query + "\n" for query in questions]
+    request_size = args.request
+    questions = questions[:request_size]
+
+    inputs = [context + query + "\n" for query in questions]
     inputs_ids = tokenizer(inputs, truncation=True, max_length=max_prompt_len).input_ids
     output_ids = model.generate(
         inputs=[inputs_ids[0]], max_new_tokens = 1, debug_mode=args.debug_mode, 
         cut_gen_len=cut_gen_len, verbose=args.verbose)
     
+    prefill_history = []
+
     for i in range(len(inputs)):
         global io_bytes 
         io_bytes = 0
@@ -1888,6 +1947,12 @@ def run_dapr_flexllmgen(args):
 
         timers("probe_cache").reset()
         timers("full_cache").reset()
+
+        timers("imp choose1").reset()
+        timers("imp choose2").reset()
+        timers("imp choose3").reset()
+
+        timers("chunk io").reset()
 
         output_ids = model.generate(
             inputs=[inputs_ids[i]], max_new_tokens = args.gen_len, debug_mode=args.debug_mode, 
@@ -1913,11 +1978,12 @@ def run_dapr_flexllmgen(args):
         print("imp calc average:",timers("imp calc").elapsed("average"))
         print("imp calc sum:",timers("imp calc").elapsed("sum"))
         #print("imp io:{}",timers("imp io").costs)
-        #print("imp calc:{}",timers("imp calc").costs)
+        print("imp calc:",timers("imp calc").costs)
         print("compute average:",timers("compute").elapsed("average"))
         print("compute sum:",timers("compute").elapsed("sum"))
         #print("compute:{}",timers("compute").costs)
         print("prefill:",timers("generate").costs[0])
+        prefill_history.append(timers("generate").costs[0])
         print((timers("imp io").elapsed("sum") + timers("imp calc").elapsed("sum"))/timers("generate").costs[0] * 100)
 
         print("imp load :",timers("imp load and compute").elapsed("average"))
@@ -1928,6 +1994,14 @@ def run_dapr_flexllmgen(args):
         print("probe_cache: ",timers("probe_cache").elapsed("average"), "  ", timers("probe_cache").elapsed("sum"))
         print("full_cache: ",timers("full_cache").elapsed("average"), "  ", timers("full_cache").elapsed("sum"))
         
+
+        print("imp choose1: ",timers("imp choose1").elapsed("average"), "  ", timers("imp choose1").elapsed("sum"))
+        print("imp choose1 costs: ",timers("imp choose1").costs)
+        print("imp choose2: ",timers("imp choose2").elapsed("average"), "  ", timers("imp choose2").elapsed("sum"))
+        print("imp choose2 costs: ",timers("imp choose2").costs)
+        print("imp choose3: ",timers("imp choose3").elapsed("average"), "  ", timers("imp choose3").elapsed("sum"))
+        print("imp choose3 costs: ",timers("imp choose3").costs)
+
         # print("total io token:", io_bytes)
         # print("total continue token", cur_continue_addr)
         # if i!=0:
@@ -1936,10 +2010,11 @@ def run_dapr_flexllmgen(args):
         print("=" * 50)
 
         if(i == len(inputs) // 2):
-            global chunk_cnt
-            logger.info(f"Befor KV Reordering, avg_chunk_cnt = {sum(chunk_cnt)/len(chunk_cnt)}")
-            chunk_cnt = []
-            #model.kv_reordering()
+            #model.radix_tree.visualize()
+            #global chunk_cnt
+            #logger.info(f"Befor KV Reordering, avg_chunk_cnt = {sum(chunk_cnt)/len(chunk_cnt)}")
+            #chunk_cnt = []
+            model.kv_reordering()
             print("=" * 25,"KV_REORDERING", "="*25)
 
 
@@ -1958,13 +2033,18 @@ def run_dapr_flexllmgen(args):
 
         subprocess.run(['sudo', 'drop_cache'], check=True)
         
-    logger.info(f"After KV Reordering, avg_chunk_cnt = {sum(chunk_cnt)/len(chunk_cnt)}")
+    #logger.info(f"After KV Reordering, avg_chunk_cnt = {sum(chunk_cnt)/len(chunk_cnt)}")
     #model.plot_layer_distribution()
     env.close_copy_threads()
 
     _, gpu_peak_mem = gpu.mem_stats()
     _, cpu_peak_mem = cpu.mem_stats()
     print(f"peak gpu mem: {gpu_peak_mem / GB:.3f} GB\t" + f"peak cpu mem: {cpu_peak_mem / GB:.3f} GB\t")
+    if prefill_history:
+        recent_prefill = prefill_history[1:]
+        print(f"Last {len(recent_prefill)} prefill values: {recent_prefill}")
+        print(f"Average of last {len(recent_prefill)} prefill values: {sum(recent_prefill)/len(recent_prefill):.6f}")
+
 
 
 
@@ -2013,6 +2093,8 @@ def add_parser_arguments(parser):
 
     parser.add_argument("--overlap", type=str2bool, nargs='?',
         const=True, default=True)
+    
+    parser.add_argument("--request", type=int, default=5)
 
 import matplotlib.pyplot as plt
 def plot_and_save_layer_frequency(data: List[int], layer: int):
