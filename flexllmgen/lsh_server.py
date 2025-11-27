@@ -213,8 +213,10 @@ class LSHServer:
         
         ### get results from lsh hashtables
         self.results_lsh_cpu.zero_()
+        
         self.nnz.zero_()
         self.lsh_retriever.batch_retrieve_multi(layer_idx, self.pinned_hashcode_multi, q_len ,self.results_lsh_cpu, self.nnz, max_index)
+        self.extend_imp_heads()
         
         if save_res:
             save_dir = "/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/lqy/llm_infer/FlexLLMGen/analyze/longbench_sim_66b/" + str(req_id)
@@ -228,6 +230,18 @@ class LSHServer:
         #     self.results_lsh_cpu[i][:self.nnz[i]], _ = torch.sort(self.results_lsh_cpu[i][:self.nnz[i]])
         #print(self.nnz)
         self.record_query_results(layer_idx)
+    
+    def extend_imp_heads(self):
+        imp_ids = set()
+        for i in range(3):
+            n = self.nnz[i]
+            imp_ids = imp_ids | set(self.results_lsh_cpu[i][:n].tolist())
+        # print(imp_ids)
+        n = len(imp_ids)
+        imp_ids = torch.tensor(list(imp_ids))
+        for i in range(self.num_key_value_heads):
+            self.results_lsh_cpu[i][:n].copy_(imp_ids)
+            self.nnz[i] = n
     
     def load_kv(self, 
         req_id: int, 

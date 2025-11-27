@@ -54,7 +54,7 @@ def set_cpu_affinity(gpu_id, cpu_cores=None):
     except Exception as e:
         print(f"Set CPU affinity failed: {e}")
 
-set_cpu_affinity(0)
+set_cpu_affinity(1)
 
 from collections import defaultdict
 from datasets import load_dataset
