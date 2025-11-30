@@ -288,9 +288,14 @@ class TorchDevice:
         hidden = F.layer_norm(inputs.data, (h,), weight=w_ln.data, bias=b_ln.data)
         if donate[0]: inputs.delete()
 
-        # output embedding
         logits = F.linear(hidden, w_token.data)
+        if not do_sample:
+            return TorchTensor.create_from_torch(logits.to(torch.float32), self)
+        
         last_token_logits = logits[:,-1,:]
+        # output embedding
+        # logits = F.linear(hidden, w_token.data)
+        # last_token_logits = logits[:,-1,:]
 
         if do_sample and not temperature < 1e-5:
             probs = torch.softmax(last_token_logits / temperature, dim=-1)

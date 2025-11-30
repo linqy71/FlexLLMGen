@@ -403,7 +403,7 @@ class ChunkPool:
             bandwidth_mbps = float('inf')
 
         # 打印信息
-        print(f"Chunk IO Time: {last_io_time:.4f} s, Chunks Read: {num_chunks}, Calculated Bandwidth: {bandwidth_mbps:.2f} MB/s")
+        # print(f"Chunk IO Time: {last_io_time:.4f} s, Chunks Read: {num_chunks}, Calculated Bandwidth: {bandwidth_mbps:.2f} MB/s")
 
         # def _copy_slice(k_data, v_data, src_offset, dst_offset):
         #     k_cache.data[dst_offset:dst_offset + 1, :, :].copy_(k_data[src_offset:src_offset + 1, :, :], non_blocking=True)
