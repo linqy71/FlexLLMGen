@@ -40,5 +40,5 @@ today_job.sh
 
 analyze/
 log/
-lm_eval/logits/
-lm_eval/datasets/
+logits
+datasets
