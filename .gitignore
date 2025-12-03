@@ -33,8 +33,8 @@ flexllmgen/apps/data_wrangle/core
 
 # tmp scripts
 today_job.sh
-lm_eval_impress/logits/
-lm_eval_impress/datasets/
+logits
+datasets
 
 log/
 analyze/
