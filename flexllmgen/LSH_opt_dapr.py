@@ -596,9 +596,9 @@ class SelfAttention:
                     # timers("imp calc").stop()
                     # timers("imp load and compute").start()
                     
-                    k_cache_data, v_cache_data = self.kv_server.load_kv(0, self.layer_id, prefix_id)
+                    # k_cache_data, v_cache_data = self.kv_server.load_kv(0, self.layer_id, prefix_id)
                         
-                    # k_cache_data, v_cache_data = self.kv_server.get_full_kv(0, self.layer_id, query_states, prefix_id, max_common_len)
+                    k_cache_data, v_cache_data = self.kv_server.get_full_kv(0, self.layer_id, query_states, prefix_id, max_common_len)
                     # print(k_cache_data)
                     # with torch.cuda.stream(self.copy_stream):
                         # k_cache_data, v_cache_data = self.kv_server.get_full_kv(0, j, query_states, prefix_id)
@@ -1052,11 +1052,15 @@ class OptLM:
     def get_logits(self,
                  inputs: Union[np.array, List[int]],
                  temperature: float = 1.0,
+                 full: bool = False,
                  req_id: int = 0):
         matched_prefix = self.radix_tree.match(inputs[0])
         prefix_only = False
         new_prefix_id = 0
-        common_len = sum(matched_prefix.values())
+        if full:
+            common_len = 0 #  full kv
+        else :
+            common_len = sum(matched_prefix.values())
         if common_len < 10:
             # reset radix tree
             del self.radix_tree
