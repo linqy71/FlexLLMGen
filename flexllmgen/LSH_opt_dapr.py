@@ -596,9 +596,9 @@ class SelfAttention:
                     # timers("imp calc").stop()
                     # timers("imp load and compute").start()
                     
-                    # k_cache_data, v_cache_data = self.kv_server.load_kv(0, self.layer_id, prefix_id)
+                    k_cache_data, v_cache_data = self.kv_server.load_kv(0, self.layer_id, prefix_id)
                         
-                    k_cache_data, v_cache_data = self.kv_server.get_full_kv(0, self.layer_id, query_states, prefix_id, max_common_len)
+                    # k_cache_data, v_cache_data = self.kv_server.get_full_kv(0, self.layer_id, query_states, prefix_id, max_common_len)
                     # print(k_cache_data)
                     # with torch.cuda.stream(self.copy_stream):
                         # k_cache_data, v_cache_data = self.kv_server.get_full_kv(0, j, query_states, prefix_id)
