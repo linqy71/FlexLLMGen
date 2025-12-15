@@ -54,7 +54,7 @@ def set_cpu_affinity(gpu_id, cpu_cores=None):
     except Exception as e:
         print(f"Set CPU affinity failed: {e}")
 
-set_cpu_affinity(1)
+set_cpu_affinity(0)
 
 from collections import defaultdict
 from datasets import load_dataset
@@ -199,7 +199,7 @@ class InputEmbed:
             # w_token
             ((v, h), dtype, path + "decoder.embed_tokens.weight"),
             # w_pos
-            ((s + 2, h), dtype, path + "decoder.embed_positions.weight"),
+            ((s + 2, h), dtype, path + "decoder.et_embed_positions.weight"),
         ]
         weights = init_weight_list(weight_specs, self.policy, self.env)
 
@@ -341,6 +341,8 @@ class SelfAttention:
         # self.copy_stream = torch.cuda.Stream(priority=-1)
         # self.cpu2gpu_stream = torch.cuda.Stream()
         self.prefill_cache_shape = 0 #prefill阶段的cache第一维长度，可能是n_imp + NR(jaccard超过threshold)  可能是R+NR(没有超过threshold)
+        self.n_imp = 1
+        self.max_common_len = 1
 
     def set_task(self, task):
         self.task = task
@@ -532,7 +534,7 @@ class SelfAttention:
         seq_len, _, _ = k_new.shape
 
         if self.task.prefix_only:
-            print(f"offloading prefix {self.task.new_prefix_id} to LSH")
+            # print(f"offloading prefix {self.task.new_prefix_id} to LSH")
             self.kv_server.offload_to_lsh(self.layer_id, 0, seq_len, self.task.new_prefix_id, k_new.data, v_new.data)
             return
 
@@ -585,7 +587,8 @@ class SelfAttention:
                 cur_pos = 0
                 
                 for prefix_id, max_common_len in matched_prefix.items():
-                    print(f"max common len {max_common_len} for prefix {prefix_id}")
+                    # print(f"max common len {max_common_len} for prefix {prefix_id}")
+                    self.max_common_len = max_common_len
                     ## j is layer_id
                     ## get query_states from compute
                     query_states = self.compute.get_suffix_query_states(h, mask, w_q, b_q, 
@@ -610,7 +613,8 @@ class SelfAttention:
                 ### kv_server的layer统一用layer_id管理
                 imp_token_idx, avg_n_imp = self.kv_server.get_imp_idx(self.layer_id)
                 # imp_token_idx = self.kv_server.get_full_idx(self.layer_id)
-                print(f"get {avg_n_imp} important tokens")
+                # print(f"get {avg_n_imp} important tokens")
+                self.n_imp = avg_n_imp
 
                 # print(imp_token_idx[:3])
                 timers("compute").start()
@@ -1087,6 +1091,7 @@ class OptLM:
             req_id = req_id,
             is_logits_task=True,
         )
+        print(f"prompt_len: {task.prompt_len}")
         # logger.info(f"generate: Task={task}")
         num_layers = self.num_layers
         num_gpu_batches = self.num_gpu_batches
@@ -1134,6 +1139,8 @@ class OptLM:
         for k in range(self.num_gpu_batches):
             self.update_attention_mask(i, k)
         
+        n_imp_list = []
+        max_common_len = 0
         for j in range(self.num_layers):
             # 加载权重
             for k in range(self.num_gpu_batches):
@@ -1154,8 +1161,14 @@ class OptLM:
                 
                 # store_cache 在 prefill 后填充KV缓存，对logits任务非必需，但保持流程完整
                 self.store_cache(i, j, k, overlap=False)
+            
+            if isinstance(self.layers[j], TransformerLayer):
+                n_imp_list.append(self.layers[j].attention.n_imp)
+                max_common_len = self.layers[j].attention.max_common_len
 
         # 从最后一层的hidden状态中提取logits
+        avg_n_imp = sum(n_imp_list) / len(n_imp_list)
+        print(f"max_common_len: {max_common_len}, n_imp: {avg_n_imp}, retention: {avg_n_imp / max_common_len}")
         return self._extract_logits_from_hidden()
 
     def logits_loop_overlap_single_batch(self):
@@ -1651,7 +1664,7 @@ def get_model(args):
                                       group_dim=2, symmetric=False))
     assert not (args.compress_cache and args.attn_sparsity < 1.0), "Not implemented"
 
-    opt_config = get_opt_config(args.model)
+    opt_config = get_opt_config(args.model, max_seq_len=8192)
     cache_size = opt_config.cache_bytes(num_prompts, max_prompt_len + gen_len)
     hidden_size = opt_config.hidden_bytes(num_prompts, max_prompt_len + gen_len)
     print(f"model size: {opt_config.model_bytes()/GB:.3f} GB, "

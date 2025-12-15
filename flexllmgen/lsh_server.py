@@ -116,7 +116,7 @@ class LSHServer:
         self.avg_k[layer_idx][request_id] = avg_k
         
         offload_len = offload_key.shape[1]
-        print(offload_key.shape, seq_len)
+        # print(offload_key.shape, seq_len)
         self.alloc_buffer(offload_len)
         
         ### computing hashcode of offload keys
@@ -216,7 +216,7 @@ class LSHServer:
         
         self.nnz.zero_()
         self.lsh_retriever.batch_retrieve_multi(layer_idx, self.pinned_hashcode_multi, q_len ,self.results_lsh_cpu, self.nnz, max_index)
-        self.extend_imp_heads()
+        # self.extend_imp_heads()
         
         if save_res:
             save_dir = "/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/lqy/llm_infer/FlexLLMGen/analyze/longbench_sim_66b/" + str(req_id)

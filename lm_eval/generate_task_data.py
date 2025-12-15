@@ -30,9 +30,10 @@ if __name__ == '__main__':
     parser.add_argument('--task-name', type=str, default='hellaswag')
     parser.add_argument('--num-fewshot', type=int, default=0)
     parser.add_argument('--limit', type=int, default=None, help='限制生成样本数量')
+    parser.add_argument('--seq', type=int, default=1024)
     args = parser.parse_args()
 
-    seq = 1024
+    seq = args.seq
     total_batch = 1
     pe = 'fixed'
 

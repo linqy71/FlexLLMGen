@@ -42,3 +42,4 @@ analyze/
 log/
 logits
 datasets
+acc
