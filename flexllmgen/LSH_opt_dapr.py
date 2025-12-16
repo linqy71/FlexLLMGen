@@ -54,7 +54,7 @@ def set_cpu_affinity(gpu_id, cpu_cores=None):
     except Exception as e:
         print(f"Set CPU affinity failed: {e}")
 
-set_cpu_affinity(0)
+set_cpu_affinity(2)
 
 from collections import defaultdict
 from datasets import load_dataset
@@ -199,7 +199,7 @@ class InputEmbed:
             # w_token
             ((v, h), dtype, path + "decoder.embed_tokens.weight"),
             # w_pos
-            ((s + 2, h), dtype, path + "decoder.embed_positions.weight"),
+            ((s + 2, h), dtype, path + "decoder.et_embed_positions.weight"),
         ]
         weights = init_weight_list(weight_specs, self.policy, self.env)
 
@@ -595,7 +595,6 @@ class SelfAttention:
                 imp_token_idx, avg_n_imp = self.kv_server.get_imp_idx(self.layer_id)
                 # imp_token_idx = self.kv_server.get_full_idx(self.layer_id)
                 print(f"get {avg_n_imp} important tokens")
-
                 # print(imp_token_idx[:3])
                 timers("compute").start()
                 self.copy_stream.synchronize()
@@ -768,7 +767,7 @@ class OptLM:
                  max_gen_len: int,
                  persist_strategy: str):
         if isinstance(config, str):
-            config = get_opt_config(config)
+            config = get_opt_config(config, max_seq_len=8192)
         self.config = config
         self.env = env
         self.path = path
@@ -827,7 +826,7 @@ class OptLM:
         self.kv_store_path = os.path.join(offload_dir, "kv_store")
         if not os.path.exists(self.kv_store_path):
             os.makedirs(self.kv_store_path)
-        self.kv_server = LSHServer(self.config, self.num_hidden_layers, self.kv_store_path, K=10, L=100, batch_size=1, max_length=8192, device='cuda:0')
+        self.kv_server = LSHServer(self.config, self.num_hidden_layers, self.kv_store_path, K=8, L=50, batch_size=1, max_length=8192, device='cuda:2')
         self.set_kv_server()
         
         for j in range(num_layers):
@@ -1099,6 +1098,14 @@ class OptLM:
 
         self.set_task(task)
 
+        #load hash table
+        if self.task.prefix_only == False:
+            self.kv_server.lsh_retriever.clear()
+            self.kv_server.load_lsh_meta(prefix_id=1)
+
+        load_LSH = timers("load LSH meta").costs
+        logger.info(f"Load LSH Meta use: {load_LSH}")
+
         # Generate
         if debug_mode is None:
             if not overlap:
@@ -1138,7 +1145,8 @@ class OptLM:
         else:
             pass
             #self.kv_server.promote_persist(self.task.new_prefix_id)
-            #self.kv_server.reorder_persist(self.task.new_prefix_id)
+            self.kv_server.reorder_persist(self.task.new_prefix_id)
+            #self.kv_server.persist_kv_store_meta(self.task.new_prefix_id)
         self.kv_server.reset(switch=False)
 
         try:
@@ -1492,7 +1500,7 @@ def run_dapr_flexllmgen(args):
     num_prompts = args.num_gpu_batches * args.gpu_batch_size
     max_prompt_len, gen_len, cut_gen_len = args.prompt_len, args.gen_len, args.cut_gen_len
     
-    gpu = TorchDevice("cuda:0")
+    gpu = TorchDevice("cuda:2")
     cpu = TorchDevice("cpu")
     disk = TorchDisk(args.offload_dir)
     env = ExecutionEnv(gpu=gpu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gpu, cpu, disk]))
@@ -1511,7 +1519,7 @@ def run_dapr_flexllmgen(args):
                                       group_dim=2, symmetric=False))
     assert not (args.compress_cache and args.attn_sparsity < 1.0), "Not implemented"
 
-    opt_config = get_opt_config(args.model)
+    opt_config = get_opt_config(args.model, max_seq_len=8192)
     cache_size = opt_config.cache_bytes(num_prompts, max_prompt_len + gen_len)
     hidden_size = opt_config.hidden_bytes(num_prompts, max_prompt_len + gen_len)
     print(f"model size: {opt_config.model_bytes()/GB:.3f} GB, "
@@ -1523,7 +1531,7 @@ def run_dapr_flexllmgen(args):
     model = OptLM(opt_config, env, args.path, args.offload_dir, policy, args.prompt_len, args.gen_len, args.strategy)
 
     context, questions = process_dapr()
-    context = context[:8192]
+
     ### feed prefix
     prefix_input = get_tokenized_inputs(context, max_prompt_len=max_prompt_len, tokenizer=tokenizer)
     print(len(prefix_input[0]))
@@ -1536,6 +1544,9 @@ def run_dapr_flexllmgen(args):
     inputs = [context +  query + "\n" for query in questions]
     inputs_ids = tokenizer(inputs, truncation=True, max_length=max_prompt_len).input_ids
     
+    prefill_history = []
+    load_lsh_history = []
+
     for i in range(len(inputs)):
         global io_bytes 
         io_bytes = 0
@@ -1553,6 +1564,7 @@ def run_dapr_flexllmgen(args):
         timers("cache store").reset()
 
         timers("io part test").reset()
+        timers("load LSH meta").reset()
 
         output_ids = model.generate(
             inputs=[inputs_ids[i]], max_new_tokens = args.gen_len, debug_mode=args.debug_mode, 
@@ -1570,9 +1582,9 @@ def run_dapr_flexllmgen(args):
         end_cache_store = torch.cuda.Event(enable_timing=True)
         timers("cache store").start(start_cache_store.record())
 
-        if i==len(inputs)-1:
-            model.kv_server.persist_kv_store_meta(1)
-            model.kv_server.persist_queried_result(1);
+        # if i==len(inputs)-1:
+        #     model.kv_server.persist_kv_store_meta(1)
+        #     model.kv_server.persist_queried_result(1);
         
 
 
@@ -1590,6 +1602,7 @@ def run_dapr_flexllmgen(args):
         print("compute sum:",timers("compute").elapsed("sum"))
         print("compute:{}",timers("compute").costs)
         print("prefill:",timers("generate").costs[0])
+        prefill_history.append(timers("generate").costs[0])
         print((timers("imp io").elapsed("sum") + timers("imp calc").elapsed("sum"))/timers("generate").costs[0] * 100)
 
         print("imp load avg:",timers("imp load and compute").elapsed("average")) 
@@ -1606,13 +1619,23 @@ def run_dapr_flexllmgen(args):
         # if i!=0:
         #     print("average continue:", sum(average_continue_addr) / len(average_continue_addr))
         #     print("sum avg:", sum(average_continue_addr))
-        print("=" * 50)
+        load_lsh_history.append(timers("load LSH meta").elapsed("sum"))
 
     env.close_copy_threads()
 
     _, gpu_peak_mem = gpu.mem_stats()
     _, cpu_peak_mem = cpu.mem_stats()
     print(f"peak gpu mem: {gpu_peak_mem / GB:.3f} GB\t" + f"peak cpu mem: {cpu_peak_mem / GB:.3f} GB\t")
+    
+    if prefill_history:
+        recent_prefill = prefill_history[1:]
+        print(f"Last {len(recent_prefill)} prefill values: {recent_prefill}")
+        print(f"Average of last {len(recent_prefill)} prefill values: {sum(recent_prefill)/len(recent_prefill):.6f}")
+
+    if load_lsh_history:
+        recent_load_lsh = load_lsh_history[1:]
+        print(f"Last {len(recent_load_lsh)} load LSH values: {recent_load_lsh}")
+        print(f"Average of last {len(recent_load_lsh)} load LSH values: {sum(recent_load_lsh)/len(recent_load_lsh):.6f}")
 
 
 def run_prefix_flexllmgen(args):
@@ -1626,7 +1649,7 @@ def run_prefix_flexllmgen(args):
     num_prompts = args.num_gpu_batches * args.gpu_batch_size
     max_prompt_len, gen_len, cut_gen_len = args.prompt_len, args.gen_len, args.cut_gen_len
     
-    gpu = TorchDevice("cuda:0")
+    gpu = TorchDevice("cuda:2")
     cpu = TorchDevice("cpu")
     disk = TorchDisk(args.offload_dir)
     env = ExecutionEnv(gpu=gpu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gpu, cpu, disk]))

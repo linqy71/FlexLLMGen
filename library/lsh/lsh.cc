@@ -173,6 +173,7 @@ void LSH::fill(
   for (int j = 0; j < this->L; ++j)
   {
     for (int i = 0; i < this->num_key_value_heads; ++i)
+    //for (int i = 0; i < 3; ++i)
     {
       const int16_t *v_i = sorted_hash_code + i * (this->L * seq_len);
       int *ms_i = start + i * (this->L * num_buckets);
@@ -391,7 +392,9 @@ void LSH::batch_retrieve_multi(
   assert(nnz_pt.size(0) == this->batch_size * this->num_attention_heads);
 // cudaStreamSynchronize(this->stream);
 #pragma omp parallel for schedule(static, 1) num_threads(LSH_THREADS)
+//#pragma omp parallel for schedule(static, 1) num_threads(3)
   for (int head_id = 0; head_id < this->batch_size * this->num_attention_heads; ++head_id)
+  //for (int head_id = 0; head_id < this->batch_size * 3; ++head_id)
   {
     nnz[head_id] = this->retrieve_multi(
         layer_id,
