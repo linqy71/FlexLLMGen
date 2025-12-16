@@ -87,6 +87,30 @@ class LSHServer:
 
         self.copy_stream = torch.cuda.Stream(priority=-1)
     
+    def _warmup_lsh_kernels(self, q_len):
+        """warmup LSH kernel"""
+
+        dummy_query = torch.randn(
+            (q_len, self.num_attention_heads, self.head_dim),
+            device='cuda',
+            dtype=torch.float16
+        )
+        
+        with torch.cuda.stream(self.copy_stream):
+            query_states = dummy_query.transpose(0, 1).contiguous()
+            norm_q = query_states.reshape(-1, self.head_dim)
+            norm_q = norm_q / norm_q.norm(p=2, dim=-1, keepdim=True)
+            q_hashcode = torch.matmul(norm_q, self.hash_func).gt(0)
+            q_hashcode = q_hashcode.reshape(-1, self.K).to(torch.float16)
+            q_hashcode = torch.mv(q_hashcode, self.binary_pack).int()
+            q_hashcode = q_hashcode.reshape(self.num_attention_heads, q_len, self.L)
+
+            if q_len <= self.pinned_hashcode_multi.shape[1]:
+                self.pinned_hashcode_multi[..., :q_len, :].copy_(q_hashcode, non_blocking=True)
+        
+        self.copy_stream.synchronize()
+        
+        print("LSH kernel warmup done.")
 
     ### alloc buffer for offloaded tokens, seq_len is # of offloaded tokens
     ### called in offload_to_lsh()
@@ -201,6 +225,7 @@ class LSHServer:
         save_res: bool):
         if not self.offloaded or prefix_id == 0:
             return None, None
+        timers("hash compute").start()
         with torch.cuda.stream(self.copy_stream):
             q_len, _, _ = query_states.shape
             query_states = query_states.transpose(0,1).contiguous() # num_heads, q_len, head_dim
@@ -213,12 +238,16 @@ class LSHServer:
             q_hashcode = q_hashcode.reshape(self.num_attention_heads, q_len, self.L)
             
             self.pinned_hashcode_multi[...,:q_len,:].copy_(q_hashcode, non_blocking=True)
-        
+        self.copy_stream.synchronize()
+        timers("hash compute").stop()
         ### get results from lsh hashtables
-        self.results_lsh_cpu.zero_()
-        self.nnz.zero_()
+
+        timers("id retrieve").start()
+        # self.results_lsh_cpu.zero_()
+        # self.nnz.zero_()
         self.lsh_retriever.batch_retrieve_multi(layer_idx, self.pinned_hashcode_multi, q_len ,self.results_lsh_cpu, self.nnz, max_index)
-        
+        timers("id retrieve").stop()
+
         if save_res:
             save_dir = "/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/lqy/llm_infer/FlexLLMGen/analyze/longbench_sim_66b/" + str(req_id)
             if not os.path.exists(save_dir):

@@ -199,7 +199,7 @@ class InputEmbed:
             # w_token
             ((v, h), dtype, path + "decoder.embed_tokens.weight"),
             # w_pos
-            ((s + 2, h), dtype, path + "decoder.embed_positions.weight"),
+            ((s + 2, h), dtype, path + "decoder.et_embed_positions.weight"),
         ]
         weights = init_weight_list(weight_specs, self.policy, self.env)
 
@@ -768,7 +768,7 @@ class OptLM:
                  max_gen_len: int,
                  persist_strategy: str):
         if isinstance(config, str):
-            config = get_opt_config(config)
+            config = get_opt_config(config, max_seq_len=8192)
         self.config = config
         self.env = env
         self.path = path
@@ -827,7 +827,7 @@ class OptLM:
         self.kv_store_path = os.path.join(offload_dir, "kv_store")
         if not os.path.exists(self.kv_store_path):
             os.makedirs(self.kv_store_path)
-        self.kv_server = LSHServer(self.config, self.num_hidden_layers, self.kv_store_path, K=10, L=100, batch_size=1, max_length=8192, device='cuda:0')
+        self.kv_server = LSHServer(self.config, self.num_hidden_layers, self.kv_store_path, K=8, L=50, batch_size=1, max_length=8192, device='cuda:0')
         self.set_kv_server()
         
         for j in range(num_layers):
@@ -1073,6 +1073,9 @@ class OptLM:
         overlap = self.policy.overlap
         prompt_len, gen_len = task.prompt_len, task.gen_len
         self.execute_gen_len = task.cut_gen_len if task.cut_gen_len else task.gen_len
+        
+        q_len = prompt_len - sum(matched_prefix.values())
+        self.warmup_one_query(q_len)
 
         # Output token ids
         self.output_ids = np.full((len(task.inputs), prompt_len + gen_len),
@@ -1123,6 +1126,9 @@ class OptLM:
             raise ValueError("Invalid debug mode: {debug_mode}")
 
         return self.output_ids
+
+    def warmup_one_query(self, q_len):
+        self.kv_server._warmup_lsh_kernels(q_len)
 
     def finish_one_query(self, final=False):
         self.sync()
@@ -1511,7 +1517,7 @@ def run_dapr_flexllmgen(args):
                                       group_dim=2, symmetric=False))
     assert not (args.compress_cache and args.attn_sparsity < 1.0), "Not implemented"
 
-    opt_config = get_opt_config(args.model)
+    opt_config = get_opt_config(args.model, max_seq_len=8192)
     cache_size = opt_config.cache_bytes(num_prompts, max_prompt_len + gen_len)
     hidden_size = opt_config.hidden_bytes(num_prompts, max_prompt_len + gen_len)
     print(f"model size: {opt_config.model_bytes()/GB:.3f} GB, "
@@ -1523,7 +1529,7 @@ def run_dapr_flexllmgen(args):
     model = OptLM(opt_config, env, args.path, args.offload_dir, policy, args.prompt_len, args.gen_len, args.strategy)
 
     context, questions = process_dapr()
-    context = context[:8192]
+    # context = context[:8192]
     ### feed prefix
     prefix_input = get_tokenized_inputs(context, max_prompt_len=max_prompt_len, tokenizer=tokenizer)
     print(len(prefix_input[0]))
@@ -1536,7 +1542,8 @@ def run_dapr_flexllmgen(args):
     inputs = [context +  query + "\n" for query in questions]
     inputs_ids = tokenizer(inputs, truncation=True, max_length=max_prompt_len).input_ids
     
-    for i in range(len(inputs)):
+    # for i in range(len(inputs)):
+    for i in range(2):
         global io_bytes 
         io_bytes = 0
         global last_id,last_offset,cur_continue_addr,average_continue_addr
@@ -1553,6 +1560,8 @@ def run_dapr_flexllmgen(args):
         timers("cache store").reset()
 
         timers("io part test").reset()
+        timers("hash compute").reset()
+        timers("id retrieve").reset()
 
         output_ids = model.generate(
             inputs=[inputs_ids[i]], max_new_tokens = args.gen_len, debug_mode=args.debug_mode, 
@@ -1601,6 +1610,9 @@ def run_dapr_flexllmgen(args):
         print("io part test:", timers("io part test").costs)
         print("io part test avg:", timers("io part test").elapsed("average"))#attn load
         print("io part test sum:", timers("io part test").elapsed("sum"))
+        
+        print("hash compute:", timers("hash compute").costs)
+        print("id retrieve:", timers("id retrieve").costs)
         # print("total io token:", io_bytes)
         # print("total continue token", cur_continue_addr)
         # if i!=0:
