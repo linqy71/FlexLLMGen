@@ -404,7 +404,7 @@ class TorchDevice:
             # shape: (common_prefix_len, b * n_probe_head, head_dim)
             k = k_cache.data
         
-        timers("imp choose1").start()
+        #timers("imp choose1").start(torch.cuda.synchronize())
 
         n_probe_head = 3
         b, s, h = inputs.shape
@@ -435,9 +435,9 @@ class TorchDevice:
         # shape:(b * n_probe_head, head_dim, common_prefix_len)
         k = k.permute(1, 2, 0).reshape(b * n_probe_head, head_dim, common_prefix_len)
 
-        timers("imp choose1").stop()
+        #timers("imp choose1").stop(torch.cuda.synchronize())
 
-        timers("imp choose2").start()
+        #timers("imp choose2").start(torch.cuda.synchronize())
         # shape: (b * n_probe_head, s, common_prefix_len)
         attn_weights = torch.bmm(q, k)
         
@@ -455,11 +455,15 @@ class TorchDevice:
         _, topk_idx = torch.topk(attn_sum, k=n_important, dim=1)
         topk_idx = topk_idx.view(b, n_probe_head, n_important)
 
-        timers("imp choose2").stop()
+        #torch.cuda.synchronize()
 
-        timers("imp choose3").start()
+        #timers("imp choose2").stop(torch.cuda.synchronize())
+        
+        #timers("imp choose3").start(torch.cuda.synchronize())
         cpu_topk_idx = topk_idx.cpu().numpy()
+        #timers("imp choose3").stop(torch.cuda.synchronize())
 
+        #timers("imp choose4").start(torch.cuda.synchronize())
         S_imp = [[] for _ in range(b)]
         for i in range(b):
             for j in range(n_probe_head):
@@ -486,8 +490,8 @@ class TorchDevice:
                 imp_token_idx.append(list(range(common_prefix_len))) #表示加载全部kv
 
         k_cache.delete()
-
-        timers("imp choose3").stop()
+        #timers("imp choose4").stop(torch.cuda.synchronize())
+        
 
         return imp_token_idx
         
@@ -504,6 +508,7 @@ class TorchDevice:
         if compress_cache:
             # shape: (n_imp, b * n_head, head_dim)
             k = k_cache.device.decompress(k_cache)
+
             v = v_cache.device.decompress(v_cache)
         else:
             # shape: (n_imp, b * n_head, head_dim)
