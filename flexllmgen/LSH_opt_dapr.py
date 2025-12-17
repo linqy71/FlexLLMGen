@@ -46,7 +46,7 @@ def set_cpu_affinity(gpu_id, cpu_cores=None):
         if gpu_id < 4:
             cpu_cores = list(range(0, 32)) + list(range(64, 96))  # GPU0/1/2/3的亲和CPU
         else:
-            cpu_cores = list(range(12, 24)) + list(range(36, 48))  # GPU4/5/6/7的亲和CPU
+            cpu_cores = list(range(32, 64)) + list(range(96, 128))  # GPU4/5/6/7的亲和CPU
     
     try:
         process.cpu_affinity(cpu_cores)
@@ -54,7 +54,7 @@ def set_cpu_affinity(gpu_id, cpu_cores=None):
     except Exception as e:
         print(f"Set CPU affinity failed: {e}")
 
-set_cpu_affinity(2)
+set_cpu_affinity(0)
 
 from collections import defaultdict
 from datasets import load_dataset
@@ -517,7 +517,7 @@ class SelfAttention:
         seq_len, _, _ = k_new.shape
 
         if self.task.prefix_only:
-            print(f"offloading prefix {self.task.new_prefix_id} to LSH")
+            print(f"offloading prefix {self.task.new_prefix_id} to LSH", flush=True)
             self.kv_server.offload_to_lsh(self.layer_id, 0, seq_len, self.task.new_prefix_id, k_new.data, v_new.data)
             return
 
@@ -1112,6 +1112,9 @@ class OptLM:
 
         load_LSH = timers("load LSH meta").costs
         logger.info(f"Load LSH Meta use: {load_LSH}")
+        
+        load_table = timers("load table").costs
+        logger.info(f"Load table use: {load_table}")
 
         # Generate
         if debug_mode is None:
@@ -1510,7 +1513,7 @@ def run_dapr_flexllmgen(args):
     num_prompts = args.num_gpu_batches * args.gpu_batch_size
     max_prompt_len, gen_len, cut_gen_len = args.prompt_len, args.gen_len, args.cut_gen_len
     
-    gpu = TorchDevice("cuda:2")
+    gpu = TorchDevice("cuda:0")
     cpu = TorchDevice("cpu")
     disk = TorchDisk(args.offload_dir)
     env = ExecutionEnv(gpu=gpu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gpu, cpu, disk]))
@@ -1541,7 +1544,7 @@ def run_dapr_flexllmgen(args):
     model = OptLM(opt_config, env, args.path, args.offload_dir, policy, args.prompt_len, args.gen_len, args.strategy)
 
     context, questions = process_dapr()
-    context = context[:8192]
+    # context = context[:8192]
     ### feed prefix
     prefix_input = get_tokenized_inputs(context, max_prompt_len=max_prompt_len, tokenizer=tokenizer)
     print(len(prefix_input[0]))
@@ -1558,7 +1561,7 @@ def run_dapr_flexllmgen(args):
     load_lsh_history = []
 
     for i in range(len(inputs)):
-    # for i in range(2):
+    # for i in range(3):
         global io_bytes 
         io_bytes = 0
         global last_id,last_offset,cur_continue_addr,average_continue_addr
@@ -1578,6 +1581,8 @@ def run_dapr_flexllmgen(args):
 
         timers("io part test").reset()
         timers("load LSH meta").reset()
+        timers("load table").reset()
+        timers("build table").reset()
         timers("avgk").reset()
         timers("hash compute").reset()
         timers("id retrieve").reset()
@@ -1641,6 +1646,10 @@ def run_dapr_flexllmgen(args):
         
         print("hash compute sum:", timers("hash compute").elapsed("sum"))
         print("id retrieve:", timers("id retrieve").elapsed("sum"))
+
+        print("load table:", timers("load table").elapsed("sum"))
+        print("build table:", timers("build table").elapsed("sum"))
+
         # print("total io token:", io_bytes)
         # print("total continue token", cur_continue_addr)
         # if i!=0:
@@ -1676,7 +1685,7 @@ def run_prefix_flexllmgen(args):
     num_prompts = args.num_gpu_batches * args.gpu_batch_size
     max_prompt_len, gen_len, cut_gen_len = args.prompt_len, args.gen_len, args.cut_gen_len
     
-    gpu = TorchDevice("cuda:2")
+    gpu = TorchDevice("cuda:0")
     cpu = TorchDevice("cpu")
     disk = TorchDisk(args.offload_dir)
     env = ExecutionEnv(gpu=gpu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gpu, cpu, disk]))

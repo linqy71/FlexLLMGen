@@ -164,7 +164,7 @@ void LSH::fill(
 
   int seq_len = sorted_hash_code_pt.size(2);
   int stride = this->num_key_value_heads * this->L * this->num_buckets;
-  int16_t *sorted_hash_code = static_cast<int16_t *>(sorted_hash_code_pt.data_ptr());
+  uint8_t *sorted_hash_code = static_cast<uint8_t *>(sorted_hash_code_pt.data_ptr());
 
   int *start = this->table_start[layer_id] + request_id * stride;
   int *end = this->table_end[layer_id] + request_id * stride;
@@ -175,10 +175,10 @@ void LSH::fill(
     for (int i = 0; i < this->num_key_value_heads; ++i)
     //for (int i = 0; i < 3; ++i)
     {
-      const int16_t *v_i = sorted_hash_code + i * (this->L * seq_len);
+      const uint8_t *v_i = sorted_hash_code + i * (this->L * seq_len);
       int *ms_i = start + i * (this->L * num_buckets);
       int *me_i = end + i * (this->L * num_buckets);
-      const int16_t *v_ij = v_i + j * seq_len;
+      const uint8_t *v_ij = v_i + j * seq_len;
       int *ms_ij = ms_i + j * num_buckets;
       int *me_ij = me_i + j * num_buckets;
       for (int k = 0; k < seq_len; ++k)

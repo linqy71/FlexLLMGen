@@ -81,7 +81,7 @@ class LSHServer:
         self.pinned_queried_value = torch.zeros((self.max_length, self.num_key_value_heads, self.head_dim), dtype=torch.float16).pin_memory()
 
         ### store hashcode of prefix token key cache
-        self.hash_code_buffer =  torch.zeros((self.num_key_value_heads, self.L, self.max_length), dtype=torch.int16, device=self.device)
+        self.hash_code_buffer =  torch.zeros((self.num_key_value_heads, self.L, self.max_length), dtype=torch.uint8, device=self.device)
         self.sorted_hash_values_buffer :torch.Tensor = None
         self.sorted_hash_indices_buffer :torch.Tensor = None
 
@@ -89,6 +89,7 @@ class LSHServer:
         self.persist_strategy = [None for i in range(self.num_layers)]
 
         self.copy_stream = torch.cuda.Stream(priority=-1)
+        self.build_stream = torch.cuda.Stream()
     
     def _warmup_lsh_kernels(self, q_len):
         """warmup LSH kernel"""
@@ -118,8 +119,8 @@ class LSHServer:
     ### alloc buffer for offloaded tokens, seq_len is # of offloaded tokens
     ### called in offload_to_lsh()
     def alloc_buffer(self, seq_len):
-        self.sorted_hash_values_buffer = torch.zeros((self.num_key_value_heads, self.L, seq_len), dtype=torch.int16, device="cpu")
-        self.sorted_hash_indices_buffer = torch.zeros((self.num_key_value_heads, self.L, seq_len), dtype=torch.int32, device="cpu")
+        self.sorted_hash_values_buffer = torch.zeros((self.num_key_value_heads, self.L, seq_len), dtype=torch.uint8, device="cpu", pin_memory=True)
+        self.sorted_hash_indices_buffer = torch.zeros((self.num_key_value_heads, self.L, seq_len), dtype=torch.int32, device="cpu", pin_memory=True)
     
     ### offload key and value to lsh
     ### layer_idx: current layer index
@@ -143,7 +144,7 @@ class LSHServer:
         self.avg_k[layer_idx][request_id] = avg_k
         
         offload_len = offload_key.shape[1]
-        print(offload_key.shape, seq_len)
+        # print(offload_key.shape, seq_len, flush=True)
         self.alloc_buffer(offload_len)
         
         ### computing hashcode of offload keys
@@ -153,17 +154,17 @@ class LSHServer:
         hash_code = hash_code.reshape(-1, self.K).to(torch.float16)
         hash_code = torch.mv(hash_code, self.binary_pack)
         hash_code = hash_code.reshape(self.num_key_value_heads, -1, self.L)
-        hash_code = hash_code.transpose(1,2).contiguous().to(torch.int16)
+        hash_code = hash_code.transpose(1,2).contiguous().to(torch.uint8)
         self.hash_code_buffer[:,:,:offload_len].copy_(hash_code) #这里存hash_code，用于后面前缀kv直接查
 
-        #print("gpu ---> cpu")
+        # print("gpu ---> cpu", flush=True)
         offload_key = offload_key.cpu()
         offload_value = offload_value.cpu()
         
         ### offload to kv store
         self.kv_store.fill(layer_idx, offload_key, offload_value)
         
-        #print(f"offloading {offload_len}")
+        # print(f"offloading {offload_len}", flush=True)
         self.build_table(layer_idx, request_id, offload_len)
 
         self.sorted_hash_values_buffer.zero_()
@@ -173,7 +174,7 @@ class LSHServer:
         self.current_prefix_id = prefix_id
 
         if self.persisted == False:
-            print("into persist lsh meta")
+            print("into persist lsh meta", flush=True)
             avg_k_file = os.path.join(
                 self.kv_store_path,
                 f"avg_k_prefix_{prefix_id}_layer_{layer_idx}.pt"
@@ -195,15 +196,21 @@ class LSHServer:
         request_id: int,
         seq_len:int):
         
-        for i in range(self.num_key_value_heads):
-        #for i in range(3):
-            sorted_hash_values, sorted_hash_indices = self.hash_code_buffer[i,:,:seq_len].sort()
-            self.sorted_hash_values_buffer[i].copy_(sorted_hash_values)
-            self.sorted_hash_indices_buffer[i].copy_(sorted_hash_indices)
-        
-        torch.save(self.sorted_hash_values_buffer, self.kv_store_path + "/hash_values" + str(layer_idx))
-        torch.save(self.sorted_hash_indices_buffer, self.kv_store_path + "/hash_indices" + str(layer_idx))
-        
+        timers("build table").start()
+
+        # 一次性对所有头进行排序
+        # 假设hash_code_buffer形状为 [num_heads, batch_size, seq_len]
+        # 调整维度，使所有头在同一个维度
+        hash_codes = self.hash_code_buffer.view(-1, self.hash_code_buffer.size(-1))
+        sorted_hash_values, sorted_hash_indices = hash_codes[:, :seq_len].sort(dim=-1)
+
+        # 批量拷贝回缓冲区
+        self.sorted_hash_values_buffer.copy_(sorted_hash_values.view_as(self.sorted_hash_values_buffer), non_blocking=True)
+        self.sorted_hash_indices_buffer.copy_(sorted_hash_indices.view_as(self.sorted_hash_indices_buffer), non_blocking=True)
+
+        # 等待拷贝完成
+        torch.cuda.synchronize()
+        timers("build table").stop()
         self.lsh_retriever.fill(layer_idx, request_id,
                     self.sorted_hash_values_buffer, 
                     self.sorted_hash_indices_buffer)
@@ -521,35 +528,9 @@ class LSHServer:
             else:
                 print(f"File {file_path} does not exist. Cannot recover queried results for layer {layer_idx}.")
     
-    # def recover_kv_store_meta(self, prefix_id:int):
-    #     self.offloaded = True
-    #     self.kv_store.recover_meta("/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/lqy/llm_infer/tmp_store", prefix_id)
-
-    #     for layer_idx in range(self.num_layers):
-    #         if layer_idx in self.dense_layers:
-    #             continue
-    #         self.recover_lsh(layer_idx)
-        
-    # def recover_lsh(self,
-    #     layer_idx:int):
-      
-    #     hash_code = torch.load(f"/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/lqy/llm_infer/MagicPIG/examples/snapshots/hash_code_layer{layer_idx}.pt")
-    #     _,_,seq_len = hash_code.shape
-        
-    #     self.offload_len = seq_len
-    #     self.alloc_buffer(seq_len)
-        
-    #     self.hash_code_buffer[:,:,:seq_len].copy_(hash_code)
-    #     self.build_table(layer_idx, 0, seq_len)
     def load_lsh_meta(self, prefix_id):
         self.offloaded = True
         self.current_prefix_id = prefix_id
-
-        timers("load LSH meta").start()
-        # 恢复 KVStore meta
-        # if self.persisted == True:
-        #     self.recover_kv_store_meta(prefix_id)
-        timers("load LSH meta").stop()
 
         timers("load LSH meta").start()
 
@@ -564,34 +545,46 @@ class LSHServer:
                 self.kv_store_path,
                 f"hash_code_prefix_{prefix_id}_layer_{layer_idx}.pt"
             )
-            if os.path.exists(hash_code_file):
-                loaded_hash_code = torch.load(hash_code_file)
-                _, _, seq_len = loaded_hash_code.shape
-                self.offload_len = seq_len
-
+            timers("load table").start()
+            loaded_hash_code = torch.load(hash_code_file)
+            timers("load table").stop()
+            _, _, seq_len = loaded_hash_code.shape
+            self.offload_len = seq_len
+            if layer_idx == 0:
                 self.alloc_buffer(seq_len)
-                
-                self.hash_code_buffer[:,:,:seq_len].copy_(loaded_hash_code)
-                #self.hash_code_buffer[:3,:,:seq_len].copy_(loaded_hash_code)
-                self.build_table(layer_idx, 0, seq_len)
-            else:
-                print(f"[WARN] hash_code file not found: {hash_code_file}")
-        
+            
+            self.hash_code_buffer[:,:,:seq_len].copy_(loaded_hash_code)
+
+            #### build table 
+            
+            self.build_table(layer_idx, 0, seq_len)
+            
         timers("load LSH meta").stop()
 
     def load_lsh_meta_concurrent(self, prefix_id):
         pass
     
-    def load_bulid_table(self, 
+    def load_build_table(self, 
         layer_idx:int,
         request_id: int,
         seq_len:int,
         code_buffer):
+        events = []
         for i in range(self.num_key_value_heads):
-        #for i in range(3):
-            sorted_hash_values, sorted_hash_indices = code_buffer[i,:,:seq_len].sort()
-            self.sorted_hash_values_buffer[i].copy_(sorted_hash_values)
-            self.sorted_hash_indices_buffer[i].copy_(sorted_hash_indices)
+            sorted_hash_values, sorted_hash_indices = code_buffer[i, :, :seq_len].sort()
+            sort_done = torch.cuda.Event(enable_timing=False)
+            sort_done.record()
+            with torch.cuda.stream(self.copy_stream):
+                self.copy_stream.wait_event(sort_done)
+                self.sorted_hash_values_buffer[i].copy_(sorted_hash_values, non_blocking=True)
+                self.sorted_hash_indices_buffer[i].copy_(sorted_hash_indices, non_blocking=True)
+                copy_done = torch.cuda.Event(enable_timing=False)
+                copy_done.record(self.copy_stream)
+                events.append(copy_done)
+        
+        for event in events:
+            event.synchronize()
+        self.copy_stream.synchronize()
         
         self.lsh_retriever.fill(layer_idx, request_id,
                     self.sorted_hash_values_buffer, 
