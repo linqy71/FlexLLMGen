@@ -101,7 +101,8 @@ uint64_t KVStore::get_meta_id(int token_id, int layer_id, int head_id){
 
 void KVStore::persist_meta(int prefix_id) {
     std::string meta_file = this->store_path + "/" + std::to_string(prefix_id) + ".meta";
-    std::ofstream file(meta_file, std::ios::app);
+    //std::ofstream file(meta_file, std::ios::app);
+    std::ofstream file(meta_file, std::ios::binary | std::ios::trunc);
     std::stringstream ss;
     for (const auto &[id, meta] : *kv_meta) {
         ss << id << " " << meta.file_index << " " << meta.offset << "\n";
@@ -109,9 +110,13 @@ void KVStore::persist_meta(int prefix_id) {
     file.write(ss.str().data(), ss.str().size());
     file.flush();
     file.close();
+    
+    std::cout<<"Successfully persist kvstore meta"<<std::endl;
 }
 
 void KVStore::recover_meta(std::string path, int prefix_id) {
+    auto start_time = std::chrono::high_resolution_clock::now();
+
     this->store_path = path;
     std::string meta_file = this->store_path + "/" + std::to_string(prefix_id) + ".meta";
     std::ifstream file(meta_file);
@@ -126,6 +131,10 @@ void KVStore::recover_meta(std::string path, int prefix_id) {
     }
     file.close();
     this->persisted = true;
+
+    auto end_time = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> duration = end_time - start_time;
+    std::cout << "[TIMER] recover_meta for prefix " << prefix_id << " took " << duration.count() << " seconds." << std::endl;
 }
 
 // void KVStore::write_to_storage(
