@@ -77,6 +77,9 @@ class LSHServer:
         self.pinned_hashcode_multi = torch.zeros((self.num_attention_heads, self.max_query_tokens, self.L), dtype=torch.int32).pin_memory()
         self.pinned_hashcode = torch.zeros((self.num_attention_heads, self.L), dtype=torch.int32).pin_memory()
 
+        self.pinned_queried_key = torch.zeros((self.max_length, self.num_key_value_heads, self.head_dim), dtype=torch.float16).pin_memory()
+        self.pinned_queried_value = torch.zeros((self.max_length, self.num_key_value_heads, self.head_dim), dtype=torch.float16).pin_memory()
+
         ### store hashcode of prefix token key cache
         self.hash_code_buffer =  torch.zeros((self.num_key_value_heads, self.L, self.max_length), dtype=torch.int16, device=self.device)
         self.sorted_hash_values_buffer :torch.Tensor = None
@@ -280,13 +283,18 @@ class LSHServer:
         res_len = self.nnz.max().data
         queried_key = self.kv_store.get_queried_key_cache()  # collect后保存在kvstore里,这里将数据包装成tensor后拿出来
         queried_value = self.kv_store.get_queried_value_cache()
-        
+
+        timers("avgk").start()
         avg_k = self.avg_k[layer_idx][req_id].to("cpu")
-        queried_key = queried_key + avg_k
+        queried_key += avg_k
         queried_key = queried_key[...,:res_len,:].transpose(0,1)
         queried_value = queried_value[...,:res_len,:].transpose(0,1)
+        self.pinned_queried_key[:res_len].copy_(queried_key)
+        self.pinned_queried_value[:res_len].copy_(queried_value)
 
-        return queried_key, queried_value
+        timers("avgk").stop()
+
+        return self.pinned_queried_key[:res_len], self.pinned_queried_value[:res_len]
 
     ### for debug...
     ### get full kv from kv_store by generating indices of range(offloaded_len)
@@ -302,7 +310,7 @@ class LSHServer:
         queried_key = self.kv_store.get_queried_key_cache()
         queried_value = self.kv_store.get_queried_value_cache()
         avg_k = self.avg_k[layer_idx][req_id].to("cpu")
-        queried_key = queried_key + avg_k
+        queried_key += avg_k
         res_len = self.nnz.max().data
         
         queried_key = queried_key.transpose(0,1).contiguous()

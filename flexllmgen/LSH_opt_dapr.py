@@ -572,11 +572,13 @@ class SelfAttention:
                 for prefix_id, max_common_len in matched_prefix.items():
                     ## j is layer_id
                     ## get query_states from compute
+                    timers("imp calc").start()
                     query_states = self.compute.get_suffix_query_states(h, mask, w_q, b_q, 
                         w_ln, b_ln, n_head, k_cache, donate, self.policy.compress_cache, 
                         self.policy.comp_cache_config, matched_prefix)
-                    timers("imp calc").start()
+                    timers("lsh calc").start()
                     self.kv_server.lsh_retrieve(self.task.req_id, self.layer_id, query_states, prefix_id, max_common_len, self.task.save_res)
+                    timers("lsh calc").stop()
                     timers("imp calc").stop()
                     timers("imp load and compute").start()
                     
@@ -584,10 +586,12 @@ class SelfAttention:
                         
                     # k_cache_data, v_cache_data = self.kv_server.get_full_kv(0, self.layer_id, query_states, prefix_id)
                     # print(k_cache_data)
+                    timers("copy prefix").start()
                     with torch.cuda.stream(self.copy_stream):
                         # k_cache_data, v_cache_data = self.kv_server.get_full_kv(0, j, query_states, prefix_id)
                         length = self.copy_prefix(k_cache, k_cache_data, cur_pos)
                         length = self.copy_prefix(v_cache, v_cache_data, cur_pos)
+                    timers("copy prefix").stop()
                     timers("imp load and compute").stop()
                     cur_pos += length
                 # n_imp = cur_pos
@@ -1542,8 +1546,8 @@ def run_dapr_flexllmgen(args):
     inputs = [context +  query + "\n" for query in questions]
     inputs_ids = tokenizer(inputs, truncation=True, max_length=max_prompt_len).input_ids
     
-    # for i in range(len(inputs)):
-    for i in range(2):
+    for i in range(len(inputs)):
+    # for i in range(2):
         global io_bytes 
         io_bytes = 0
         global last_id,last_offset,cur_continue_addr,average_continue_addr
@@ -1555,11 +1559,14 @@ def run_dapr_flexllmgen(args):
         timers("generate").reset()
         timers("imp io").reset()
         timers("imp calc").reset()
+        timers("lsh calc").reset()
         timers("compute").reset()
         timers("imp load and compute").reset()
+        timers("copy prefix").reset()
         timers("cache store").reset()
 
         timers("io part test").reset()
+        timers("avgk").reset()
         timers("hash compute").reset()
         timers("id retrieve").reset()
 
@@ -1593,6 +1600,8 @@ def run_dapr_flexllmgen(args):
         print("imp io sum:",timers("imp io").elapsed("sum"))
         print("imp calc average:",timers("imp calc").elapsed("average"))
         print("imp calc sum:",timers("imp calc").elapsed("sum")) #hash comp
+        print("lsh calc average:",timers("lsh calc").elapsed("average"))
+        print("lsh calc sum:",timers("lsh calc").elapsed("sum"))
         #print("imp io:{}",timers("imp io").costs)
         #print("imp calc:{}",timers("imp calc").costs)
         print("compute average:",timers("compute").elapsed("average")) # attn comp
@@ -1603,6 +1612,10 @@ def run_dapr_flexllmgen(args):
 
         print("imp load avg:",timers("imp load and compute").elapsed("average")) 
         print("imp load sum:",timers("imp load and compute").elapsed("sum"))
+        
+        print("copy prefix:",timers("copy prefix").costs)
+        print("copy prefix sum:",timers("copy prefix").elapsed("sum"))
+
         print("store cache:",timers("cache store").costs)
         print("generate:", timers("generate").costs)
         print("generate sum:", timers("generate").elapsed("sum"))
@@ -1610,9 +1623,11 @@ def run_dapr_flexllmgen(args):
         print("io part test:", timers("io part test").costs)
         print("io part test avg:", timers("io part test").elapsed("average"))#attn load
         print("io part test sum:", timers("io part test").elapsed("sum"))
+
+        print("avgk sum:", timers("avgk").elapsed("sum"))
         
-        print("hash compute:", timers("hash compute").costs)
-        print("id retrieve:", timers("id retrieve").costs)
+        print("hash compute sum:", timers("hash compute").elapsed("sum"))
+        print("id retrieve:", timers("id retrieve").elapsed("sum"))
         # print("total io token:", io_bytes)
         # print("total continue token", cur_continue_addr)
         # if i!=0:

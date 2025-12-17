@@ -18,10 +18,6 @@ class LSH{
         ~LSH();
         void alloc(int K, int L, int num_layers, int num_attention_heads, int num_key_value_heads, int batch_size, int max_length);
         void fill(int layer_id, int request_id, torch::Tensor sorted_hash_code_pt, torch::Tensor sorted_indices_pt);
-        void save_to_file(const std::string filename);
-        void save_sparse_array(std::ofstream& out, const int* data, size_t size);
-        void load_from_file(const std::string filename);
-        void load_sparse_array(std::ifstream& in, int* data, size_t total_size);
         void fastfill(int layer_id, int request_id, torch::Tensor hash_code_pt);
         void copy(torch::Tensor query_pt);
         void clear();
