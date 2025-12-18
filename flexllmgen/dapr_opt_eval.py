@@ -210,7 +210,7 @@ class InputEmbed:
             # w_token
             ((v, h), dtype, path + "decoder.embed_tokens.weight"),
             # w_pos
-            ((s + 2, h), dtype, path + "decoder.embed_positions.weight"),
+            ((s + 2, h), dtype, path + "decoder.et_embed_positions.weight"),
         ]
         weights = init_weight_list(weight_specs, self.policy, self.env)
 
@@ -849,7 +849,7 @@ class OptLM:
                  max_prompt_len: int,
                  max_gen_len: int):
         if isinstance(config, str):
-            config = get_opt_config(config)
+            config = get_opt_config(config, max_seq_len=8192)
         self.config = config
         self.env = env
         self.path = path
@@ -1946,7 +1946,7 @@ def run_prefix_flexllmgen(args):
                                       group_dim=2, symmetric=False))
     assert not (args.compress_cache and args.attn_sparsity < 1.0), "Not implemented"
 
-    opt_config = get_opt_config(args.model)
+    opt_config = get_opt_config(args.model, max_seq_len=8192)
     cache_size = opt_config.cache_bytes(num_prompts, max_prompt_len + gen_len)
     hidden_size = opt_config.hidden_bytes(num_prompts, max_prompt_len + gen_len)
     print(f"model size: {opt_config.model_bytes()/GB:.3f} GB, "
@@ -2125,7 +2125,7 @@ def get_model(args):
                     important_ratio=args.important_ratio)
     assert not (args.compress_cache and args.attn_sparsity < 1.0), "Not implemented"
 
-    opt_config = get_opt_config(args.model)
+    opt_config = get_opt_config(args.model, max_seq_len=8192)
     cache_size = opt_config.cache_bytes(num_prompts, max_prompt_len + gen_len)
     hidden_size = opt_config.hidden_bytes(num_prompts, max_prompt_len + gen_len)
     print(f"model size: {opt_config.model_bytes()/GB:.3f} GB, "
