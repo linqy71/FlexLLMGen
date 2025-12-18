@@ -91,6 +91,9 @@ class ChunkPool:
 
         self.cpu_buf = torch.empty((1 * GB,), dtype=torch.float16, pin_memory=True)
 
+        self.cpu_buf_k = torch.empty((8192, batch_size * self.n_head, self.head_dim), dtype=torch.float16, pin_memory=True)
+        self.cpu_buf_v = torch.empty((8192, batch_size * self.n_head, self.head_dim), dtype=torch.float16, pin_memory=True)        
+
     @classmethod
     def next_chunk_id(cls):
         return next(cls.chunk_id)
@@ -422,7 +425,7 @@ class ChunkPool:
         #     for future in as_completed(copy_futures):
         #         future.result() # 检查是否有异常
 
-
+        timers("chunk io").start()
         for chunk_id, store_ptr in req.items():
             # 从预加载的字典中获取数据
             k_data, v_data = loaded_chunks[chunk_id]
@@ -434,6 +437,173 @@ class ChunkPool:
             
             # 更新分数
             self.update_score(chunk_id, len(store_ptr))
+        timers("chunk io").stop()
+        last_io_time = timers("chunk io").costs[-1]
+        logger.info(f"chunk iteration time:{last_io_time}")
+    
+    def get_full_head_cache_concurrent_once(self, k_cache, v_cache, req):
+        loaded_chunks = {}
+
+        def _load_chunk_data(chunk_id):
+            src_chunk = self.get_chunk_data(chunk_id)
+            full_head_k = src_chunk.full_head_k
+            full_head_v = src_chunk.full_head_v
+
+            if full_head_k.device.device_type == DeviceType.DISK:
+                # k_data = torch.from_numpy(np.load(full_head_k.data)).pin_memory()
+                # v_data = torch.from_numpy(np.load(full_head_v.data)).pin_memory()
+                k_data = torch.from_numpy(np.load(full_head_k.data))
+                v_data = torch.from_numpy(np.load(full_head_v.data))
+            else:
+                k_data = map_to_torch_tensor(full_head_k, None)
+                v_data = map_to_torch_tensor(full_head_v, None)
+            
+            return chunk_id, k_data, v_data
+        
+
+        timers("chunk io").start()
+        with ThreadPoolExecutor() as executor:
+            future_to_chunk_id = {executor.submit(_load_chunk_data, chunk_id): chunk_id for chunk_id in req.keys()}
+            
+            for future in as_completed(future_to_chunk_id):
+                chunk_id, k_data, v_data = future.result()
+                loaded_chunks[chunk_id] = (k_data, v_data)
+        timers("chunk io").stop()
+        last_io_time = timers("chunk io").costs[-1]
+        num_chunks = len(req)
+        bytes_per_chunk = self.chunk_size * self.n_head * self.head_dim * 2 * 2
+        total_bytes_read = num_chunks * bytes_per_chunk
+
+        if last_io_time > 0:
+            bandwidth_bps = total_bytes_read / last_io_time
+            bandwidth_mbps = bandwidth_bps / (1024 * 1024)
+        else:
+            bandwidth_mbps = float('inf')
+
+        print(f"Chunk IO Time: {last_io_time:.4f} s, Chunks Read: {num_chunks}, Calculated Bandwidth: {bandwidth_mbps:.2f} MB/s")
+        
+        timers("chunk io").start()
+        for chunk_id, store_ptr in req.items():
+                k_data, v_data = loaded_chunks[chunk_id]
+                if not store_ptr:
+                    continue
+                src_offsets = [item[0] for item in store_ptr]
+                dst_offsets = [item[1] for item in store_ptr]
+
+                self.cpu_buf_k[dst_offsets] = k_data[src_offsets]
+                self.cpu_buf_v[dst_offsets] = v_data[src_offsets]
+            #self.update_score(chunk_id, len(store_ptr))
+        timers("chunk io").stop()
+        k_len = k_cache.shape[0]
+        k_cache.data.copy_(self.cpu_buf_k[:k_len], non_blocking=True)
+        v_cache.data.copy_(self.cpu_buf_v[:k_len], non_blocking=True)
+        
+        last_io_time = timers("chunk io").costs[-1]
+        logger.info(f"chunk iteration time:{last_io_time}")
+    
+
+    def get_full_head_cache_concurrent_merge(self, k_cache, v_cache, req):
+        loaded_chunks = {}
+
+        def _load_chunk_data(chunk_id):
+            src_chunk = self.get_chunk_data(chunk_id)
+            full_head_k = src_chunk.full_head_k
+            full_head_v = src_chunk.full_head_v
+
+            if full_head_k.device.device_type == DeviceType.DISK:
+                k_data = torch.from_numpy(np.load(full_head_k.data)).pin_memory()
+                v_data = torch.from_numpy(np.load(full_head_v.data)).pin_memory()
+            else:
+                k_data = map_to_torch_tensor(full_head_k, None)
+                v_data = map_to_torch_tensor(full_head_v, None)
+            
+            return chunk_id, k_data, v_data
+
+        timers("chunk io").start()
+        with ThreadPoolExecutor() as executor:
+            future_to_chunk_id = {executor.submit(_load_chunk_data, chunk_id): chunk_id for chunk_id in req.keys()}
+            
+            for future in as_completed(future_to_chunk_id):
+                chunk_id, k_data, v_data = future.result()
+                loaded_chunks[chunk_id] = (k_data, v_data)
+        timers("chunk io").stop()
+        
+        last_io_time = timers("chunk io").costs[-1]
+        num_chunks = len(req)
+        bytes_per_chunk = self.chunk_size * self.n_head * self.head_dim * 2 * 2  # K + V
+        total_bytes_read = num_chunks * bytes_per_chunk
+
+        if last_io_time > 0:
+            bandwidth_bps = total_bytes_read / last_io_time
+            bandwidth_mbps = bandwidth_bps / (1024 * 1024)
+        else:
+            bandwidth_mbps = float('inf')
+        print(f"Chunk IO Time: {last_io_time:.4f} s, Chunks Read: {num_chunks}, Calculated Bandwidth: {bandwidth_mbps:.2f} MB/s")
+
+        # 阶段2：创建 CPU 缓冲区
+        k_shape = k_cache.shape
+        k_dtype = k_cache.dtype
+        v_shape = v_cache.shape
+        v_dtype = v_cache.dtype
+        cpu_buf_k = torch.empty(k_shape, dtype=k_dtype, pin_memory=True)
+        cpu_buf_v = torch.empty(v_shape, dtype=v_dtype, pin_memory=True)
+
+        timers("chunk io").reset()
+        
+        # 阶段3：合并连续的复制请求并执行
+        num_merged = 0
+        for chunk_id, store_ptr in req.items():
+            k_data, v_data = loaded_chunks[chunk_id]
+            
+            if not store_ptr:
+                continue
+            
+            # 合并连续的复制请求
+            # store_ptr 是 [(src_offset, dst_offset), ...] 的列表
+            merged_ranges = []
+            
+            first_src, first_dst = store_ptr[0]
+            current_src_start = first_src
+            current_dst_start = first_dst
+            current_length = 1
+            
+            for i in range(1, len(store_ptr)):
+                src_offset, dst_offset = store_ptr[i]
+                prev_src, prev_dst = store_ptr[i - 1]
+                
+                # 检查是否连续：src 和 dst 都连续递增
+                if src_offset == prev_src + 1 and dst_offset == prev_dst + 1:
+                    # 连续，扩展当前范围
+                    current_length += 1
+                else:
+                    # 不连续，保存当前范围，开始新范围
+                    merged_ranges.append((current_src_start, current_dst_start, current_length))
+                    current_src_start = src_offset
+                    current_dst_start = dst_offset
+                    current_length = 1
+            
+            # 保存最后一个范围
+            merged_ranges.append((current_src_start, current_dst_start, current_length))
+            num_merged += len(merged_ranges)
+            
+            timers("chunk io").start()
+            # 执行合并后的批量复制
+            for src_start, dst_start, length in merged_ranges:
+                cpu_buf_k[dst_start:dst_start + length, :, :].copy_(
+                    k_data[src_start:src_start + length, :, :]
+                )
+                cpu_buf_v[dst_start:dst_start + length, :, :].copy_(
+                    v_data[src_start:src_start + length, :, :]
+                )
+            timers("chunk io").stop()
+            self.update_score(chunk_id, len(store_ptr))
+
+        # 阶段4：一次性拷贝到目标 GPU 缓存
+        k_cache.data.copy_(cpu_buf_k, non_blocking=True)
+        v_cache.data.copy_(cpu_buf_v, non_blocking=True)
+        
+        last_io_time = timers("chunk io").elapsed("sum")
+        logger.info(f"full_head chunk transfer time: {last_io_time:.4f}s, merged copies: {num_merged}")
     
     def get_full_head_cache_async_run(self, k_cache, v_cache, req):
         asyncio.run(self.get_full_head_cache_async(k_cache, v_cache, req))
@@ -750,8 +920,8 @@ class ProbeChunkPool:
 
         n_head = config.n_head
         n_probe_head = 3
-        head_dim = config.input_dim // config.n_head
-        self.chunk_shape = (chunk_size, batch_size * n_probe_head, head_dim)
+        self.head_dim = config.input_dim // config.n_head
+        self.chunk_shape = (chunk_size, batch_size * n_probe_head, self.head_dim)
 
         self.env = env
         self.gpu = env.gpu
@@ -764,6 +934,9 @@ class ProbeChunkPool:
         self.current_offset = None
 
         self.cpu_buf = torch.empty((1 * GB,), dtype=torch.float16, pin_memory=True)
+
+        self.cpu_buf_k = torch.empty((8192, batch_size * 3 ,self.head_dim), dtype=torch.float16, pin_memory=True)
+
     @classmethod
     def next_chunk_id(cls):
         return next(cls.probe_chunk_id)
@@ -831,4 +1004,206 @@ class ProbeChunkPool:
         
         for src_offset, dst_offset in store_ptr:
             k_cache.data[dst_offset:dst_offset + 1, :, :].copy_(k_data[src_offset:src_offset + 1, :, :], non_blocking=True)
+
+    def get_probe_cache_concurrent(self, k_cache, req):
+        loaded_chunks = {}
+        
+        def _load_chunk_data(chunk_id):
+            src_chunk = self.chunk_table[chunk_id]
+            probe_k = src_chunk.probe_k
+
+            if probe_k.device.device_type == DeviceType.DISK:
+                k_data = torch.from_numpy(np.load(probe_k.data))
+            else:
+                k_data = map_to_torch_tensor(probe_k, None)
+            
+            return chunk_id, k_data
+        
+        timers("probe chunk io").start()
+        with ThreadPoolExecutor() as executor:
+            future_to_chunk_id = {executor.submit(_load_chunk_data, chunk_id): chunk_id for chunk_id in req.keys()}
+            
+            for future in as_completed(future_to_chunk_id):
+                chunk_id, k_data = future.result()
+                loaded_chunks[chunk_id] = k_data
+        
+        timers("probe chunk io").stop()
+        last_io_time = timers("probe chunk io").costs[-1]
+        num_chunks = len(req)
+        bytes_per_chunk = self.chunk_size * 3 * self.head_dim * 2
+        total_bytes_read = num_chunks * bytes_per_chunk
+
+        if last_io_time > 0:
+            bandwidth_bps = total_bytes_read / last_io_time
+            bandwidth_mbps = bandwidth_bps / (1024 * 1024)
+        else:
+            bandwidth_mbps = float('inf')
+        print(f"Probe Chunk IO Time: {last_io_time:.4f} s, Chunks Read: {num_chunks}, Calculated Bandwidth: {bandwidth_mbps:.2f} MB/s")
+        
+        for chunk_id, store_ptr in req.items():
+            k_data = loaded_chunks[chunk_id]
+            for src_offset, dst_offset in store_ptr:
+                k_cache.data[dst_offset:dst_offset + 1, :, :].copy_(k_data[src_offset:src_offset + 1, :, :], non_blocking=True)
+
+    def get_probe_cache_concurrent_once(self, k_cache, req):
+        loaded_chunks = {}
+        
+        def _load_chunk_data(chunk_id):
+            src_chunk = self.chunk_table[chunk_id]
+            probe_k = src_chunk.probe_k
+
+            if probe_k.device.device_type == DeviceType.DISK:
+                k_data = torch.from_numpy(np.load(probe_k.data)).pin_memory()
+            else:
+                k_data = map_to_torch_tensor(probe_k, None)
+            
+            return chunk_id, k_data
+        
+        timers("chunk io").start()
+        with ThreadPoolExecutor() as executor:
+            future_to_chunk_id = {executor.submit(_load_chunk_data, chunk_id): chunk_id for chunk_id in req.keys()}
+            
+            for future in as_completed(future_to_chunk_id):
+                chunk_id, k_data = future.result()
+                loaded_chunks[chunk_id] = k_data
+        
+        timers("chunk io").stop()
+        last_io_time = timers("chunk io").costs[-1]
+        num_chunks = len(req)
+        bytes_per_chunk = self.chunk_size * 3 * self.head_dim * 2
+        total_bytes_read = num_chunks * bytes_per_chunk
+
+        if last_io_time > 0:
+            bandwidth_bps = total_bytes_read / last_io_time
+            bandwidth_mbps = bandwidth_bps / (1024 * 1024)
+        else:
+            bandwidth_mbps = float('inf')
+        print(f"Probe Chunk IO Time: {last_io_time:.4f} s, Chunks Read: {num_chunks}, Calculated Bandwidth: {bandwidth_mbps:.2f} MB/s")
+                
+        timers("chunk io").start()
+        
+        for chunk_id, store_ptr in req.items():
+            k_data = loaded_chunks[chunk_id]
+            for src_offset, dst_offset in store_ptr:
+                self.cpu_buf_k[dst_offset:dst_offset + 1, :, :].copy_(k_data[src_offset:src_offset + 1, :, :])
+        
+        timers("chunk io").stop()
+        
+
+        k_len = k_cache.shape[0]
+        k_cache.data.copy_(self.cpu_buf_k[:k_len], non_blocking=True)
+        
+        last_io_time = timers("chunk io").costs[-1]
+        logger.info(f"probe chunk iteration time:{last_io_time}")
     
+    def get_probe_cache_concurrent_merge(self, k_cache, req):
+        loaded_chunks = {}
+        
+        def _load_chunk_data(chunk_id):
+            src_chunk = self.chunk_table[chunk_id]
+            probe_k = src_chunk.probe_k
+
+            if probe_k.device.device_type == DeviceType.DISK:
+                k_data = torch.from_numpy(np.load(probe_k.data))
+            else:
+                k_data = map_to_torch_tensor(probe_k, None)
+            
+            return chunk_id, k_data
+        
+        timers("chunk io").start()
+        with ThreadPoolExecutor() as executor:
+            future_to_chunk_id = {executor.submit(_load_chunk_data, chunk_id): chunk_id for chunk_id in req.keys()}
+            
+            for future in as_completed(future_to_chunk_id):
+                chunk_id, k_data = future.result()
+                loaded_chunks[chunk_id] = k_data
+        
+        timers("chunk io").stop()
+        last_io_time = timers("chunk io").costs[-1]
+        num_chunks = len(req)
+        bytes_per_chunk = self.chunk_size * 3 * self.head_dim * 2
+        total_bytes_read = num_chunks * bytes_per_chunk
+
+        if last_io_time > 0:
+            bandwidth_bps = total_bytes_read / last_io_time
+            bandwidth_mbps = bandwidth_bps / (1024 * 1024)
+        else:
+            bandwidth_mbps = float('inf')
+        print(f"Probe Chunk IO Time: {last_io_time:.4f} s, Chunks Read: {num_chunks}, Calculated Bandwidth: {bandwidth_mbps:.2f} MB/s")
+
+        k_shape = k_cache.shape
+        k_dtype = k_cache.dtype
+        cpu_buf_k = torch.empty(k_shape, dtype=k_dtype, pin_memory=True)
+        
+        timers("chunk io").reset()
+        
+        num_merged = 0
+        for chunk_id, store_ptr in req.items():
+            k_data = loaded_chunks[chunk_id]
+            
+            if not store_ptr:
+                continue
+            
+            # 合并连续的复制请求
+            # store_ptr 是 [(src_offset, dst_offset), ...] 的列表，src_offset 递增
+            merged_ranges = []
+            
+            # 初始化第一个范围
+            first_src, first_dst = store_ptr[0]
+            current_src_start = first_src
+            current_dst_start = first_dst
+            current_length = 1
+            
+            for i in range(1, len(store_ptr)):
+                src_offset, dst_offset = store_ptr[i]
+                prev_src, prev_dst = store_ptr[i - 1]
+                
+                # 检查是否连续：src 和 dst 都连续递增
+                if src_offset == prev_src + 1 and dst_offset == prev_dst + 1:
+                    # 连续，扩展当前范围
+                    current_length += 1
+                else:
+                    # 不连续，保存当前范围，开始新范围
+                    merged_ranges.append((current_src_start, current_dst_start, current_length))
+                    current_src_start = src_offset
+                    current_dst_start = dst_offset
+                    current_length = 1
+            
+            # 保存最后一个范围
+            merged_ranges.append((current_src_start, current_dst_start, current_length))
+            num_merged += len(merged_ranges)
+            timers("chunk io").start()
+            # 执行合并后的复制
+            for src_start, dst_start, length in merged_ranges:
+                cpu_buf_k[dst_start:dst_start + length, :, :].copy_(
+                    k_data[src_start:src_start + length, :, :]
+                )
+            timers("chunk io").stop()
+        # 一次性拷贝到目标缓存
+        k_cache.data.copy_(cpu_buf_k, non_blocking=True)
+        
+        last_io_time = timers("chunk io").elapsed("sum")
+
+        logger.info(f"probe chunk transfer time:{last_io_time}, merged copies: {num_merged}")
+    
+
+
+class ProbeLayerPool:
+    def __init__(self, env, config, common_len, batch_size=1, chunk_size=1024):
+        self.chunk_size = chunk_size
+
+        n_head = config.n_head
+        n_probe_head = 3
+        head_dim = config.input_dim // config.n_head
+        self.chunk_shape = (common_len, batch_size * n_probe_head, head_dim)
+
+        self.env = env
+        self.gpu = env.gpu
+        self.cpu = env.cpu
+        self.disk = env.disk
+
+    def store_probe_k(self, k_cache, cache_offset, layer_id):
+        pass
+
+    def get_probe_cache(self, k_cache, layer_id, store_ptr):
+        pass
