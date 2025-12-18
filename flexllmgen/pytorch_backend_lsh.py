@@ -399,6 +399,12 @@ class TorchDevice:
 
         return TorchTensor.create_from_torch(value, self), k, v
     
+    def warmup_gpu(self, typical_shapes):
+        for shapes in typical_shapes:
+            b, s, common_prefix_len, h = shapes
+            inputs = torch.randn(b, s, h, device='cuda')
+            _ = F.layer_norm(inputs, (h,))
+    
     def get_suffix_query_states(self, inputs, attention_mask, w_q, b_q,
                 w_ln, b_ln, n_head, k_cache, donate,
                 compress_cache, comp_config, matched_prefix):

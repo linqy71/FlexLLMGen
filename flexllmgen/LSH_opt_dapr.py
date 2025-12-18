@@ -372,6 +372,8 @@ class SelfAttention:
                 w_v.smart_copy(dst1), b_v.smart_copy(dst2),
                 w_out.smart_copy(dst1), b_out.smart_copy(dst2),
                 w_ln.smart_copy(dst2), b_ln.smart_copy(dst2)))
+        typical_shapes = [(1, 1024, 4096, 128)]
+        self.compute.warmup_gpu(typical_shapes)
 
     def init_cache_one_gpu_batch(self, cache_home, max_prompt_len, max_gen_len):
         if self.policy.cache_gpu_percent == 100:
