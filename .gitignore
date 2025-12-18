@@ -35,6 +35,7 @@ flexllmgen/apps/data_wrangle/core
 today_job.sh
 logits
 datasets
+acc
 lm_eval
 
 log/

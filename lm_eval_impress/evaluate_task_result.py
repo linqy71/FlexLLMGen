@@ -2,6 +2,14 @@ import argparse
 import json
 import os
 
+# 设置本地缓存路径
+cache_dir = "/XYAIFS00/HDD_POOL/nsccgz_zgchen/nsccgz_zgchen_6/lqy/HF_HOME"
+# os.makedirs(cache_dir, exist_ok=True)
+os.environ['HF_HOME'] = cache_dir
+os.environ['HUGGINGFACE_HUB_CACHE'] = os.path.join(cache_dir, 'hub')
+os.environ['HF_DATASETS_CACHE'] = os.path.join(cache_dir, 'datasets')
+os.environ['HF_HUB_OFFLINE'] = '1'
+
 from lm_eval import evaluator, tasks, simple_evaluate
 from tasks import EvalHarnessAdaptor
 
@@ -24,6 +32,8 @@ if __name__ == '__main__':
     parser.add_argument('--num-fewshot', type=int, default=0)
     parser.add_argument('--is-prefix-caching-test', action='store_true')
     parser.add_argument('--limit', type=int, default=None, help='Limit the number of samples to evaluate')
+    parser.add_argument('--acc-file', type=str, default='eval_results.jsonl')
+    parser.add_argument('--seq', type=int, default=1024)
     args = parser.parse_args()
     
     if args.model_type == 'opt':
@@ -37,7 +47,7 @@ if __name__ == '__main__':
     else:
         assert False
 
-    seq = 1024
+    seq = args.seq
     total_batch = 1
     pe = 'fixed'
 
@@ -181,16 +191,6 @@ if __name__ == '__main__':
 
     adaptor = EvalHarnessAdaptor(t, seq, total_batch, shrink=pe != "fixed")
 
-    # results = evaluator.evaluate(
-    #     adaptor, 
-    #     tasks.get_task_dict([args.task_name]),
-    #     limit=args.limit,
-    #     cache_requests=False,
-    #     bootstrap_iters=0,
-    #     write_out=False,
-    #     log_samples=False,
-    # )
-
     results = simple_evaluate(
         model=adaptor,
         tasks=[args.task_name],
@@ -202,4 +202,6 @@ if __name__ == '__main__':
     )
     
     dumped = json.dumps(results, indent=2)
-    print(dumped)
+    # print(dumped)
+    with open(args.acc_file, 'w') as f:
+        f.write(dumped)
