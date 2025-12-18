@@ -382,6 +382,17 @@ class TorchDevice:
 
         return TorchTensor.create_from_torch(value, self), k, v
     
+    def warmup_gpu(self, typical_shapes):
+        for shapes in typical_shapes:
+            b, s, common_prefix_len, h = shapes
+            # 创建假数据
+            inputs = torch.randn(b, s, h, device='cuda')
+            k_cache = torch.randn(common_prefix_len, b * 3, 128, device='cuda')
+            attention_mask = torch.ones(b, common_prefix_len, dtype=torch.bool, device='cuda')
+            _ = F.layer_norm(inputs, (h,))
+            _ = torch.bmm(inputs, inputs.transpose(1, 2))
+            _ = F.softmax(torch.randn(1, s, common_prefix_len, device='cuda'), dim=-1)
+    
     def get_important_token_idx(self, inputs, attention_mask, w_q, b_q,
                 w_ln, b_ln, n_head, k_cache, donate,
                 compress_cache, comp_config, important_ratio):

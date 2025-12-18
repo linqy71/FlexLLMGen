@@ -33,3 +33,9 @@ flexllmgen/apps/data_wrangle/core
 
 # tmp scripts
 today_job.sh
+analyze
+*.so
+lm_eval
+lm_eval_impress
+log
+build
