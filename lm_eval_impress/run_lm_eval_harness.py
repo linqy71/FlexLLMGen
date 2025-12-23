@@ -74,7 +74,8 @@ if __name__ == '__main__':
                        help='Cache directory for model files')
     parser.add_argument('--use-flexgen', action='store_true',
                        help='Use FlexGen backend instead of HuggingFace')
-
+    parser.add_argument("--limited-samples", type=int, default=200,
+                          help='Heavy hitter cache ratio')
     # parser.add_argument("--heavy_ratio", type=float, default=0.1,
     #                    help='Heavy hitter cache ratio')
     # parser.add_argument("--recent_ratio", type=float, default=0.1,
@@ -120,10 +121,12 @@ if __name__ == '__main__':
             if line.strip() != '':
                 requests.append(json.loads(line))
 
+    requests = requests[:args.limited_samples]
     print(f"Processing {len(requests)} requests...")
     
     results = []
     with torch.no_grad():
+        i = 0
         for request in tqdm.tqdm(requests):
             result = {'request': request, 'result': {}}
             prompt = request['prompt']
@@ -172,7 +175,8 @@ if __name__ == '__main__':
             }
             
             results.append(result)
-            model.finish_one_query()
+            i += 1
+            model.finish_one_query(final=False, reset=(i%2 == 0))
 
     model.finish_one_query(final=True)
     model.env.close_copy_threads()

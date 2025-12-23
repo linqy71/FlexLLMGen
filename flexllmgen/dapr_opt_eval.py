@@ -1172,11 +1172,11 @@ class OptLM:
                  cut_gen_len: Optional[int] = None,
                  verbose: int = 0):
         common_prefix_token, common_prefix_len = self.generate_with_prefix(inputs[0])
-        if common_prefix_len < 10:
-              common_prefix_len = 0
-              common_prefix_token = list()
-              del self.radix_tree
-              self.radix_tree = RadixTree()
+        # if common_prefix_len < 10:
+        #       common_prefix_len = 0
+        #       common_prefix_token = list()
+        #       del self.radix_tree
+        #       self.radix_tree = RadixTree()
         logger.info(f"generate: common_prefix_len={common_prefix_len}")
         task = Task(
             inputs=inputs,
@@ -1308,10 +1308,14 @@ class OptLM:
 
         return self.output_ids
 
-    def finish_one_query(self, final=False, idx = 0):
+    def finish_one_query(self, final=False, reset=False):
         self.sync()
-        # if idx % 2 and final == False:
-        self.store_prefix_cache()
+        if reset and not final:
+            self.chunk_pool.delete_chunk_pool()
+            del self.radix_tree
+            self.radix_tree = RadixTree()
+        elif not final:
+            self.store_prefix_cache()
         self.sync()
         self.chunk_pool.sync()
         logger.info("query finished , now sync the model")

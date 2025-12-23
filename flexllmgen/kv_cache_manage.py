@@ -76,7 +76,8 @@ class ChunkPool:
         self.env = env
         self.gpu = env.gpu
         self.cpu = env.cpu
-        self.disk = env.disk
+        # self.disk = env.disk
+        self.disk = env.cpu
 
         self.gpu_cache_size = gpu_cache_size
         self.cpu_cache_size = cpu_cache_size
@@ -108,8 +109,12 @@ class ChunkPool:
 
         return chunk_id
     
-    def delete_chunk(self, chunk_id):
-        pass
+    def delete_chunk_pool(self):
+        for chunk_id, meta in self.chunk_table.items():
+            meta.delete()
+        self.chunk_table.clear()
+        self.current_id = None
+        self.current_offset = None
     
     def get_chunk_data(self, chunk_id):
         if chunk_id not in self.chunk_table:

@@ -493,6 +493,8 @@ class TorchDevice:
         #logger.info(f"IMP_Token: thresold={thresold}")
 
         imp_token_idx = []
+        attn_sum = attn_sum.view(b, n_probe_head, common_prefix_len).sum(dim=1)
+        attn_sum = attn_sum.view(b, common_prefix_len)
         for i in range(b):
             jaccard = 0
             for l in range(n_probe_head):
@@ -501,7 +503,11 @@ class TorchDevice:
             comb = (n_probe_head * (n_probe_head - 1)) / 2
             jaccard /= comb
             if jaccard >= thresold:
-                imp_token_idx.append(sorted(S_imp[0][0]))
+                _, topk_idx = torch.topk(attn_sum, k=n_important, dim=1)
+                # topk_idx = topk_idx.view(b, n_important)
+                cpu_topk_idx = topk_idx[0].cpu().tolist()
+                idx_set = set(cpu_topk_idx)
+                imp_token_idx.append(sorted(idx_set))
             else:
                 imp_token_idx.append(list(range(common_prefix_len))) #表示加载全部kv
 
