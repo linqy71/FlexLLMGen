@@ -385,8 +385,6 @@ class SelfAttention:
                 w_v.smart_copy(dst1), b_v.smart_copy(dst2),
                 w_out.smart_copy(dst1), b_out.smart_copy(dst2),
                 w_ln.smart_copy(dst2), b_ln.smart_copy(dst2)))
-        typical_shapes = [(1, 1024, 4096, 128)]
-        self.compute.warmup_gpu(typical_shapes)
 
     def init_cache_one_gpu_batch(self, cache_home, max_prompt_len, max_gen_len):
         if self.policy.cache_gpu_percent == 100:
@@ -1086,6 +1084,12 @@ class OptLM:
         for j in range(self.num_layers):
             self.delete_weight(j, 0)
 
+    def warmup(self):
+        typical_shapes = [(1, 1024, 4096, 128)]
+        timers('warmup').start()
+        self.env.gpu.warmup_gpu(typical_shapes)
+        timers('warmup').stop()
+
     def update_attention_mask(self, i, k):
         if i > 0:
             mask = self.attention_mask[k]
@@ -1260,9 +1264,10 @@ class OptLM:
     def generation_loop_normal(self):
         logger.info("Into normal generate")
         for i in range(self.execute_gen_len):
-            timers("generate").start()
             for k in range(self.num_gpu_batches):
                 self.update_attention_mask(i, k)
+            self.warmup()
+            timers("generate").start()
             for j in range(self.num_layers):
                 for k in range(self.num_gpu_batches):
                     self.load_weight(i, j, k, overlap=False)
@@ -1365,8 +1370,9 @@ class OptLM:
 
         # Generate
         for i in range(self.execute_gen_len):
-            timers("generate").start()
             self.update_attention_mask(i, 0)
+            self.warmup()
+            timers("generate").start()
             for j in range(self.num_layers):
                 self.load_weight(i, j+1, 0)
                 #self.load_cache(i, j+1, 0)
@@ -1501,7 +1507,7 @@ class OptLM:
             new_chunk_id = self.chunk_pool.switch_to_new_chunk()
             self.kv_reordering(cur)
 
-            self.radix_tree.visualize()
+            # self.radix_tree.visualize()
             
             self.sync()
             #logger.info(f"KV reordering: Before Delete:{len(self.chunk_pool.pool)}")
@@ -1952,6 +1958,7 @@ def run_dapr_flexllmgen(args):
         average_continue_addr = []
 
         timers("generate").reset()
+        timers('warmup').reset()
         timers("imp io").reset()
         timers("imp calc").reset()
         timers("compute").reset()
@@ -1986,6 +1993,9 @@ def run_dapr_flexllmgen(args):
         model.finish_one_query(i == len(inputs) - 1, i)
         end_cache_store.record()
         timers("cache store").stop(end_cache_store.synchronize())
+        
+        print("warmup sum:",timers("warmup").elapsed("sum"))
+        print("warmup:",timers("warmup").costs)
 
         print("imp io average:",timers("imp io").elapsed("average"))
         print("imp io sum:",timers("imp io").elapsed("sum"))
