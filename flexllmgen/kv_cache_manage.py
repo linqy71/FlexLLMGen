@@ -108,6 +108,13 @@ class ChunkPool:
 
         return chunk_id
     
+    def delete_chunk_pool(self):
+        for chunk_id, meta in self.chunk_table.items():
+            meta.delete()
+        self.chunk_table.clear()
+        self.current_id = None
+        self.current_offset = None
+        
     def delete_chunk(self, chunk_id):
         pass
     
