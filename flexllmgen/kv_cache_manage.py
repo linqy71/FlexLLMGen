@@ -1118,12 +1118,14 @@ class ProbeChunkPool:
             return chunk_id, k_data
         
         timers("chunk io").start()
-        with ThreadPoolExecutor() as executor:
-            future_to_chunk_id = {executor.submit(_load_chunk_data, chunk_id): chunk_id for chunk_id in req.keys()}
+        for chunk_id in req.keys():
+            _, loaded_chunks[chunk_id] = _load_chunk_data(chunk_id)
+        # with ThreadPoolExecutor() as executor:
+        #     future_to_chunk_id = {executor.submit(_load_chunk_data, chunk_id): chunk_id for chunk_id in req.keys()}
             
-            for future in as_completed(future_to_chunk_id):
-                chunk_id, k_data = future.result()
-                loaded_chunks[chunk_id] = k_data
+        #     for future in as_completed(future_to_chunk_id):
+        #         chunk_id, k_data = future.result()
+        #         loaded_chunks[chunk_id] = k_data
         
         timers("chunk io").stop()
         last_io_time = timers("chunk io").costs[-1]

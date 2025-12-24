@@ -4,6 +4,16 @@
 # pip install -e .
 # cd ../..
 export CUDA_VISIBLE_DEVICES=0
+# rm  /ssd/nsccgz_zgchen_6/lqy/flexllmgen_offload_dir/kv_store/impress/*
+# python3 -m flexllmgen.dapr_opt --model facebook/opt-66b \
+#         --percent 50 50 100 0 100 0 \
+#         --path /HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/hyk/opt_weights  \
+#         --prompt-len 4000 \
+#         --gen-len 24 \
+#         --request 12 \
+#         --overlap True \
+#         --offload-dir /ssd/nsccgz_zgchen_6/lqy/flexllmgen_offload_dir/kv_store/impress  > log/impress_66b_chunk256_imp25_overlap_noreorder.log 2>&1
+
 rm  /ssd/nsccgz_zgchen_6/lqy/flexllmgen_offload_dir/kv_store/impress/*
 python3 -m flexllmgen.dapr_opt --model facebook/opt-30b \
         --percent 100 0 100 0 100 0 \
@@ -12,7 +22,8 @@ python3 -m flexllmgen.dapr_opt --model facebook/opt-30b \
         --gen-len 24 \
         --request 12 \
         --overlap True \
-        --offload-dir /ssd/nsccgz_zgchen_6/lqy/flexllmgen_offload_dir/kv_store/impress  > log/impress_30b_chunk256_imp30_overlap.log 2>&1
+        --offload-dir /ssd/nsccgz_zgchen_6/lqy/flexllmgen_offload_dir/kv_store/impress  > log/impress_30b_chunk256_imp25_test_probe.log 2>&1
+
 
 # for i in {0..5}; do
 #     echo "Running iteration $i"

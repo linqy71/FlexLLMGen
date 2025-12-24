@@ -114,7 +114,7 @@ class Policy:
     comp_cache_config: CompressionConfig
 
     # the ratio of important tokens in prefix kv cache
-    important_ratio: float = 0.3
+    important_ratio: float = 0.25
 
     # Config of Chunk Pool (128, b*n_head, head_dim) * 2
     chunk_size: int = 256
@@ -2413,6 +2413,6 @@ if __name__ == "__main__":
 
     #run_prefix_flexllmgen(args)
     if(args.input == "dapr"):
-    run_dapr_flexllmgen(args)
+        run_dapr_flexllmgen(args)
     elif(args.input == "long"):
         run_longbench_flexllmgen(args)
