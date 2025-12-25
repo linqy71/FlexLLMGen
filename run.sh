@@ -11,7 +11,8 @@
 
 
 rm /ssd/nsccgz_zgchen_6/lqy/flexllmgen_offload_dir/gathering/kv_store/*
-
+K=6
+L=8
 python3 -m flexllmgen.LSH_opt_dapr --model facebook/opt-30b \
         --percent 100 00 100 0 100 0 \
         --path /HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/hyk/opt_weights \
@@ -20,7 +21,9 @@ python3 -m flexllmgen.LSH_opt_dapr --model facebook/opt-30b \
         --strategy seq \
         --overlap=True \
         --save-res=False \
-        --offload-dir /ssd/nsccgz_zgchen_6/lqy/flexllmgen_offload_dir/gathering/  > log/30b_load_lsh_meta_full_sort.log 2>&1
+        --K=$K \
+        --L=$L \
+        --offload-dir /ssd/nsccgz_zgchen_6/lqy/flexllmgen_offload_dir/gathering/  > log/30b_load_lsh_K${K}L${L}.log 2>&1
 
 # rm /ssd/nsccgz_zgchen_6/lqy/flexllmgen_offload_dir/gathering/kv_store/1_*
 # rm /ssd/nsccgz_zgchen_6/lqy/flexllmgen_offload_dir/gathering/kv_store/q*

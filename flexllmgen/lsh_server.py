@@ -90,7 +90,10 @@ class LSHServer:
 
         self.copy_stream = torch.cuda.Stream(priority=-1)
         self.build_stream = torch.cuda.Stream()
-    
+        
+        self.prefix_lens = []
+        self.imp_lens = []
+
     def _warmup_lsh_kernels(self, q_len):
         """warmup LSH kernel"""
 
@@ -226,6 +229,7 @@ class LSHServer:
             res[head_id, n:] = -1
         max_len = nnz.max()
         avg_len = nnz.sum() / len(nnz)
+        self.imp_lens.append(avg_len)
         return res[:, :max_len], avg_len
 
     def get_full_idx(self, layer_idx):
@@ -287,6 +291,7 @@ class LSHServer:
         #     self.results_lsh_cpu[i][:self.nnz[i]], _ = torch.sort(self.results_lsh_cpu[i][:self.nnz[i]])
         #print(self.nnz)
         self.record_query_results(layer_idx)
+        self.prefix_lens.append(max_index)
 
     def extend_imp_heads(self):
         imp_ids = set()

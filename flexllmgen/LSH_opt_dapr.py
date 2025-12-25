@@ -771,7 +771,9 @@ class OptLM:
                  policy: Policy,
                  max_prompt_len: int,
                  max_gen_len: int,
-                 persist_strategy: str):
+                 persist_strategy: str,
+                 K: int,
+                 L: int):
         if isinstance(config, str):
             config = get_opt_config(config, max_seq_len=8192)
         self.config = config
@@ -832,7 +834,7 @@ class OptLM:
         self.kv_store_path = os.path.join(offload_dir, "kv_store")
         if not os.path.exists(self.kv_store_path):
             os.makedirs(self.kv_store_path)
-        self.kv_server = LSHServer(self.config, self.num_hidden_layers, self.kv_store_path, K=8, L=50, batch_size=1, max_length=8192, device='cuda:0')
+        self.kv_server = LSHServer(self.config, self.num_hidden_layers, self.kv_store_path, K=K, L=L, batch_size=1, max_length=8192, device='cuda:0')
         self.set_kv_server()
         
         for j in range(num_layers):
@@ -1183,6 +1185,9 @@ class OptLM:
             if self.policy.cpu_cache_compute:
                 self.env.cpu.del_attention_compute_workspace()
             #self.clear_cache_files(self.task.new_prefix_id)
+            avg_prefix = sum(self.kv_server.prefix_lens) / len(self.kv_server.prefix_lens)
+            avg_imp = sum(self.kv_server.imp_lens) / len(self.kv_server.imp_lens)
+            print(f"avg common len: {avg_prefix}; avg imp len: {avg_imp}; retention: {avg_imp/avg_prefix}")
 
     def clear_cache_files(self,prefix_id):
         store_path = self.kv_store_path
@@ -1543,7 +1548,7 @@ def run_dapr_flexllmgen(args):
     
     print("init weight...init_cache_home...")
 
-    model = OptLM(opt_config, env, args.path, args.offload_dir, policy, args.prompt_len, args.gen_len, args.strategy)
+    model = OptLM(opt_config, env, args.path, args.offload_dir, policy, args.prompt_len, args.gen_len, args.strategy, args.K, args.L)
 
     context, questions = process_dapr()
     # context = context[:8192]
@@ -1676,167 +1681,6 @@ def run_dapr_flexllmgen(args):
         print(f"Average of last {len(recent_load_lsh)} load LSH values: {sum(recent_load_lsh)/len(recent_load_lsh):.6f}")
 
 
-def run_prefix_flexllmgen(args):
-    print(f"<run_prefix_flexllmgen>: args.model: {args.model}")
-    if args.model == "facebook/galactica-30b":
-        tokenizer = AutoTokenizer.from_pretrained("facebook/galactica-30b", padding_side="left")
-    else:
-        #tokenizer = AutoTokenizer.from_pretrained("facebook/opt-30b", padding_side="left")
-        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
-    
-    num_prompts = args.num_gpu_batches * args.gpu_batch_size
-    max_prompt_len, gen_len, cut_gen_len = args.prompt_len, args.gen_len, args.cut_gen_len
-    
-    gpu = TorchDevice("cuda:0")
-    cpu = TorchDevice("cpu")
-    disk = TorchDisk(args.offload_dir)
-    env = ExecutionEnv(gpu=gpu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gpu, cpu, disk]))
-
-    policy = Policy(args.gpu_batch_size, args.num_gpu_batches,
-                    args.percent[0], args.percent[1],
-                    args.percent[2], args.percent[3],
-                    args.percent[4], args.percent[5],
-                    args.overlap, args.sep_layer, args.pin_weight,
-                    args.cpu_cache_compute, args.attn_sparsity,
-                    args.compress_weight,
-                    CompressionConfig(num_bits=4, group_size=64,
-                                      group_dim=0, symmetric=False),
-                    args.compress_cache,
-                    CompressionConfig(num_bits=4, group_size=64,
-                                      group_dim=2, symmetric=False))
-    assert not (args.compress_cache and args.attn_sparsity < 1.0), "Not implemented"
-
-    opt_config = get_opt_config(args.model)
-    cache_size = opt_config.cache_bytes(num_prompts, max_prompt_len + gen_len)
-    hidden_size = opt_config.hidden_bytes(num_prompts, max_prompt_len + gen_len)
-    print(f"model size: {opt_config.model_bytes()/GB:.3f} GB, "
-          f"cache size: {cache_size/GB:.3f} GB, "
-          f"hidden size (prefill): {hidden_size/GB:.3f} GB")
-    
-    print("init weight...init_cache_home...")
-
-    model = OptLM(opt_config, env, args.path, args.offload_dir, policy, args.prompt_len, args.gen_len, args.strategy)
-    prefix = "Guangzhou is the capital and largest city of Guangdong province in southern China." + \
-      "Located on the Pearl River about 120 km (75 mi) northwest of Hong Kong and 145 km (90 mi) north of Macau, " + \
-      "Guangzhou has a history of over 2,200 years and was a major terminus of the Silk Road." + \
-      "The port of Guangzhou serves as a transportation hub for China's fourth largest city and surrounding areas, including Hong Kong." + \
-      "Guangzhou was captured by the British during the First Opium War and no longer enjoyed a monopoly after the war; " + \
-      "consequently it lost trade to other ports such as Hong Kong and Shanghai, but continued to serve as a major entrepot." + \
-      "Guangzhou is at the center of the Guangdong–Hong Kong–Macau Greater Bay Area, the most populous built-up metropolitan area " +\
-      "in the world, which extends into the neighboring cities of Foshan, Dongguan, Zhongshan, Shenzhen and part of Jiangmen, Huizhou, Zhuhai and Macau."
-    first_query = "Guangzhou is the capital of"
-    second_query = "Shenzhen is a city near"
-
-    prefix_input = get_tokenized_inputs(prefix, max_prompt_len, tokenizer)
-    ### feed prefix --------------
-    output_ids= model.generate(
-            prefix_input, max_new_tokens=1, debug_mode=args.debug_mode, 
-            cut_gen_len=cut_gen_len, verbose=args.verbose)
-    ### offload to lsh server
-    model.sync()
-    # model.store_prefix_cache()
-
-    ### first query: 1. match in radix tree; 2. pick important token; 3. persist
-    first_input = get_tokenized_inputs(prefix + first_query, max_prompt_len, tokenizer)
-    second_input = get_tokenized_inputs(prefix + second_query, max_prompt_len, tokenizer)
-    
-    logger.info(f"first_input: {prefix + first_query}")
-    logger.info(f"second_input: {prefix + second_query}")
-
-    try:
-        print("first query - generate")
-        timers("generate").reset()
-        output_ids= model.generate(
-            first_input, max_new_tokens = args.gen_len, debug_mode=args.debug_mode, 
-            cut_gen_len=cut_gen_len, verbose=args.verbose)
-        costs = timers("generate").costs
-
-        # Log output
-        prefill_latency = costs[0]
-        prefill_throughput = num_prompts * max_prompt_len / prefill_latency
-        if cut_gen_len:  # project latency of cut_gen_len to gen_len
-            decode_latency = project_decode_latency(costs, max_prompt_len, gen_len)
-        else:
-            decode_latency = sum(costs[1:])
-        decode_throughput = num_prompts * (gen_len - 1) / max(decode_latency, 1e-10)
-        num_generated_tokens = num_prompts * gen_len
-        total_latency = prefill_latency + decode_latency
-        total_throughput = num_generated_tokens / total_latency
-        _, gpu_peak_mem = gpu.mem_stats()
-        _, cpu_peak_mem = cpu.mem_stats()
-        log_str = (f"model size: {opt_config.model_bytes()/GB:.3f} GB\t"
-                f"cache size: {cache_size/GB:.3f} GB\t"
-                f"hidden size (p): {hidden_size/GB:.3f} GB\n"
-                f"peak gpu mem: {gpu_peak_mem / GB:.3f} GB\t"
-                f"prefill latency: {prefill_latency:.3f} s\t"
-                f"prefill throughput: {prefill_throughput:.3f} token/s\n"
-                f"decode latency: {decode_latency:.3f} s\t"
-                f"decode throughput: {decode_throughput:.3f} token/s\n"
-                f"total latency: {total_latency:.3f} s\t"
-                f"total throughput: {total_throughput:.3f} token/s")
-        print(log_str)
-
-        if DUMMY_WEIGHT not in args.path:
-            outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
-            show_str = "Outputs:\n" + 70 * '-' + "\n"
-            for i in range(0, len(outputs)):
-                show_str += f"{i}: {outputs[i]}\n"
-                show_str += "-" * 70 + "\n"
-            if args.verbose >= 2:
-                print(show_str)
-
-        model.finish_one_query(False)
-
-        print("=" * 50)
-
-        print("second query - generate")
-        timers("generate").reset()
-        output_ids = model.generate(
-            second_input, max_new_tokens = args.gen_len, debug_mode=args.debug_mode, 
-            cut_gen_len=cut_gen_len, verbose=args.verbose)
-        costs = timers("generate").costs
-
-        # Log output
-        
-        prefill_latency = costs[0]
-        prefill_throughput = num_prompts * max_prompt_len / prefill_latency
-        if cut_gen_len:  # project latency of cut_gen_len to gen_len
-            decode_latency = project_decode_latency(costs, max_prompt_len, gen_len)
-        else:
-            decode_latency = sum(costs[1:])
-        decode_throughput = num_prompts * (gen_len - 1) / max(decode_latency, 1e-10)
-        num_generated_tokens = num_prompts * gen_len
-        total_latency = prefill_latency + decode_latency
-        total_throughput = num_generated_tokens / total_latency
-        _, gpu_peak_mem = gpu.mem_stats()
-        _, cpu_peak_mem = cpu.mem_stats()
-        log_str = (f"model size: {opt_config.model_bytes()/GB:.3f} GB\t"
-                f"cache size: {cache_size/GB:.3f} GB\t"
-                f"hidden size (p): {hidden_size/GB:.3f} GB\n"
-                f"peak gpu mem: {gpu_peak_mem / GB:.3f} GB\t"
-                f"prefill latency: {prefill_latency:.3f} s\t"
-                f"prefill throughput: {prefill_throughput:.3f} token/s\n"
-                f"decode latency: {decode_latency:.3f} s\t"
-                f"decode throughput: {decode_throughput:.3f} token/s\n"
-                f"total latency: {total_latency:.3f} s\t"
-                f"total throughput: {total_throughput:.3f} token/s")
-        print(log_str)
-
-        if DUMMY_WEIGHT not in args.path:
-            outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
-            show_str = "Outputs:\n" + 70 * '-' + "\n"
-            for i in range(0, len(outputs)):
-                show_str += f"{i}: {outputs[i]}\n"
-                show_str += "-" * 70 + "\n"
-            if args.verbose >= 2:
-                print(show_str)
-
-        print("=" * 50)  
-        model.finish_one_query(True)
-
-    finally:
-        env.close_copy_threads()
-
 def add_parser_arguments(parser):
     parser.add_argument("--model", type=str, default="facebook/opt-30b",
         help="The model name.")
@@ -1886,6 +1730,10 @@ def add_parser_arguments(parser):
         const=True, default=False)
     ## query for query_group_persist; seq for sequential_persist
     parser.add_argument("--strategy", type=str, default="query")
+    
+    parser.add_argument("--K", type=int, default=8)
+    parser.add_argument("--L", type=int, default=50)
+    
 
 
 if __name__ == "__main__":
