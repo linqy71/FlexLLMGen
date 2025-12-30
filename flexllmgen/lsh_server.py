@@ -177,7 +177,6 @@ class LSHServer:
         self.current_prefix_id = prefix_id
 
         if self.persisted == False:
-            print("into persist lsh meta", flush=True)
             avg_k_file = os.path.join(
                 self.kv_store_path,
                 f"avg_k_prefix_{prefix_id}_layer_{layer_idx}.pt"
@@ -406,10 +405,6 @@ class LSHServer:
             #self.kv_store.write_to_layer_file(self.kv_store_path,
             self.kv_store.write_to_layer_promote_file(self.kv_store_path,
                                             prefix_id, layer_idx, new_token_orders)
-            #print(f"Successfully write prefix {prefix_id} to storage in {self.kv_store_path}")
-        
-        ## persist hash table
-        self.lsh_retriever.save_to_file(self.kv_store_path + "/lsh_table_" + str(prefix_id))
 
         self.persisted = True
     
@@ -485,17 +480,21 @@ class LSHServer:
         # if self.current_prefix_id not in self.prefix_to_server:
         #     self.prefix_to_server[self.current_prefix_id] = (self.lsh_retriever, self.kv_store)
         if switch:
+            del self.lsh_retriever
             self.lsh_retriever = LSH()
             self.lsh_retriever.alloc(self.K, self.L, self.num_layers, self.num_attention_heads, self.num_key_value_heads, self.batch_size, self.max_length)
+            del self.kv_store
             self.kv_store = KVStore()
             self.kv_store.alloc(self.num_layers, self.num_attention_heads, self.num_key_value_heads, self.head_dim, self.max_length)
-        
+            self.persisted = False
+
         self.nnz.zero_()
         self.results_lsh_cpu.zero_()
         self.hash_code_buffer.zero_()
         self.pinned_hashcode_multi.zero_()
         self.pinned_hashcode.zero_()
         self.query_results = [(torch.zeros_like(self.nnz), torch.zeros_like(self.results_lsh_cpu)) for _ in range(self.num_layers)]
+
 
     ### TODO ----- handle recover
     def persist_kv_store_meta(self, prefix_id):
