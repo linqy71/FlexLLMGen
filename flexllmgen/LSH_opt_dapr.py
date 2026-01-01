@@ -1658,7 +1658,7 @@ def run_full_dapr_flexllmgen(args):
             timers("cache store").start(start_cache_store.record())
 
             model.finish_one_query()
-            # drop_cache()
+            drop_cache()
             end_cache_store.record()
             timers("cache store").stop(end_cache_store.synchronize())
 
@@ -1667,6 +1667,7 @@ def run_full_dapr_flexllmgen(args):
             print("lsh calc sum:",timers("lsh calc").elapsed("sum"))
             print("compute sum:",timers("compute").elapsed("sum"))
             print("prefill:",timers("generate").costs[0])
+            prefill_history.append(timers("generate").costs[0])
             print("imp load sum:",timers("imp load and compute").elapsed("sum"))
             print("copy prefix sum:",timers("copy prefix").elapsed("sum"))
 
@@ -1682,6 +1683,8 @@ def run_full_dapr_flexllmgen(args):
 
             print("load table:", timers("load table").elapsed("sum"))
             print("build table:", timers("build table").elapsed("sum"))
+
+            load_lsh_history.append(timers("load LSH meta").elapsed("sum"))
 
             # print("total io token:", io_bytes)
             # print("total continue token", cur_continue_addr)
