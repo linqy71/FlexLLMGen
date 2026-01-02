@@ -1242,23 +1242,24 @@ class OptLM:
 
         return self.output_ids
 
-    def finish_one_query(self, final=False, idx = 0):
+    def final_finish(self):
+        num_layers, num_gpu_batches = self.num_layers, self.policy.num_gpu_batches
+        # Delete cache
+        for j in range(num_layers):
+            for k in range(num_gpu_batches):
+                self.delete_cache(j, k)
+        if self.policy.cpu_cache_compute:
+            self.env.cpu.del_attention_compute_workspace()
+        
+        self.chunk_pool.close_copy_threads()
+    
+    def finish_one_query(self, idx = 0):
         self.sync()
-        if idx == 0 and final == False:
+        if idx == 0:
             self.store_prefix_cache()
         self.sync()
         self.chunk_pool.sync()
         logger.info("query finished , now sync the model")
-        num_layers, num_gpu_batches = self.num_layers, self.policy.num_gpu_batches
-        if final:
-            # Delete cache
-            for j in range(num_layers):
-                for k in range(num_gpu_batches):
-                    self.delete_cache(j, k)
-            if self.policy.cpu_cache_compute:
-                self.env.cpu.del_attention_compute_workspace()
-            
-            self.chunk_pool.close_copy_threads()
 
 
     def generation_loop_normal(self):
@@ -1715,151 +1716,6 @@ def get_tokenized_inputs(prompt, max_prompt_len, tokenizer):
     inputs_ids = tokenizer(prompt, max_length=max_prompt_len, truncation=True).input_ids
     return inputs_ids
 
-def run_prefix_flexllmgen(args):
-    print(f"<run_prefix_flexllmgen>: args.model: {args.model}")
-    if args.model == "facebook/galactica-30b":
-        tokenizer = AutoTokenizer.from_pretrained("facebook/galactica-30b", padding_side="left")
-    else:
-        #tokenizer = AutoTokenizer.from_pretrained("facebook/opt-30b", padding_side="left")
-        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
-    
-    num_prompts = args.num_gpu_batches * args.gpu_batch_size
-    max_prompt_len, gen_len, cut_gen_len = args.prompt_len, args.gen_len, args.cut_gen_len
-    
-    gpu = TorchDevice("cuda:0")
-    cpu = TorchDevice("cpu")
-    disk = TorchDisk(args.offload_dir)
-    env = ExecutionEnv(gpu=gpu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gpu, cpu, disk]))
-
-    policy = Policy(args.gpu_batch_size, args.num_gpu_batches,
-                    args.percent[0], args.percent[1],
-                    args.percent[2], args.percent[3],
-                    args.percent[4], args.percent[5],
-                    args.overlap, args.sep_layer, args.pin_weight,
-                    args.cpu_cache_compute, args.attn_sparsity,
-                    args.compress_weight,
-                    CompressionConfig(num_bits=4, group_size=64,
-                                      group_dim=0, symmetric=False),
-                    args.compress_cache,
-                    CompressionConfig(num_bits=4, group_size=64,
-                                      group_dim=2, symmetric=False))
-    assert not (args.compress_cache and args.attn_sparsity < 1.0), "Not implemented"
-
-    opt_config = get_opt_config(args.model)
-    cache_size = opt_config.cache_bytes(num_prompts, max_prompt_len + gen_len)
-    hidden_size = opt_config.hidden_bytes(num_prompts, max_prompt_len + gen_len)
-    print(f"model size: {opt_config.model_bytes()/GB:.3f} GB, "
-          f"cache size: {cache_size/GB:.3f} GB, "
-          f"hidden size (prefill): {hidden_size/GB:.3f} GB")
-    
-    print("init weight...init_cache_home...")
-
-    model = OptLM(opt_config, env, args.path, policy, args.prompt_len, args.gen_len)
-    prefix_prompt1 = "The capital of Guangdong is Guangzhou."
-    prefix_prompt2 = "The capital of Guangdong is Guangzhou and Shenzhen is a city next to Guangzhou."
-    first_query = "Guangzhou is the capital of"
-    second_query = "Please introduce Shenzhen"
-
-    first_input = get_tokenized_inputs(prefix_prompt1 + " " + first_query, max_prompt_len, tokenizer)
-    second_input = get_tokenized_inputs(prefix_prompt2 + " " + second_query, max_prompt_len, tokenizer)
-    
-    logger.info(f"first_input: {prefix_prompt1 + first_query}, ids: {first_input}")
-    logger.info(f"second_input: {prefix_prompt2 + second_query}, ids: {second_input}")
-
-    try:
-        print("first query - generate")
-        timers("generate").reset()
-        output_ids= model.generate(
-            first_input, max_new_tokens = args.gen_len, debug_mode=args.debug_mode, 
-            cut_gen_len=cut_gen_len, verbose=args.verbose)
-        costs = timers("generate").costs
-
-        # Log output
-        prefill_latency = costs[0]
-        prefill_throughput = num_prompts * max_prompt_len / prefill_latency
-        if cut_gen_len:  # project latency of cut_gen_len to gen_len
-            decode_latency = project_decode_latency(costs, max_prompt_len, gen_len)
-        else:
-            decode_latency = sum(costs[1:])
-        decode_throughput = num_prompts * (gen_len - 1) / max(decode_latency, 1e-10)
-        num_generated_tokens = num_prompts * gen_len
-        total_latency = prefill_latency + decode_latency
-        total_throughput = num_generated_tokens / total_latency
-        _, gpu_peak_mem = gpu.mem_stats()
-        _, cpu_peak_mem = cpu.mem_stats()
-        log_str = (f"model size: {opt_config.model_bytes()/GB:.3f} GB\t"
-                f"cache size: {cache_size/GB:.3f} GB\t"
-                f"hidden size (p): {hidden_size/GB:.3f} GB\n"
-                f"peak gpu mem: {gpu_peak_mem / GB:.3f} GB\t"
-                f"prefill latency: {prefill_latency:.3f} s\t"
-                f"prefill throughput: {prefill_throughput:.3f} token/s\n"
-                f"decode latency: {decode_latency:.3f} s\t"
-                f"decode throughput: {decode_throughput:.3f} token/s\n"
-                f"total latency: {total_latency:.3f} s\t"
-                f"total throughput: {total_throughput:.3f} token/s")
-        print(log_str)
-
-        if DUMMY_WEIGHT not in args.path:
-            outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
-            show_str = "Outputs:\n" + 70 * '-' + "\n"
-            for i in range(0, len(outputs)):
-                show_str += f"{i}: {outputs[i]}\n"
-                show_str += "-" * 70 + "\n"
-            if args.verbose >= 2:
-                print(show_str)
-
-        model.finish_one_query(False,0)
-
-        print("=" * 50)
-
-        print("second query - generate")
-        timers("generate").reset()
-        output_ids = model.generate(
-            second_input, max_new_tokens = args.gen_len, debug_mode=args.debug_mode, 
-            cut_gen_len=cut_gen_len, verbose=args.verbose)
-        costs = timers("generate").costs
-
-        # Log output
-        
-        prefill_latency = costs[0]
-        prefill_throughput = num_prompts * max_prompt_len / prefill_latency
-        if cut_gen_len:  # project latency of cut_gen_len to gen_len
-            decode_latency = project_decode_latency(costs, max_prompt_len, gen_len)
-        else:
-            decode_latency = sum(costs[1:])
-        decode_throughput = num_prompts * (gen_len - 1) / max(decode_latency, 1e-10)
-        num_generated_tokens = num_prompts * gen_len
-        total_latency = prefill_latency + decode_latency
-        total_throughput = num_generated_tokens / total_latency
-        _, gpu_peak_mem = gpu.mem_stats()
-        _, cpu_peak_mem = cpu.mem_stats()
-        log_str = (f"model size: {opt_config.model_bytes()/GB:.3f} GB\t"
-                f"cache size: {cache_size/GB:.3f} GB\t"
-                f"hidden size (p): {hidden_size/GB:.3f} GB\n"
-                f"peak gpu mem: {gpu_peak_mem / GB:.3f} GB\t"
-                f"prefill latency: {prefill_latency:.3f} s\t"
-                f"prefill throughput: {prefill_throughput:.3f} token/s\n"
-                f"decode latency: {decode_latency:.3f} s\t"
-                f"decode throughput: {decode_throughput:.3f} token/s\n"
-                f"total latency: {total_latency:.3f} s\t"
-                f"total throughput: {total_throughput:.3f} token/s")
-        print(log_str)
-
-        if DUMMY_WEIGHT not in args.path:
-            outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
-            show_str = "Outputs:\n" + 70 * '-' + "\n"
-            for i in range(0, len(outputs)):
-                show_str += f"{i}: {outputs[i]}\n"
-                show_str += "-" * 70 + "\n"
-            if args.verbose >= 2:
-                print(show_str)
-
-        print("=" * 50)  
-        model.finish_one_query(True,0)
-
-    finally:
-        env.close_copy_threads()
-
 def process_dapr():
     RootPath = "/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/lqy/HF_HOME/datasets/"
     docs = load_dataset(RootPath + "UKPLab___dapr/ConditionalQA-docs/0.0.0/67ae3daa13596700976d20605630f5f9db3bd732/", split="test")
@@ -1894,34 +1750,556 @@ def process_dapr():
 
     return context, questions
 
+def run_dapr_flexllmgen(args):
+    print(f"<run_dapr_flexllmgen>: args.model: {args.model}")
+    if args.model == "facebook/galactica-30b":
+        tokenizer = AutoTokenizer.from_pretrained("facebook/galactica-30b", padding_side="left")
+    else:
+        #tokenizer = AutoTokenizer.from_pretrained("facebook/opt-30b", padding_side="left")
+        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path, truncation_side="left")
+     
+    num_prompts = args.num_gpu_batches * args.gpu_batch_size
+    max_prompt_len, gen_len, cut_gen_len = args.prompt_len, args.gen_len, args.cut_gen_len
+    
+    gpu = TorchDevice("cuda:0")
+    cpu = TorchDevice("cpu")
+    disk = TorchDisk(args.offload_dir)
+    env = ExecutionEnv(gpu=gpu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gpu, cpu, disk]))
 
-def process_longbench():
+    policy = Policy(args.gpu_batch_size, args.num_gpu_batches,
+                    args.percent[0], args.percent[1],
+                    args.percent[2], args.percent[3],
+                    args.percent[4], args.percent[5],
+                    args.overlap, args.sep_layer, args.pin_weight,
+                    args.cpu_cache_compute, args.attn_sparsity,
+                    args.compress_weight,
+                    CompressionConfig(num_bits=4, group_size=64,
+                                      group_dim=0, symmetric=False),
+                    args.compress_cache,
+                    CompressionConfig(num_bits=4, group_size=64,
+                                      group_dim=2, symmetric=False))
+    assert not (args.compress_cache and args.attn_sparsity < 1.0), "Not implemented"
+
+    opt_config = get_opt_config(args.model,max_seq_len=8192)
+    cache_size = opt_config.cache_bytes(num_prompts, max_prompt_len + gen_len)
+    hidden_size = opt_config.hidden_bytes(num_prompts, max_prompt_len + gen_len)
+    print(f"model size: {opt_config.model_bytes()/GB:.3f} GB, "
+          f"cache size: {cache_size/GB:.3f} GB, "
+          f"hidden size (prefill): {hidden_size/GB:.3f} GB")
+    
+    print("init weight...init_cache_home...")
+
+    model = OptLM(opt_config, env, args.path, policy, args.prompt_len, args.gen_len)
+
+    context, questions = process_dapr()
+    
+    request_size = args.request
+    questions = questions[:request_size]
+
+    inputs = [context + query + "\n" for query in questions]
+    inputs_ids = tokenizer(inputs, truncation=True, max_length=max_prompt_len).input_ids
+    output_ids = model.generate(
+        inputs=[inputs_ids[0]], max_new_tokens = 1, debug_mode=args.debug_mode, 
+        cut_gen_len=cut_gen_len, verbose=args.verbose)
+    
+    prefill_history = []
+
+    for i in range(len(inputs)):
+        global io_bytes 
+        io_bytes = 0
+        global last_id,last_offset,cur_continue_addr,average_continue_addr
+        last_id = -1
+        last_offset = -1
+        cur_continue_addr = 0
+        average_continue_addr = []
+
+        timers("generate").reset()
+        timers('warmup').reset()
+        timers("imp io").reset()
+        timers("imp calc").reset()
+        timers("compute").reset()
+        timers("imp load and compute").reset()
+        timers("cache store").reset()
+
+        timers("probe_cache").reset()
+        timers("full_cache").reset()
+
+        timers("imp choose1").reset()
+        timers("imp choose2").reset()
+        timers("imp choose3").reset()
+        timers("imp choose4").reset()
+        timers("chunk io").reset()
+        timers("mlp").reset()
+
+        output_ids = model.generate(
+            inputs=[inputs_ids[i]], max_new_tokens = args.gen_len, debug_mode=args.debug_mode, 
+            cut_gen_len=cut_gen_len, verbose=args.verbose)
+        if DUMMY_WEIGHT not in args.path:
+            outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
+            show_str = "Outputs:\n" + 70 * '-' + "\n"
+            for j in range(0, len(outputs)):
+                show_str += f"{j}: {outputs[j]}\n"    
+                show_str += "-" * 70 + "\n"
+            if args.verbose >= 2:
+                print(show_str)
+        
+        start_cache_store = torch.cuda.Event(enable_timing=True)
+        end_cache_store = torch.cuda.Event(enable_timing=True)
+        timers("cache store").start(start_cache_store.record())
+        model.finish_one_query(i == len(inputs) - 1, i)
+        end_cache_store.record()
+        timers("cache store").stop(end_cache_store.synchronize())
+        
+        print("warmup sum:",timers("warmup").elapsed("sum"))
+        print("warmup:",timers("warmup").costs)
+
+        print("imp io average:",timers("imp io").elapsed("average"))
+        print("imp io sum:",timers("imp io").elapsed("sum"))
+        print("imp calc average:",timers("imp calc").elapsed("average"))
+        print("imp calc sum:",timers("imp calc").elapsed("sum"))
+        #print("imp io:{}",timers("imp io").costs)
+        print("imp calc:",timers("imp calc").costs)
+        print("compute average:",timers("compute").elapsed("average"))
+        print("compute sum:",timers("compute").elapsed("sum"))
+        #print("compute:{}",timers("compute").costs)
+        print("prefill:",timers("generate").costs[0])
+        prefill_history.append(timers("generate").costs[0])
+        print((timers("imp io").elapsed("sum") + timers("imp calc").elapsed("sum"))/timers("generate").costs[0] * 100)
+
+        print("imp load :",timers("imp load and compute").elapsed("average"))
+        print("imp sum:",timers("imp load and compute").elapsed("sum"))
+        #print("store cache:",timers("cache store").costs)
+        print("generate:", timers("generate").costs)
+        print("generate sum:", timers("generate").elapsed("sum"))
+        print("probe_cache: ",timers("probe_cache").elapsed("average"), "  ", timers("probe_cache").elapsed("sum"))
+        print("full_cache: ",timers("full_cache").elapsed("average"), "  ", timers("full_cache").elapsed("sum"))
+        
+
+        print("imp choose1: ",timers("imp choose1").elapsed("average"), "  ", timers("imp choose1").elapsed("sum"))
+        print("imp choose1 costs: ",timers("imp choose1").costs)
+        print("imp choose2: ",timers("imp choose2").elapsed("average"), "  ", timers("imp choose2").elapsed("sum"))
+        print("imp choose2 costs: ",timers("imp choose2").costs)
+        print("imp choose3: ",timers("imp choose3").elapsed("average"), "  ", timers("imp choose3").elapsed("sum"))
+        print("imp choose3 costs: ",timers("imp choose3").costs)
+        print("imp choose4: ",timers("imp choose4").elapsed("average"), "  ", timers("imp choose4").elapsed("sum"))
+        print("imp choose4 costs: ",timers("imp choose4").costs)
+        print("mlp: ",timers("mlp").elapsed("average"), "  ", timers("mlp").elapsed("sum"))
+        print("mlp costs: ",timers("mlp").costs)
+
+        # print("total io token:", io_bytes)
+        # print("total continue token", cur_continue_addr)
+        # if i!=0:
+        #     print("average continue:", sum(average_continue_addr) / len(average_continue_addr))
+        #     print("sum avg:", sum(average_continue_addr))
+        if i>=1 and len(imp_token_count) > 0:
+            avg_imp = sum(imp_token_count) / len(imp_token_count)
+            logger.info(f"Important tokens per layer: {imp_token_count}; average per layer: {avg_imp:.2f}")
+    
+
+        #if(i == len(inputs) // 2):
+            #model.radix_tree.visualize()
+            #global chunk_cnt
+            #logger.info(f"Befor KV Reordering, avg_chunk_cnt = {sum(chunk_cnt)/len(chunk_cnt)}")
+            #chunk_cnt = []
+        # model.kv_reordering()
+        # print("=" * 25,"KV_REORDERING", "="*25)
+
+
+        logger.info(f"gpu_cache:{len(model.chunk_pool.gpu_cache.index_heap._pos)}")
+        logger.info(f"cpu_cache:{len(model.chunk_pool.cpu_cache.index_heap._pos)}")
+        
+        # if i == 4 or i==10:
+        #     subprocess.run(['sudo', 'drop_cache'], check=True)
+        #     model.chunk_pool.sync()
+        #     print("=" * 50, "Test Copy Overhead", "="*50)
+        #     model.test_probe_disk()
+        #     #model.test_probe_gpu()
+        #     subprocess.run(['sudo', 'drop_cache'], check=True)
+        #     model.test_full_disk()
+        #     #model.test_full_gpu()
+
+        subprocess.run(['sudo', 'drop_cache'], check=True)
+        
+    #logger.info(f"After KV Reordering, avg_chunk_cnt = {sum(chunk_cnt)/len(chunk_cnt)}")
+    #model.plot_layer_distribution()
+    env.close_copy_threads()
+
+    _, gpu_peak_mem = gpu.mem_stats()
+    _, cpu_peak_mem = cpu.mem_stats()
+    print(f"peak gpu mem: {gpu_peak_mem / GB:.3f} GB\t" + f"peak cpu mem: {cpu_peak_mem / GB:.3f} GB\t")
+    if prefill_history:
+        recent_prefill = prefill_history[1:]
+        print(f"Last {len(recent_prefill)} prefill values: {recent_prefill}")
+        print(f"Average of last {len(recent_prefill)} prefill values: {sum(recent_prefill)/len(recent_prefill):.6f}")
+
+
+def process_full_dapr():
+    RootPath = "/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/lqy/HF_HOME/datasets/"
+    docs = load_dataset(RootPath + "UKPLab___dapr/ConditionalQA-docs/0.0.0/67ae3daa13596700976d20605630f5f9db3bd732/", split="test")
+    qrels = load_dataset(RootPath + "UKPLab___dapr/ConditionalQA-qrels/0.0.0/67ae3daa13596700976d20605630f5f9db3bd732/", split="test")
+    queries = load_dataset(RootPath + "UKPLab___dapr/ConditionalQA-queries/0.0.0/67ae3daa13596700976d20605630f5f9db3bd732/", split="test")
+    print(queries)
+    qrels_dict = defaultdict(set)
+
+    for row in qrels:
+        corpus_id = row["corpus_id"]
+        doc_id = corpus_id.split('-')[0]
+        qrels_dict[doc_id].add(row["query_id"])
+    
+    def process_doc(docs, doc_id):
+        docs = docs.filter(lambda row: row["doc_id"] == doc_id)
+        passages = docs[0]["passages"]
+        context = ""
+        for psg in passages:
+            context += psg + "\n"
+        return context
+    def process_query(queries, query_ids):
+        questions = []
+        target_queries = queries.filter(lambda q: q["_id"] in query_ids)
+        for q in target_queries:
+            questions.append(q["text"])
+        return questions
+
+    process_res = {}
+    for k, v in qrels_dict.items():
+        if len(v) < 5:
+            continue
+        doc_id, query_ids = k, v
+        context = process_doc(docs, doc_id)
+        questions = process_query(queries, query_ids)
+        process_res[doc_id] = (context, questions)
+
+    return process_res
+
+def drop_cache():
+    try:
+        import subprocess
+        subprocess.run(['sudo', 'drop_cache'], check=True)
+        logger.info("Successfully dropped system caches")
+    except subprocess.CalledProcessError as e:
+        logger.warning(f"Failed to drop caches: {e}")
+    except Exception as e:
+        logger.warning(f"Unexpected error when dropping caches: {e}")
+
+def run_full_dapr_flexllmgen(args):
+    print(f"<run_dapr_flexllmgen>: args.model: {args.model}")
+    if args.model == "facebook/galactica-30b":
+        tokenizer = AutoTokenizer.from_pretrained("facebook/galactica-30b", padding_side="left")
+    else:
+        #tokenizer = AutoTokenizer.from_pretrained("facebook/opt-30b", padding_side="left")
+        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path, truncation_side="left")
+     
+    num_prompts = args.num_gpu_batches * args.gpu_batch_size
+    max_prompt_len, gen_len, cut_gen_len = args.prompt_len, args.gen_len, args.cut_gen_len
+    
+    gpu = TorchDevice("cuda:0")
+    cpu = TorchDevice("cpu")
+    disk = TorchDisk(args.offload_dir)
+    env = ExecutionEnv(gpu=gpu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gpu, cpu, disk]))
+
+    policy = Policy(args.gpu_batch_size, args.num_gpu_batches,
+                    args.percent[0], args.percent[1],
+                    args.percent[2], args.percent[3],
+                    args.percent[4], args.percent[5],
+                    args.overlap, args.sep_layer, args.pin_weight,
+                    args.cpu_cache_compute, args.attn_sparsity,
+                    args.compress_weight,
+                    CompressionConfig(num_bits=4, group_size=64,
+                                      group_dim=0, symmetric=False),
+                    args.compress_cache,
+                    CompressionConfig(num_bits=4, group_size=64,
+                                      group_dim=2, symmetric=False))
+    assert not (args.compress_cache and args.attn_sparsity < 1.0), "Not implemented"
+
+    opt_config = get_opt_config(args.model, max_seq_len=8192)
+    cache_size = opt_config.cache_bytes(num_prompts, max_prompt_len + gen_len)
+    hidden_size = opt_config.hidden_bytes(num_prompts, max_prompt_len + gen_len)
+    print(f"model size: {opt_config.model_bytes()/GB:.3f} GB, "
+          f"cache size: {cache_size/GB:.3f} GB, "
+          f"hidden size (prefill): {hidden_size/GB:.3f} GB")
+    
+    print("init weight...init_cache_home...")
+
+    model = OptLM(opt_config, env, args.path, policy, args.prompt_len, args.gen_len)
+    requests = process_full_dapr()
+    print(len(requests), flush=True)
+    for doc_id, (context, questions) in requests.items():
+
+        prefix_input = get_tokenized_inputs(context, max_prompt_len=max_prompt_len, tokenizer=tokenizer)
+        print(len(prefix_input[0]))
+        output_ids = model.generate(
+            prefix_input, max_new_tokens=1, debug_mode=args.debug_mode,
+            cut_gen_len=cut_gen_len, verbose=args.verbose
+        )
+        model.sync()
+
+        inputs = [context +  query + "\n" for query in questions]
+        inputs_ids = tokenizer(inputs, truncation=True, max_length=max_prompt_len).input_ids
+        
+        prefill_history = []
+        load_lsh_history = []
+
+        for i in range(len(inputs)):
+            global io_bytes 
+            io_bytes = 0
+            global last_id,last_offset,cur_continue_addr,average_continue_addr
+            last_id = -1
+            last_offset = -1
+            cur_continue_addr = 0
+            average_continue_addr = []
+
+            timers("generate").reset()
+            timers('warmup').reset()
+            timers("imp io").reset()
+            timers("imp calc").reset()
+            timers("compute").reset()
+            timers("imp load and compute").reset()
+            timers("cache store").reset()
+
+            timers("probe_cache").reset()
+            timers("full_cache").reset()
+
+            timers("imp choose1").reset()
+            timers("imp choose2").reset()
+            timers("imp choose3").reset()
+            timers("imp choose4").reset()
+            timers("chunk io").reset()
+            timers("mlp").reset()
+
+            output_ids = model.generate(
+                inputs=[inputs_ids[i]], max_new_tokens = args.gen_len, debug_mode=args.debug_mode, 
+                cut_gen_len=cut_gen_len, verbose=args.verbose)
+            if DUMMY_WEIGHT not in args.path:
+                outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
+                show_str = "Outputs:\n" + 70 * '-' + "\n"
+                for j in range(0, len(outputs)):
+                    show_str += f"{j}: {outputs[j]}\n"    
+                    show_str += "-" * 70 + "\n"
+                if args.verbose >= 2:
+                    print(show_str)
+            
+            start_cache_store = torch.cuda.Event(enable_timing=True)
+            end_cache_store = torch.cuda.Event(enable_timing=True)
+            timers("cache store").start(start_cache_store.record())
+            model.finish_one_query(i)
+            drop_cache()
+            end_cache_store.record()
+            timers("cache store").stop(end_cache_store.synchronize())
+            
+            print("warmup sum:",timers("warmup").elapsed("sum"))
+            print("warmup:",timers("warmup").costs)
+
+            print("imp io average:",timers("imp io").elapsed("average"))
+            print("imp io sum:",timers("imp io").elapsed("sum"))
+            print("imp calc average:",timers("imp calc").elapsed("average"))
+            print("imp calc sum:",timers("imp calc").elapsed("sum"))
+            #print("imp io:{}",timers("imp io").costs)
+            print("imp calc:",timers("imp calc").costs)
+            print("compute average:",timers("compute").elapsed("average"))
+            print("compute sum:",timers("compute").elapsed("sum"))
+            #print("compute:{}",timers("compute").costs)
+            print("prefill:",timers("generate").costs[0])
+            prefill_history.append(timers("generate").costs[0])
+            print((timers("imp io").elapsed("sum") + timers("imp calc").elapsed("sum"))/timers("generate").costs[0] * 100)
+
+            print("imp load :",timers("imp load and compute").elapsed("average"))
+            print("imp sum:",timers("imp load and compute").elapsed("sum"))
+            #print("store cache:",timers("cache store").costs)
+            print("generate:", timers("generate").costs)
+            print("generate sum:", timers("generate").elapsed("sum"))
+            print("probe_cache: ",timers("probe_cache").elapsed("average"), "  ", timers("probe_cache").elapsed("sum"))
+            print("full_cache: ",timers("full_cache").elapsed("average"), "  ", timers("full_cache").elapsed("sum"))
+            
+
+        _, gpu_peak_mem = gpu.mem_stats()
+        _, cpu_peak_mem = cpu.mem_stats()
+        print(f"peak gpu mem: {gpu_peak_mem / GB:.3f} GB\t" + f"peak cpu mem: {cpu_peak_mem / GB:.3f} GB\t")
+        
+        if prefill_history:
+            recent_prefill = prefill_history[1:]
+            prefill_history = []
+            print(f"Last {len(recent_prefill)} prefill values: {recent_prefill}")
+            print(f"Average of last {len(recent_prefill)} prefill values: {sum(recent_prefill)/len(recent_prefill):.6f}")
+
+        del model.radix_tree
+        model.radix_tree = RadixTree()
+    
+    model.final_finish()
+    env.close_copy_threads()
+
+
+def process_full_longbench():
     RootPath = "/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/lqy/HF_HOME/datasets/THUDM___long_bench/data/"
     task = "narrativeqa"
     file_path = RootPath + task + ".jsonl"
     # print(file_path)
     dataset = load_dataset('json', data_files=file_path)["train"]
     
-    context_to_questions = defaultdict(set)
+    context_to_questions = defaultdict(list)
     
     for row in dataset:
         context = row["context"]
         question = row["input"]
-        context_to_questions[context].add(question)
+        context_to_questions[context].append(question)
     
-    max_count = 0
-    max_context = None
-    questions = set()
+    requests = {}
+    req_id = 0
     for ctx, qs in context_to_questions.items():
-        if (len(qs)) > 10:
-            max_count = len(qs)
-            max_context = ctx
-            questions = qs
-            break
+        if (len(qs)) < 10:
+            continue
+        max_context = ctx[:18000]
+        requests[req_id] = (max_context, qs)
+        req_id += 1
 
-    # max_context = max_context.replace(" ", "")
+    return requests
 
-    return max_context[:24500], list(questions)
+def run_full_longbench_flexllmgen(args):
+    print(f"<run_dapr_flexllmgen>: args.model: {args.model}")
+    if args.model == "facebook/galactica-30b":
+        tokenizer = AutoTokenizer.from_pretrained("facebook/galactica-30b", padding_side="left")
+    else:
+        #tokenizer = AutoTokenizer.from_pretrained("facebook/opt-30b", padding_side="left")
+        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path, truncation_side="left")
+     
+    num_prompts = args.num_gpu_batches * args.gpu_batch_size
+    max_prompt_len, gen_len, cut_gen_len = args.prompt_len, args.gen_len, args.cut_gen_len
+    
+    gpu = TorchDevice("cuda:0")
+    cpu = TorchDevice("cpu")
+    disk = TorchDisk(args.offload_dir)
+    env = ExecutionEnv(gpu=gpu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gpu, cpu, disk]))
+
+    policy = Policy(args.gpu_batch_size, args.num_gpu_batches,
+                    args.percent[0], args.percent[1],
+                    args.percent[2], args.percent[3],
+                    args.percent[4], args.percent[5],
+                    args.overlap, args.sep_layer, args.pin_weight,
+                    args.cpu_cache_compute, args.attn_sparsity,
+                    args.compress_weight,
+                    CompressionConfig(num_bits=4, group_size=64,
+                                      group_dim=0, symmetric=False),
+                    args.compress_cache,
+                    CompressionConfig(num_bits=4, group_size=64,
+                                      group_dim=2, symmetric=False))
+    assert not (args.compress_cache and args.attn_sparsity < 1.0), "Not implemented"
+
+    opt_config = get_opt_config(args.model, max_seq_len=8192)
+    cache_size = opt_config.cache_bytes(num_prompts, max_prompt_len + gen_len)
+    hidden_size = opt_config.hidden_bytes(num_prompts, max_prompt_len + gen_len)
+    print(f"model size: {opt_config.model_bytes()/GB:.3f} GB, "
+          f"cache size: {cache_size/GB:.3f} GB, "
+          f"hidden size (prefill): {hidden_size/GB:.3f} GB")
+    
+    print("init weight...init_cache_home...")
+
+    model = OptLM(opt_config, env, args.path, policy, args.prompt_len, args.gen_len)
+    requests = process_full_longbench()
+    print(len(requests), flush=True)
+
+    for doc_id, (context, questions) in requests.items():
+
+        prefix_input = get_tokenized_inputs(context, max_prompt_len=max_prompt_len, tokenizer=tokenizer)
+        print(len(prefix_input[0]))
+        output_ids = model.generate(
+            prefix_input, max_new_tokens=1, debug_mode=args.debug_mode,
+            cut_gen_len=cut_gen_len, verbose=args.verbose
+        )
+        model.sync()
+
+        inputs = [context +  query + "\n" for query in questions]
+        inputs_ids = tokenizer(inputs, truncation=True, max_length=max_prompt_len).input_ids
+        print(len(inputs_ids[0]))
+        prefill_history = []
+        load_lsh_history = []
+
+        for i in range(len(inputs)):
+            global io_bytes 
+            io_bytes = 0
+            global last_id,last_offset,cur_continue_addr,average_continue_addr
+            last_id = -1
+            last_offset = -1
+            cur_continue_addr = 0
+            average_continue_addr = []
+
+            timers("generate").reset()
+            timers('warmup').reset()
+            timers("imp io").reset()
+            timers("imp calc").reset()
+            timers("compute").reset()
+            timers("imp load and compute").reset()
+            timers("cache store").reset()
+
+            timers("probe_cache").reset()
+            timers("full_cache").reset()
+
+            timers("imp choose1").reset()
+            timers("imp choose2").reset()
+            timers("imp choose3").reset()
+            timers("imp choose4").reset()
+            timers("chunk io").reset()
+            timers("mlp").reset()
+
+            output_ids = model.generate(
+                inputs=[inputs_ids[i]], max_new_tokens = args.gen_len, debug_mode=args.debug_mode, 
+                cut_gen_len=cut_gen_len, verbose=args.verbose)
+            if DUMMY_WEIGHT not in args.path:
+                outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
+                show_str = "Outputs:\n" + 70 * '-' + "\n"
+                for j in range(0, len(outputs)):
+                    show_str += f"{j}: {outputs[j]}\n"    
+                    show_str += "-" * 70 + "\n"
+                if args.verbose >= 2:
+                    print(show_str)
+            
+            start_cache_store = torch.cuda.Event(enable_timing=True)
+            end_cache_store = torch.cuda.Event(enable_timing=True)
+            timers("cache store").start(start_cache_store.record())
+            model.finish_one_query(i)
+            drop_cache()
+            end_cache_store.record()
+            timers("cache store").stop(end_cache_store.synchronize())
+            
+            print("warmup sum:",timers("warmup").elapsed("sum"))
+            print("warmup:",timers("warmup").costs)
+
+            print("imp io average:",timers("imp io").elapsed("average"))
+            print("imp io sum:",timers("imp io").elapsed("sum"))
+            print("imp calc average:",timers("imp calc").elapsed("average"))
+            print("imp calc sum:",timers("imp calc").elapsed("sum"))
+            #print("imp io:{}",timers("imp io").costs)
+            print("imp calc:",timers("imp calc").costs)
+            print("compute average:",timers("compute").elapsed("average"))
+            print("compute sum:",timers("compute").elapsed("sum"))
+            #print("compute:{}",timers("compute").costs)
+            print("prefill:",timers("generate").costs[0])
+            prefill_history.append(timers("generate").costs[0])
+            print((timers("imp io").elapsed("sum") + timers("imp calc").elapsed("sum"))/timers("generate").costs[0] * 100)
+
+            print("imp load :",timers("imp load and compute").elapsed("average"))
+            print("imp sum:",timers("imp load and compute").elapsed("sum"))
+            #print("store cache:",timers("cache store").costs)
+            print("generate:", timers("generate").costs)
+            print("generate sum:", timers("generate").elapsed("sum"))
+            print("probe_cache: ",timers("probe_cache").elapsed("average"), "  ", timers("probe_cache").elapsed("sum"))
+            print("full_cache: ",timers("full_cache").elapsed("average"), "  ", timers("full_cache").elapsed("sum"))
+            
+
+        _, gpu_peak_mem = gpu.mem_stats()
+        _, cpu_peak_mem = cpu.mem_stats()
+        print(f"peak gpu mem: {gpu_peak_mem / GB:.3f} GB\t" + f"peak cpu mem: {cpu_peak_mem / GB:.3f} GB\t")
+        
+        if prefill_history:
+            recent_prefill = prefill_history[1:]
+            prefill_history = []
+            print(f"Last {len(recent_prefill)} prefill values: {recent_prefill}")
+            print(f"Average of last {len(recent_prefill)} prefill values: {sum(recent_prefill)/len(recent_prefill):.6f}")
+
+        del model.radix_tree
+        model.radix_tree = RadixTree()
+    
+    model.final_finish()
+    env.close_copy_threads()
+
 
 def run_longbench_flexllmgen(args):
     print(f"<run_longbench_flexllmgen>: args.model: {args.model}")
@@ -2116,191 +2494,6 @@ def run_longbench_flexllmgen(args):
 
 
 
-def run_dapr_flexllmgen(args):
-    print(f"<run_dapr_flexllmgen>: args.model: {args.model}")
-    if args.model == "facebook/galactica-30b":
-        tokenizer = AutoTokenizer.from_pretrained("facebook/galactica-30b", padding_side="left")
-    else:
-        #tokenizer = AutoTokenizer.from_pretrained("facebook/opt-30b", padding_side="left")
-        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path, truncation_side="left")
-     
-    num_prompts = args.num_gpu_batches * args.gpu_batch_size
-    max_prompt_len, gen_len, cut_gen_len = args.prompt_len, args.gen_len, args.cut_gen_len
-    
-    gpu = TorchDevice("cuda:0")
-    cpu = TorchDevice("cpu")
-    disk = TorchDisk(args.offload_dir)
-    env = ExecutionEnv(gpu=gpu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gpu, cpu, disk]))
-
-    policy = Policy(args.gpu_batch_size, args.num_gpu_batches,
-                    args.percent[0], args.percent[1],
-                    args.percent[2], args.percent[3],
-                    args.percent[4], args.percent[5],
-                    args.overlap, args.sep_layer, args.pin_weight,
-                    args.cpu_cache_compute, args.attn_sparsity,
-                    args.compress_weight,
-                    CompressionConfig(num_bits=4, group_size=64,
-                                      group_dim=0, symmetric=False),
-                    args.compress_cache,
-                    CompressionConfig(num_bits=4, group_size=64,
-                                      group_dim=2, symmetric=False))
-    assert not (args.compress_cache and args.attn_sparsity < 1.0), "Not implemented"
-
-    opt_config = get_opt_config(args.model,max_seq_len=8192)
-    cache_size = opt_config.cache_bytes(num_prompts, max_prompt_len + gen_len)
-    hidden_size = opt_config.hidden_bytes(num_prompts, max_prompt_len + gen_len)
-    print(f"model size: {opt_config.model_bytes()/GB:.3f} GB, "
-          f"cache size: {cache_size/GB:.3f} GB, "
-          f"hidden size (prefill): {hidden_size/GB:.3f} GB")
-    
-    print("init weight...init_cache_home...")
-
-    model = OptLM(opt_config, env, args.path, policy, args.prompt_len, args.gen_len)
-
-    context, questions = process_dapr()
-    
-    request_size = args.request
-    questions = questions[:request_size]
-
-    inputs = [context + query + "\n" for query in questions]
-    inputs_ids = tokenizer(inputs, truncation=True, max_length=max_prompt_len).input_ids
-    output_ids = model.generate(
-        inputs=[inputs_ids[0]], max_new_tokens = 1, debug_mode=args.debug_mode, 
-        cut_gen_len=cut_gen_len, verbose=args.verbose)
-    
-    prefill_history = []
-
-    for i in range(len(inputs)):
-        global io_bytes 
-        io_bytes = 0
-        global last_id,last_offset,cur_continue_addr,average_continue_addr
-        last_id = -1
-        last_offset = -1
-        cur_continue_addr = 0
-        average_continue_addr = []
-
-        timers("generate").reset()
-        timers('warmup').reset()
-        timers("imp io").reset()
-        timers("imp calc").reset()
-        timers("compute").reset()
-        timers("imp load and compute").reset()
-        timers("cache store").reset()
-
-        timers("probe_cache").reset()
-        timers("full_cache").reset()
-
-        timers("imp choose1").reset()
-        timers("imp choose2").reset()
-        timers("imp choose3").reset()
-        timers("imp choose4").reset()
-        timers("chunk io").reset()
-        timers("mlp").reset()
-
-        output_ids = model.generate(
-            inputs=[inputs_ids[i]], max_new_tokens = args.gen_len, debug_mode=args.debug_mode, 
-            cut_gen_len=cut_gen_len, verbose=args.verbose)
-        if DUMMY_WEIGHT not in args.path:
-            outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
-            show_str = "Outputs:\n" + 70 * '-' + "\n"
-            for j in range(0, len(outputs)):
-                show_str += f"{j}: {outputs[j]}\n"    
-                show_str += "-" * 70 + "\n"
-            if args.verbose >= 2:
-                print(show_str)
-        
-        start_cache_store = torch.cuda.Event(enable_timing=True)
-        end_cache_store = torch.cuda.Event(enable_timing=True)
-        timers("cache store").start(start_cache_store.record())
-        model.finish_one_query(i == len(inputs) - 1, i)
-        end_cache_store.record()
-        timers("cache store").stop(end_cache_store.synchronize())
-        
-        print("warmup sum:",timers("warmup").elapsed("sum"))
-        print("warmup:",timers("warmup").costs)
-
-        print("imp io average:",timers("imp io").elapsed("average"))
-        print("imp io sum:",timers("imp io").elapsed("sum"))
-        print("imp calc average:",timers("imp calc").elapsed("average"))
-        print("imp calc sum:",timers("imp calc").elapsed("sum"))
-        #print("imp io:{}",timers("imp io").costs)
-        print("imp calc:",timers("imp calc").costs)
-        print("compute average:",timers("compute").elapsed("average"))
-        print("compute sum:",timers("compute").elapsed("sum"))
-        #print("compute:{}",timers("compute").costs)
-        print("prefill:",timers("generate").costs[0])
-        prefill_history.append(timers("generate").costs[0])
-        print((timers("imp io").elapsed("sum") + timers("imp calc").elapsed("sum"))/timers("generate").costs[0] * 100)
-
-        print("imp load :",timers("imp load and compute").elapsed("average"))
-        print("imp sum:",timers("imp load and compute").elapsed("sum"))
-        #print("store cache:",timers("cache store").costs)
-        print("generate:", timers("generate").costs)
-        print("generate sum:", timers("generate").elapsed("sum"))
-        print("probe_cache: ",timers("probe_cache").elapsed("average"), "  ", timers("probe_cache").elapsed("sum"))
-        print("full_cache: ",timers("full_cache").elapsed("average"), "  ", timers("full_cache").elapsed("sum"))
-        
-
-        print("imp choose1: ",timers("imp choose1").elapsed("average"), "  ", timers("imp choose1").elapsed("sum"))
-        print("imp choose1 costs: ",timers("imp choose1").costs)
-        print("imp choose2: ",timers("imp choose2").elapsed("average"), "  ", timers("imp choose2").elapsed("sum"))
-        print("imp choose2 costs: ",timers("imp choose2").costs)
-        print("imp choose3: ",timers("imp choose3").elapsed("average"), "  ", timers("imp choose3").elapsed("sum"))
-        print("imp choose3 costs: ",timers("imp choose3").costs)
-        print("imp choose4: ",timers("imp choose4").elapsed("average"), "  ", timers("imp choose4").elapsed("sum"))
-        print("imp choose4 costs: ",timers("imp choose4").costs)
-        print("mlp: ",timers("mlp").elapsed("average"), "  ", timers("mlp").elapsed("sum"))
-        print("mlp costs: ",timers("mlp").costs)
-
-        # print("total io token:", io_bytes)
-        # print("total continue token", cur_continue_addr)
-        # if i!=0:
-        #     print("average continue:", sum(average_continue_addr) / len(average_continue_addr))
-        #     print("sum avg:", sum(average_continue_addr))
-        if i>=1 and len(imp_token_count) > 0:
-            avg_imp = sum(imp_token_count) / len(imp_token_count)
-            logger.info(f"Important tokens per layer: {imp_token_count}; average per layer: {avg_imp:.2f}")
-    
-
-        #if(i == len(inputs) // 2):
-            #model.radix_tree.visualize()
-            #global chunk_cnt
-            #logger.info(f"Befor KV Reordering, avg_chunk_cnt = {sum(chunk_cnt)/len(chunk_cnt)}")
-            #chunk_cnt = []
-        # model.kv_reordering()
-        # print("=" * 25,"KV_REORDERING", "="*25)
-
-
-        logger.info(f"gpu_cache:{len(model.chunk_pool.gpu_cache.index_heap._pos)}")
-        logger.info(f"cpu_cache:{len(model.chunk_pool.cpu_cache.index_heap._pos)}")
-        
-        # if i == 4 or i==10:
-        #     subprocess.run(['sudo', 'drop_cache'], check=True)
-        #     model.chunk_pool.sync()
-        #     print("=" * 50, "Test Copy Overhead", "="*50)
-        #     model.test_probe_disk()
-        #     #model.test_probe_gpu()
-        #     subprocess.run(['sudo', 'drop_cache'], check=True)
-        #     model.test_full_disk()
-        #     #model.test_full_gpu()
-
-        subprocess.run(['sudo', 'drop_cache'], check=True)
-        
-    #logger.info(f"After KV Reordering, avg_chunk_cnt = {sum(chunk_cnt)/len(chunk_cnt)}")
-    #model.plot_layer_distribution()
-    env.close_copy_threads()
-
-    _, gpu_peak_mem = gpu.mem_stats()
-    _, cpu_peak_mem = cpu.mem_stats()
-    print(f"peak gpu mem: {gpu_peak_mem / GB:.3f} GB\t" + f"peak cpu mem: {cpu_peak_mem / GB:.3f} GB\t")
-    if prefill_history:
-        recent_prefill = prefill_history[1:]
-        print(f"Last {len(recent_prefill)} prefill values: {recent_prefill}")
-        print(f"Average of last {len(recent_prefill)} prefill values: {sum(recent_prefill)/len(recent_prefill):.6f}")
-
-
-
-
 def add_parser_arguments(parser):
     parser.add_argument("--model", type=str, default="facebook/opt-6.7b",
         help="The model name.")
@@ -2413,6 +2606,6 @@ if __name__ == "__main__":
 
     #run_prefix_flexllmgen(args)
     if(args.input == "dapr"):
-        run_dapr_flexllmgen(args)
+        run_full_dapr_flexllmgen(args)
     elif(args.input == "long"):
-        run_longbench_flexllmgen(args)
+        run_full_longbench_flexllmgen(args)
