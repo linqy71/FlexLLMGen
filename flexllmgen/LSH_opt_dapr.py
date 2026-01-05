@@ -14,6 +14,7 @@ import numpy as np
 from tqdm import tqdm
 import torch
 from transformers import AutoTokenizer
+import gc
 
 from flexllmgen.compression import CompressionConfig
 from flexllmgen.opt_config import OptConfig, get_opt_config, download_opt_weights
@@ -1157,9 +1158,6 @@ class OptLM:
         if self.policy.cpu_cache_compute:
             self.env.cpu.del_attention_compute_workspace()
         #self.clear_cache_files(self.task.new_prefix_id)
-        avg_prefix = sum(self.kv_server.prefix_lens) / len(self.kv_server.prefix_lens)
-        avg_imp = sum(self.kv_server.imp_lens) / len(self.kv_server.imp_lens)
-        print(f"avg common len: {avg_prefix}; avg imp len: {avg_imp}; retention: {avg_imp/avg_prefix}")
 
     def finish_one_query(self):
         self.sync()
@@ -1179,6 +1177,9 @@ class OptLM:
             #self.kv_server.persist_kv_store_meta(self.task.new_prefix_id)
         self.kv_server.reset(switch=False)
         logger.info("query finished , now sync the model")
+        avg_prefix = sum(self.kv_server.prefix_lens) / len(self.kv_server.prefix_lens)
+        avg_imp = sum(self.kv_server.imp_lens) / len(self.kv_server.imp_lens)
+        print(f"avg common len: {avg_prefix}; avg imp len: {avg_imp}; retention: {avg_imp/avg_prefix}")
         
     def clear_cache_files(self,prefix_id):
         store_path = self.kv_store_path
@@ -1938,10 +1939,198 @@ def add_parser_arguments(parser):
         const=True, default=False)
     ## query for query_group_persist; seq for sequential_persist
     parser.add_argument("--strategy", type=str, default="query")
-    
+    parser.add_argument("--input", type=str, default="dapr")
     parser.add_argument("--K", type=int, default=8)
     parser.add_argument("--L", type=int, default=50)
     
+
+def process_full_longbench():
+    RootPath = "/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/lqy/HF_HOME/datasets/THUDM___long_bench/data/"
+    task = "narrativeqa"
+    file_path = RootPath + task + ".jsonl"
+    # print(file_path)
+    dataset = load_dataset('json', data_files=file_path)["train"]
+    
+    context_to_questions = defaultdict(list)
+    
+    for row in dataset:
+        context = row["context"]
+        question = row["input"]
+        context_to_questions[context].append(question)
+    
+    requests = {}
+    req_id = 0
+    for ctx, qs in context_to_questions.items():
+        if (len(qs)) < 10:
+            continue
+        max_context = ctx[:18000]
+        requests[req_id] = (max_context, qs)
+        req_id += 1
+
+    return requests
+
+def run_full_longbench_flexllmgen(args):
+    print(f"<run_dapr_flexllmgen>: args.model: {args.model}")
+    if args.model == "facebook/galactica-30b":
+        tokenizer = AutoTokenizer.from_pretrained("facebook/galactica-30b", padding_side="left")
+    else:
+        #tokenizer = AutoTokenizer.from_pretrained("facebook/opt-30b", padding_side="left")
+        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path, truncation_side="left")
+     
+    num_prompts = args.num_gpu_batches * args.gpu_batch_size
+    max_prompt_len, gen_len, cut_gen_len = args.prompt_len, args.gen_len, args.cut_gen_len
+    
+    gpu = TorchDevice("cuda:0")
+    cpu = TorchDevice("cpu")
+    disk = TorchDisk(args.offload_dir)
+    env = ExecutionEnv(gpu=gpu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gpu, cpu, disk]))
+
+    policy = Policy(args.gpu_batch_size, args.num_gpu_batches,
+                    args.percent[0], args.percent[1],
+                    args.percent[2], args.percent[3],
+                    args.percent[4], args.percent[5],
+                    args.overlap, args.sep_layer, args.pin_weight,
+                    args.cpu_cache_compute, args.attn_sparsity,
+                    args.compress_weight,
+                    CompressionConfig(num_bits=4, group_size=64,
+                                      group_dim=0, symmetric=False),
+                    args.compress_cache,
+                    CompressionConfig(num_bits=4, group_size=64,
+                                      group_dim=2, symmetric=False))
+    assert not (args.compress_cache and args.attn_sparsity < 1.0), "Not implemented"
+
+    opt_config = get_opt_config(args.model, max_seq_len=8192)
+    cache_size = opt_config.cache_bytes(num_prompts, max_prompt_len + gen_len)
+    hidden_size = opt_config.hidden_bytes(num_prompts, max_prompt_len + gen_len)
+    print(f"model size: {opt_config.model_bytes()/GB:.3f} GB, "
+          f"cache size: {cache_size/GB:.3f} GB, "
+          f"hidden size (prefill): {hidden_size/GB:.3f} GB")
+    
+    print("init weight...init_cache_home...")
+
+    model = OptLM(opt_config, env, args.path, args.offload_dir, policy, args.prompt_len, args.gen_len, args.strategy, args.K, args.L)
+    requests = process_full_longbench()
+    print(len(requests), flush=True)
+
+    for doc_id, (context, questions) in requests.items():
+
+        prefix_input = get_tokenized_inputs(context, max_prompt_len=max_prompt_len, tokenizer=tokenizer)
+        print("prefix len: ", len(prefix_input[0]))
+        output_ids = model.generate(
+            prefix_input, max_new_tokens=1, debug_mode=args.debug_mode,
+            cut_gen_len=cut_gen_len, verbose=args.verbose
+        )
+        model.sync()
+
+        inputs = [context +  query + "\n" for query in questions]
+        inputs_ids = tokenizer(inputs, truncation=True, max_length=max_prompt_len).input_ids
+        prefill_history = []
+        load_lsh_history = []
+
+        for i in range(len(inputs)):
+            global io_bytes 
+            io_bytes = 0
+            global last_id,last_offset,cur_continue_addr,average_continue_addr
+            last_id = -1
+            last_offset = -1
+            cur_continue_addr = 0
+            average_continue_addr = []
+
+            timers("generate").reset()
+            timers("imp io").reset()
+            timers("imp calc").reset()
+            timers("lsh calc").reset()
+            timers("compute").reset()
+            timers("imp load and compute").reset()
+            timers("copy prefix").reset()
+            timers("cache store").reset()
+
+            timers("io part test").reset()
+            timers("load LSH meta").reset()
+            timers("load table").reset()
+            timers("build table").reset()
+            timers("avgk").reset()
+            timers("hash compute").reset()
+            timers("id retrieve").reset()
+
+            output_ids = model.generate(
+                inputs=[inputs_ids[i]], max_new_tokens = args.gen_len, debug_mode=args.debug_mode, 
+                cut_gen_len=cut_gen_len, verbose=args.verbose, req_id=i, save_res=args.save_res)
+            if DUMMY_WEIGHT not in args.path:
+                outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
+                show_str = "Outputs:\n" + 70 * '-' + "\n"
+                for j in range(0, len(outputs)):
+                    show_str += f"{j}: {outputs[j]}\n"    
+                    show_str += "-" * 70 + "\n"
+                if args.verbose >= 2:
+                    print(show_str)
+            
+            start_cache_store = torch.cuda.Event(enable_timing=True)
+            end_cache_store = torch.cuda.Event(enable_timing=True)
+            timers("cache store").start(start_cache_store.record())
+
+            model.finish_one_query()
+            drop_cache()
+            end_cache_store.record()
+            timers("cache store").stop(end_cache_store.synchronize())
+
+            print("imp io sum:",timers("imp io").elapsed("sum"))
+            print("imp calc sum:",timers("imp calc").elapsed("sum")) #hash comp
+            print("lsh calc sum:",timers("lsh calc").elapsed("sum"))
+            print("compute sum:",timers("compute").elapsed("sum"))
+            print("prefill:",timers("generate").costs[0])
+            prefill_history.append(timers("generate").costs[0])
+            print("imp load sum:",timers("imp load and compute").elapsed("sum"))
+            print("copy prefix sum:",timers("copy prefix").elapsed("sum"))
+
+            print("store cache:",timers("cache store").costs)
+            print("generate sum:", timers("generate").elapsed("sum"))
+
+            print("io part test:", timers("io part test").costs)
+            print("io part test sum:", timers("io part test").elapsed("sum"))
+
+            print("avgk sum:", timers("avgk").elapsed("sum"))
+            print("hash compute sum:", timers("hash compute").elapsed("sum"))
+            print("id retrieve:", timers("id retrieve").elapsed("sum"))
+
+            print("load table:", timers("load table").elapsed("sum"))
+            print("build table:", timers("build table").elapsed("sum"))
+
+            load_lsh_history.append(timers("load LSH meta").elapsed("sum"))
+
+            # print("total io token:", io_bytes)
+            # print("total continue token", cur_continue_addr)
+            # if i!=0:
+            #     print("average continue:", sum(average_continue_addr) / len(average_continue_addr))
+            #     print("sum avg:", sum(average_continue_addr))
+
+        _, gpu_peak_mem = gpu.mem_stats()
+        _, cpu_peak_mem = cpu.mem_stats()
+        print(f"peak gpu mem: {gpu_peak_mem / GB:.3f} GB\t" + f"peak cpu mem: {cpu_peak_mem / GB:.3f} GB\t")
+        gc.collect()
+        
+        if prefill_history:
+            recent_prefill = prefill_history[1:]
+            prefill_history = []
+            print(f"Last {len(recent_prefill)} prefill values: {recent_prefill}")
+            print(f"Average of last {len(recent_prefill)} prefill values: {sum(recent_prefill)/len(recent_prefill):.6f}")
+
+        if load_lsh_history:
+            recent_load_lsh = load_lsh_history[1:]
+            load_lsh_history = []
+            print(f"Last {len(recent_load_lsh)} load LSH values: {recent_load_lsh}")
+            print(f"Average of last {len(recent_load_lsh)} load LSH values: {sum(recent_load_lsh)/len(recent_load_lsh):.6f}")
+        
+        ### remove pt files
+        remove_pt_files(os.path.join(args.offload_dir, "kv_store"))
+        del model.radix_tree
+        model.radix_tree = RadixTree()
+        model.kv_server.reset(switch=True)
+    
+    model.final_finish()
+    env.close_copy_threads()
+
+
 
 
 if __name__ == "__main__":
@@ -1951,5 +2140,8 @@ if __name__ == "__main__":
 
     assert len(args.percent) == 6
 
-    # run_prefix_flexllmgen(args)
-    run_full_dapr_flexllmgen(args)
+    if args.input == "dapr":
+        # run_prefix_flexllmgen(args)
+        run_full_dapr_flexllmgen(args)
+    elif args.input == "long":
+        run_full_longbench_flexllmgen(args)
