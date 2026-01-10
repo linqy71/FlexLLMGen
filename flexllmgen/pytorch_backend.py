@@ -423,9 +423,10 @@ class TorchDevice:
         scaling = head_dim ** -0.5
         
         common_prefix_len = k_cache.shape[0]
+        suffix_len = s - common_prefix_len
         n_important = math.ceil(common_prefix_len * important_ratio)
         
-        hidden = F.layer_norm(inputs.data, (h,), weight=w_ln.data, bias=b_ln.data)
+        hidden = F.layer_norm(inputs.data[:,common_prefix_len:, ], (h,), weight=w_ln.data, bias=b_ln.data)
 
         # w_q_probe = w_q.data.view(h, n_head, head_dim)[:, :n_probe_head, :].reshape(h, n_probe_head * head_dim)
         # b_q_probe = b_q.data.view(n_head, head_dim)[:n_probe_head, :].reshape(n_probe_head * head_dim)
@@ -435,12 +436,12 @@ class TorchDevice:
         
         #logger.info(f"IMP_Token: w_q_probe's shape={w_q_probe.data.shape},b_q_probe's shape={b_q_probe.shape},hidden's shape={b_q.data.shape}")
 
-        # shape: (b * n_probe_head, s, head_dim)
+        # shape: (b * n_probe_head, suffix_len, head_dim)
         q = F.linear(hidden, w_q_probe, bias=b_q_probe) * scaling
-        # shape: (b, s, n_probe_head, head_dim)
-        q = q.view(b, s, n_probe_head, head_dim)
+        # shape: (b, suffix_len, n_probe_head, head_dim)
+        q = q.view(b, suffix_len, n_probe_head, head_dim)
         # shape: (b * n_probe_head, s, head_dim)
-        q = q.permute(0, 2, 1, 3).reshape(b * n_probe_head, s, head_dim)
+        q = q.permute(0, 2, 1, 3).reshape(b * n_probe_head, suffix_len, head_dim)
 
         # origin k_cache shape: (common_prefix_len, b * n_probe_head, head_dim)
         # shape:(b * n_probe_head, head_dim, common_prefix_len)
@@ -455,9 +456,9 @@ class TorchDevice:
         mask = attention_mask.data[:, :common_prefix_len].view(b, 1, 1, common_prefix_len)
         #logger.info(f"IMP_Token mask={mask}")
         # expand to (b, n_probe_head, s, common_prefix_len)
-        mask = mask.expand(b, n_probe_head, s, common_prefix_len)
+        mask = mask.expand(b, n_probe_head, suffix_len, common_prefix_len)
         # reshape to match attn_weights: (b * n_probe_head, s, common_prefix_len)
-        mask = mask.reshape(b * n_probe_head, s, common_prefix_len)
+        mask = mask.reshape(b * n_probe_head, suffix_len, common_prefix_len)
 
         attn_weights = torch.where(mask, attn_weights, -1e4)   
         attn_weights = F.softmax(attn_weights, dim=2)
@@ -498,6 +499,7 @@ class TorchDevice:
             if jaccard >= thresold:
                 imp_token_idx.append(sorted(S_imp[0][0]))
             else:
+                print("Using full attention ---")
                 imp_token_idx.append(list(range(common_prefix_len))) #表示加载全部kv
 
         k_cache.delete()

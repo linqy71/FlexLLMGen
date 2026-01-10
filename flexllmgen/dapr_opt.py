@@ -1846,7 +1846,7 @@ def run_dapr_flexllmgen(args):
         start_cache_store = torch.cuda.Event(enable_timing=True)
         end_cache_store = torch.cuda.Event(enable_timing=True)
         timers("cache store").start(start_cache_store.record())
-        model.finish_one_query(i == len(inputs) - 1, i)
+        model.finish_one_query(i)
         end_cache_store.record()
         timers("cache store").stop(end_cache_store.synchronize())
         
@@ -1922,6 +1922,7 @@ def run_dapr_flexllmgen(args):
         
     #logger.info(f"After KV Reordering, avg_chunk_cnt = {sum(chunk_cnt)/len(chunk_cnt)}")
     #model.plot_layer_distribution()
+    model.final_finish()
     env.close_copy_threads()
 
     _, gpu_peak_mem = gpu.mem_stats()
@@ -2606,6 +2607,6 @@ if __name__ == "__main__":
 
     #run_prefix_flexllmgen(args)
     if(args.input == "dapr"):
-        run_full_dapr_flexllmgen(args)
+        run_dapr_flexllmgen(args)
     elif(args.input == "long"):
         run_full_longbench_flexllmgen(args)
