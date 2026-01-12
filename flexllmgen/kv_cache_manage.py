@@ -940,7 +940,7 @@ class ProbeChunkPool:
 
         self.cpu_buf = torch.empty((1 * GB,), dtype=torch.float16, pin_memory=True)
 
-        self.cpu_buf_k = torch.empty((8192, batch_size * 3 ,self.head_dim), dtype=torch.float16, pin_memory=True)
+        self.cpu_buf_k = torch.empty((8192, batch_size * n_probe_head ,self.head_dim), dtype=torch.float16, pin_memory=True)
 
     @classmethod
     def next_chunk_id(cls):

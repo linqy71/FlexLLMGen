@@ -488,7 +488,7 @@ class TorchDevice:
 
         #logger.info(f"IMP_Token Set:{S_imp}")
 
-        thresold = ((n_important/common_prefix_len) / (2 - n_important/common_prefix_len)) ** 0.6
+        thresold = ((n_important/common_prefix_len) / (2 - n_important/common_prefix_len)) ** 0.3
         
         #logger.info(f"IMP_Token: thresold={thresold}")
 

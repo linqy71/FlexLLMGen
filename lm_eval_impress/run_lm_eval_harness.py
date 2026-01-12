@@ -121,7 +121,7 @@ if __name__ == '__main__':
             if line.strip() != '':
                 requests.append(json.loads(line))
 
-    requests = requests[:args.limited_samples]
+    # requests = requests[:args.limited_samples]
     print(f"Processing {len(requests)} requests...")
     
     results = []
