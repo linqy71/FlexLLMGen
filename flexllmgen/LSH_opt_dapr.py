@@ -594,6 +594,7 @@ class SelfAttention:
                         # k_cache_data, v_cache_data = self.kv_server.get_full_kv(0, j, query_states, prefix_id)
                         length = self.copy_prefix(k_cache, k_cache_data, cur_pos)
                         length = self.copy_prefix(v_cache, v_cache_data, cur_pos)
+                    self.copy_stream.synchronize()
                     timers("copy prefix").stop()
                     timers("imp load and compute").stop()
                     cur_pos += length
@@ -604,7 +605,6 @@ class SelfAttention:
                 print(f"get {avg_n_imp} important tokens")
                 # print(imp_token_idx[:3])
                 timers("compute").start()
-                self.copy_stream.synchronize()
                 h, new_k_cache, new_v_cache = self.compute.mha_prefill_with_kv(h, mask, w_q, b_q,
                     w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln, n_head, k_cache, v_cache, donate,
                     self.policy.compress_cache, self.policy.comp_cache_config, matched_prefix, 
