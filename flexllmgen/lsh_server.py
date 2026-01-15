@@ -18,6 +18,7 @@ class LSHServer:
         max_length: int = 8192,
         device: str = 'cuda:0',
         dtype = torch.float16,
+        merge = True,
         ):
         # 2^K=哈希表桶数，L=哈希表个数
         self.config = config  ### OptConfig or LlamaConfig
@@ -37,6 +38,7 @@ class LSHServer:
         
         self.offloaded = False ### check whether there are keys offloaded to lsh
         self.persisted = False
+        self.merge = merge
     
         ### key -= avg_k before fill to lsh, so record avg_k for recovery
         self.avg_k = [torch.zeros(
@@ -313,9 +315,12 @@ class LSHServer:
         timers("io part test").start()       
         ### collect key value from kv_store
         #timers("io part test").start()
-        #self.kv_store.collect_queried_key_value(prefix_id, layer_idx, self.results_lsh_cpu, self.nnz)
-        self.kv_store.merge_collect_queried_key_value(prefix_id, layer_idx, self.results_lsh_cpu, self.nnz)
-        
+        # self.kv_store.collect_queried_key_value(prefix_id, layer_idx, self.results_lsh_cpu, self.nnz)
+        if self.merge:
+            self.kv_store.merge_collect_queried_key_value(prefix_id, layer_idx, self.results_lsh_cpu, self.nnz)
+        else:
+            self.kv_store.collect_queried_key_value(prefix_id, layer_idx, self.results_lsh_cpu, self.nnz)
+
         #self.kv_store.concurrent_merge_collect_queried_key_value(prefix_id, layer_idx, self.results_lsh_cpu, self.nnz)
         timers("io part test").stop()
         #timers("io part test").stop()
@@ -488,6 +493,7 @@ class LSHServer:
             self.kv_store.alloc(self.num_layers, self.num_attention_heads, self.num_key_value_heads, self.head_dim, self.max_length)
             self.persisted = False
 
+        print("req done, sum of io count: ", self.kv_store.get_num_io())
         self.nnz.zero_()
         self.results_lsh_cpu.zero_()
         self.hash_code_buffer.zero_()

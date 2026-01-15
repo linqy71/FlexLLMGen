@@ -16,6 +16,7 @@ KVStore::KVStore(){
     this->allocated = false;
     this->kv_meta = new std::unordered_map<uint64_t, FileOffsetInfo>();
     this->persisted = false;
+    this->num_io = 0;
 }
 
 KVStore::~KVStore(){
@@ -61,6 +62,7 @@ void KVStore::alloc(
     memset(this->queried_key, 0, this->num_key_value_heads * this->max_length * this->head_dim * sizeof(DTYPE));
     memset(this->queried_value, 0, this->num_key_value_heads * this->max_length * this->head_dim * sizeof(DTYPE));
 
+    this->num_io = 0;
     //this->layer_stats.assign(num_layers, LayerStats());
 
 }
@@ -74,6 +76,8 @@ void KVStore::clear() {
 
     memset(this->queried_key, 0, this->num_key_value_heads * this->max_length * this->head_dim * sizeof(DTYPE));
     memset(this->queried_value, 0, this->num_key_value_heads * this->max_length * this->head_dim * sizeof(DTYPE));
+
+    this->num_io = 0;
 }
 
 void KVStore::fill(
@@ -882,7 +886,7 @@ void KVStore::load_key_value(
     uint64_t cur_file_index = std::numeric_limits<uint64_t>::max();
     int fd = -1; // 文件描述符
     int count = 0;
-
+    std::cout << "Layer:" << layer_id << " head:" << head_id << " num io:" << content.size() << std::endl;
     for (const auto& [file_index, offset, length] : content) {
         // 如果文件分片改变，则切换文件描述符
         if (file_index != cur_file_index) {
@@ -974,10 +978,11 @@ void KVStore::load_key_value_from_file(
     //////// ananlyze
     //if (layer_id == 1 && head_id == 0){
 
-    if (head_id == 0 || head_id == 1 || head_id == 2){  
-        //analyze_content_segments(content, layer_id, head_id, this->layer_stats);
-    }
+    // if (head_id == 0 || head_id == 1 || head_id == 2){  
+    //     analyze_content_segments(content, layer_id, head_id, this->layer_stats);
+    // }
 
+    this->num_io += content.size();
 
     size_t entry_size = 2 * this->head_dim * sizeof(DTYPE); // key + value
     int count = 0;
@@ -991,7 +996,7 @@ void KVStore::load_key_value_from_file(
             if (file.is_open()) file.close();
             //std::string file_name = this->store_path + "/" + std::to_string(prefix_id) + "_part" + std::to_string(file_index) + ".bin";
             //std::string file_name = this->store_path + "/" + std::to_string(prefix_id) + "_layer" + std::to_string(layer_id)  + "_part" + std::to_string(file_index) + ".bin";
-            std::string file_name = this->store_path + "/" + std::to_string(prefix_id)  + "_layer" + std::to_string(layer_id) + ".bin";
+            std::string file_name = this->store_path + "/" + std::to_string(prefix_id)  + "_layer" + std::to_string(layer_id) + "_part0.bin";
             file.open(file_name, std::ios::binary);
             if (!file.is_open()) {
                 std::cerr << "Failed to open file: " << file_name << std::endl;
@@ -1040,6 +1045,8 @@ void KVStore::load_key_value_from_file_concurrent(
 {
     // Currently no-op; placeholder for potential concurrent loading implementation
     if (content.empty()) return;
+
+    this->num_io += content.size();
 
     using TaskIdx = size_t;
     const size_t dtype_size = sizeof(DTYPE);
@@ -1258,9 +1265,11 @@ void KVStore::merge_load_key_value_from_file(
     int layer_id,
     int head_id
 ) {
-    if(head_id == 0 || head_id == 5){
-        //merge_analyze_content_segments(content, layer_id, head_id, this->layer_stats);
-    }
+    // if(head_id == 0 || head_id == 5){
+    //     merge_analyze_content_segments(content, layer_id, head_id, this->layer_stats);
+    // }
+
+    this->num_io += content.size();
     size_t entry_size = 2 * this->head_dim * sizeof(DTYPE); // key + value
     int count = 0;
 
@@ -1543,6 +1552,12 @@ torch::Tensor KVStore::get_queried_value_cache()
     // auto options = torch::TensorOptions().dtype(torch::kFloat32);
     torch::Tensor tensor = torch::from_blob(this->queried_value, {this->num_key_value_heads, this->max_length, this->head_dim}, options);
     return tensor;
+}
+
+int KVStore::get_num_io_and_reset(){
+    int n = this->num_io;
+    this->num_io = 0;
+    return n;
 }
 
 void KVStore::concurrent_merge_collect_queried_key_value(
@@ -1836,5 +1851,6 @@ PYBIND11_MODULE(kvstore, m) {
         .def("promote_persist", &KVStore::promote_persist)
         .def("reorder_persist", &KVStore::reorder_persist)
         .def("get_queried_value_cache", &KVStore::get_queried_value_cache)
-        .def("clear", &KVStore::clear);
+        .def("clear", &KVStore::clear)
+        .def("get_num_io", &KVStore::get_num_io_and_reset);
 }

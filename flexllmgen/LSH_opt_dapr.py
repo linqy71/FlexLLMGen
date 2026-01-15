@@ -773,6 +773,7 @@ class OptLM:
                  max_prompt_len: int,
                  max_gen_len: int,
                  persist_strategy: str,
+                 merge: bool,
                  K: int,
                  L: int):
         if isinstance(config, str):
@@ -835,7 +836,7 @@ class OptLM:
         self.kv_store_path = os.path.join(offload_dir, "kv_store")
         if not os.path.exists(self.kv_store_path):
             os.makedirs(self.kv_store_path)
-        self.kv_server = LSHServer(self.config, self.num_hidden_layers, self.kv_store_path, K=K, L=L, batch_size=1, max_length=8192, device='cuda:0')
+        self.kv_server = LSHServer(self.config, self.num_hidden_layers, self.kv_store_path, K=K, L=L, batch_size=1, max_length=8192, device='cuda:0', merge=merge)
         self.set_kv_server()
         
         for j in range(num_layers):
@@ -1171,9 +1172,9 @@ class OptLM:
             else:
                 raise ValueError(f"Invalid strategy: {self.persist_strategy}")
         else:
-            pass
             #self.kv_server.promote_persist(self.task.new_prefix_id)
-            self.kv_server.reorder_persist(self.task.new_prefix_id)
+            if self.persist_strategy == "query":
+                self.kv_server.reorder_persist(self.task.new_prefix_id)
             #self.kv_server.persist_kv_store_meta(self.task.new_prefix_id)
         self.kv_server.reset(switch=False)
         logger.info("query finished , now sync the model")
@@ -1539,6 +1540,7 @@ def process_dapr():
     return context, questions
 
 def drop_cache():
+    # pass
     try:
         import subprocess
         subprocess.run(['sudo', 'drop_cache'], check=True)
@@ -1596,7 +1598,7 @@ def run_full_dapr_flexllmgen(args):
     
     print("init weight...init_cache_home...")
 
-    model = OptLM(opt_config, env, args.path, args.offload_dir, policy, args.prompt_len, args.gen_len, args.strategy, args.K, args.L)
+    model = OptLM(opt_config, env, args.path, args.offload_dir, policy, args.prompt_len, args.gen_len, args.strategy, args.merge, args.K, args.L)
 
     requests = process_full_dapr()
     print(len(requests), flush=True)
@@ -1933,6 +1935,8 @@ def add_parser_arguments(parser):
     parser.add_argument("--no-log", action="store_true")
     parser.add_argument("--verbose", type=int, default=2)
 
+    parser.add_argument("--merge", type=str2bool, nargs='?',
+        const=True, default=True)
     parser.add_argument("--overlap", type=str2bool, nargs='?',
         const=True, default=False)
     parser.add_argument("--save-res", type=str2bool, nargs='?',
@@ -2008,7 +2012,7 @@ def run_full_longbench_flexllmgen(args):
     
     print("init weight...init_cache_home...")
 
-    model = OptLM(opt_config, env, args.path, args.offload_dir, policy, args.prompt_len, args.gen_len, args.strategy, args.K, args.L)
+    model = OptLM(opt_config, env, args.path, args.offload_dir, policy, args.prompt_len, args.gen_len, args.strategy, args.merge, args.K, args.L)
     requests = process_full_longbench()
     print(len(requests), flush=True)
 
