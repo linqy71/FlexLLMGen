@@ -283,7 +283,8 @@ void KVStore::collect_queried_key_value(
         auto key_ptr = key + i * stride;
         auto value_ptr = value + i * stride;
         for (int j = 0; j < num_indices; j++) {
-          auto cur_ind = ind[j];
+          // auto cur_ind = ind[j];
+          auto cur_ind = ind[i * this->max_length + j];
           memcpy(queried_key_ptr + j * this->head_dim, key_ptr + cur_ind * this->head_dim, this->head_dim * sizeof(DTYPE));
           memcpy(queried_value_ptr + j * this->head_dim, value_ptr + cur_ind * this->head_dim, this->head_dim * sizeof(DTYPE));
         }

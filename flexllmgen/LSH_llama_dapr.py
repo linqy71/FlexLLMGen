@@ -35,6 +35,8 @@ from flexllmgen.llama_template import *
 
 fix_recursive_import()
 
+HF_ROOT = "/HOME/nsccgz_qylin/nsccgz_qylinxy_1/HDD_POOL/lqy/HF_HOME/"
+
 DUMMY_WEIGHT = "_DUMMY_"  # Use dummy weights for benchmark purposes
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 import logging
@@ -515,18 +517,17 @@ class SelfAttention:
                         w_k, w_v, w_out, self.rms_norm_eps, freqs_cis,n_head, num_key_value_heads,
                         donate, self.policy.compress_cache, self.policy.comp_cache_config, matched_prefix)
                     
-                    # self.kv_server.lsh_retrieve(0, self.layer_id, query_states, prefix_id, max_common_len)
-                    # k_cache_data, v_cache_data = self.kv_server.load_kv(0, self.layer_id, prefix_id)
-
-                    k_cache_data, v_cache_data = self.kv_server.get_full_kv(0, self.layer_id, prefix_id)
+                    self.kv_server.lsh_retrieve(0, self.layer_id, query_states, prefix_id, max_common_len)
+                    k_cache_data, v_cache_data = self.kv_server.load_kv(0, self.layer_id, prefix_id)
+                    # k_cache_data, v_cache_data = self.kv_server.get_full_kv(0, self.layer_id, prefix_id)
 
                     length = self.copy_prefix(k_cache, k_cache_data, cur_pos)
                     length = self.copy_prefix(v_cache, v_cache_data, cur_pos)
                     cur_pos += length
             
                 ### kv_server的layer统一用layer_id管理
-                # imp_token_idx, avg_n_imp = self.kv_server.get_imp_idx(self.layer_id)
-                imp_token_idx, avg_n_imp = self.kv_server.get_full_idx(self.layer_id)
+                imp_token_idx, avg_n_imp = self.kv_server.get_imp_idx(self.layer_id)
+                # imp_token_idx, avg_n_imp = self.kv_server.get_full_idx(self.layer_id)
                 print(f"get {avg_n_imp} important tokens")
                 h, new_k_cache, new_v_cache = self.compute.gqa_prefill_with_kv(h, mask, i_n, w_q,
                         w_k, w_v, w_out, self.rms_norm_eps, freqs_cis,n_head, num_key_value_heads,
@@ -550,6 +551,7 @@ class SelfAttention:
             mask, donate[1] = attention_mask.val.smart_copy(self.attention_compute)
             (k_cache, donate[7]), (v_cache, donate[8]) = cache_read_buf.pop()
 
+            imp_token_idx, avg_n_imp = self.kv_server.get_imp_idx(self.layer_id)
             pos = self.task.prompt_len + i
             cos = cos_cached[pos-1:pos]
             sin = sin_cached[pos-1:pos]
@@ -558,7 +560,7 @@ class SelfAttention:
                 w_k, w_v, w_out, self.rms_norm_eps, (cos, sin),
                 n_head, num_key_value_heads, k_cache, v_cache, donate,
                 self.policy.compress_cache, self.policy.comp_cache_config,
-                pos=pos)
+                pos=self.prefill_cache_shape + i, imp_token_idx=imp_token_idx)
             cache_write_buf.store((new_k_cache, new_v_cache))
 
         hidden.val = h
@@ -1090,14 +1092,14 @@ class LLAMA:
 
         self.kv_server.reset(switch=False)
 
-        try:
-            import subprocess
-            subprocess.run(['sudo', 'drop_cache'], check=True)
-            logger.info("Successfully dropped system caches")
-        except subprocess.CalledProcessError as e:
-            logger.warning(f"Failed to drop caches: {e}")
-        except Exception as e:
-            logger.warning(f"Unexpected error when dropping caches: {e}")
+        # try:
+        #     import subprocess
+        #     subprocess.run(['sudo', 'drop_cache'], check=True)
+        #     logger.info("Successfully dropped system caches")
+        # except subprocess.CalledProcessError as e:
+        #     logger.warning(f"Failed to drop caches: {e}")
+        # except Exception as e:
+        #     logger.warning(f"Unexpected error when dropping caches: {e}")
 
         logger.info("query finished , now sync the model")
         num_layers, num_gpu_batches = self.num_layers, self.policy.num_gpu_batches
@@ -1380,7 +1382,7 @@ def get_tokenized_inputs(prompt, max_prompt_len, tokenizer):
     return inputs_ids
 
 def process_dapr():
-    RootPath = "/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/lqy/HF_HOME/datasets/"
+    RootPath = HF_ROOT + "datasets/"
     docs = load_dataset(RootPath + "UKPLab___dapr/ConditionalQA-docs/0.0.0/67ae3daa13596700976d20605630f5f9db3bd732/", split="test")
     qrels = load_dataset(RootPath + "UKPLab___dapr/ConditionalQA-qrels/0.0.0/67ae3daa13596700976d20605630f5f9db3bd732/", split="test")
     queries = load_dataset(RootPath + "UKPLab___dapr/ConditionalQA-queries/0.0.0/67ae3daa13596700976d20605630f5f9db3bd732/", split="test")
@@ -1414,7 +1416,7 @@ def process_dapr():
 
 def run_dapr_flexllmgen(args):
     print(f"<run_dapr_flexllmgen>: args.model: {args.model}")
-    tokenizer = AutoTokenizer.from_pretrained("/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/lqy/HF_HOME/hub/models--meta-llama--Llama-3.3-70B-Instruct/snapshots/6f6073b423013f6a7d4d9f39144961bfbfbc386b")
+    tokenizer = AutoTokenizer.from_pretrained(HF_ROOT + "hub/models--meta-llama--Llama-3.3-70B-Instruct/snapshots/6f6073b423013f6a7d4d9f39144961bfbfbc386b")
     
     num_prompts = args.num_gpu_batches * args.gpu_batch_size
     max_prompt_len, gen_len, cut_gen_len = args.prompt_len, args.gen_len, args.cut_gen_len
@@ -1541,7 +1543,7 @@ def run_dapr_flexllmgen(args):
 
 def run_prefix_flexllmgen(args):
     print(f"<run_flexllmgen>: args.model: {args.model}")
-    tokenizer = AutoTokenizer.from_pretrained("/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/lqy/HF_HOME/hub/models--meta-llama--Meta-Llama-3.1-8B-Instruct/snapshots/0e9e39f249a16976918f6564b8830bc894c89659")
+    tokenizer = AutoTokenizer.from_pretrained(HF_ROOT + "hub/models--meta-llama--Meta-Llama-3.1-8B-Instruct/snapshots/0e9e39f249a16976918f6564b8830bc894c89659")
 
     # if args.model == "facebook/galactica-30b":
     #     tokenizer = AutoTokenizer.from_pretrained("facebook/galactica-30b", padding_side="left")

@@ -564,7 +564,11 @@ class TorchDevice:
         sin = sin.to(self.dev) 
         # freqs_cis = freqs_cis.to(self.dev)
         repeat_kv = n_head // n_kv_head
-        
+        imp_token_idx = imp_token_idx.to(self.dev, dtype=torch.long)
+        imp_token_idx = imp_token_idx.view(b, n_kv_head, n_imp)
+        # 扩成 attention-head 维度，和 repeat 后的 K/V 对齐
+        prefix_token_idxs = imp_token_idx.repeat_interleave(repeat_kv, dim=1)  # [b, n_head, n_imp]
+
         #input_layernorm
         hidden = F.rms_norm(inputs.data, (h,), weight=i_n.data, eps=eps)
         suffix_hidden = hidden[:, common_prefix_len:, :]
@@ -593,7 +597,6 @@ class TorchDevice:
         l = n_imp + suffix_len
 
         # Expand kv heads to match attention heads if needed
-        repeat_kv = n_head // n_kv_head
         if repeat_kv > 1:
             # shape: l, b, n_head, head_dim
             k = ori_k.repeat_interleave(repeat_kv, dim=1)
@@ -605,12 +608,43 @@ class TorchDevice:
         v = v.permute(1, 0, 2).reshape(b * n_head, l, head_dim)
 
         scores = torch.matmul(q, k) / math.sqrt(head_dim)
-        # if attention_mask.data is not None:
-        #     scores = scores + attention_mask.data  # (b, n_head, s, s)
+        scores = scores.view(b, n_head, s, l)
+        suffix_token_idxs = torch.arange(
+            common_prefix_len, s, device=self.dev, dtype=torch.long
+        ).view(1, 1, suffix_len).expand(b, n_head, suffix_len)
+        
+        # 压缩 prefix 列 + suffix 列，在原始序列中的位置
+        token_idxs = torch.cat([prefix_token_idxs, suffix_token_idxs], dim=-1)  # [b, n_head, l]
 
-        ### shape: b, n_head, s, l
+        # causal mask: query t 只能看 <= t 的原始位置
+        idx = torch.arange(s, device=self.dev)
+        causal_mask = (idx <= idx.view(s, 1))   # [s, s]
+
+        # 多补一列给 -1 用
+        expanded_mask = F.pad(causal_mask, (0, 1), value=False)  # [s, s+1]
+
+        token_idxs = token_idxs.clone()
+        token_idxs[token_idxs < 0] = s
+
+        attn_mask = expanded_mask.view(1, 1, s, s + 1).expand(b, n_head, s, s + 1).gather(
+            dim=3,
+            index=token_idxs.unsqueeze(2).expand(-1, -1, s, -1)
+        )  # [b, n_head, s, l]
+
+        # 如果要兼容 padding，再把 pad mask 也 gather 进来
+        if attention_mask is not None:
+            src_valid = F.pad(attention_mask.data.to(self.dev), (0, 1), value=False)
+            src_valid = src_valid.view(b, 1, 1, s + 1).expand(b, n_head, s, s + 1).gather(
+                dim=3,
+                index=token_idxs.unsqueeze(2).expand(-1, -1, s, -1)
+            )
+            attn_mask = attn_mask & src_valid
+
+        scores = scores.masked_fill(~attn_mask, -1e4)
         scores = F.softmax(scores.float(), dim=-1).type_as(q)
-        output = torch.matmul(scores, v)  # (b, n_head, s, head_dim)
+
+        output = torch.matmul(scores.view(b * n_head, s, l), v)   # [b*n_head, s, head_dim]
+        output = output.view(b, n_head, s, head_dim)              # 先还原 head 维
         output = output.transpose(1, 2).contiguous().view(b, s, -1)
         out = F.linear(output, w_out.data)
 
@@ -630,7 +664,7 @@ class TorchDevice:
 
     def gqa_gen(self, inputs, attention_mask, i_n, w_q, w_k, w_v, w_out, eps,
             freqs_cis, n_head, n_kv_head, k_cache, v_cache, donate,
-            compress_cache, comp_config, pos):
+            compress_cache, comp_config, pos, imp_token_idx=None):
         """Grouped-query attention (decoding phase)."""
         
         # decompress weights
@@ -652,7 +686,20 @@ class TorchDevice:
         sin = sin.to(self.dev) 
 
         repeat_kv = n_head // n_kv_head
+        prefix_cache_mask = None
+        if imp_token_idx is not None:
+            imp_token_idx = imp_token_idx.to(self.dev, dtype=torch.long)
+            n_imp = imp_token_idx.shape[1]
+            imp_token_idx = imp_token_idx.view(b, n_kv_head, n_imp)
 
+            # prefix 部分哪些列是真实检索到的 KV，哪些只是为了对齐 max_len 的空槽位
+            prefix_cache_mask = (imp_token_idx >= 0)
+            prefix_cache_mask = prefix_cache_mask.repeat_interleave(repeat_kv, dim=1)
+
+            # decode 阶段 prefix 后面的列（suffix + 已生成 token）都是真实有效的
+            if src_s > n_imp:
+                tail_valid = torch.ones((b, n_head, src_s - n_imp), dtype=torch.bool, device=self.dev)
+                prefix_cache_mask = torch.cat([prefix_cache_mask, tail_valid], dim=2)
         #input_layernorm
         hidden = F.rms_norm(inputs.data, (h,), weight=i_n.data, eps=eps)
 
@@ -693,11 +740,13 @@ class TorchDevice:
 
         # q: (b, n_head, tgt_s, head_dim)
         scores = torch.matmul(q, k) / math.sqrt(head_dim)
-        # if attention_mask.data is not None:
-        #     scores = scores + attention_mask.data  # (b, n_head, tgt_s, src_s)
+        if prefix_cache_mask is not None:
+            scores = scores.view(b, n_head, tgt_s, src_s)
+            scores = scores.masked_fill(~prefix_cache_mask.unsqueeze(2), -1e4)
+            scores = scores.view(b * n_head, tgt_s, src_s)
         scores = F.softmax(scores.float(), dim=-1).type_as(q)
         output = torch.matmul(scores, v) # (b, n_head, tgt_s, head_dim)
-        
+        output = output.view(b, n_head, tgt_s, head_dim)   # 先拆回 head 维
         # Postprocess
         output = output.transpose(1, 2).contiguous().view(b, tgt_s, -1)
         out = F.linear(output, w_out.data)

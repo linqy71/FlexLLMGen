@@ -66,7 +66,17 @@ class LSHServer:
         self.nnz = torch.zeros((self.batch_size * self.num_attention_heads,)).to(torch.int32)
         self.results_lsh_cpu = torch.zeros((self.batch_size * self.num_attention_heads, self.max_length)).to(torch.int32)
     
-        self.query_results = [(torch.zeros_like(self.nnz), torch.zeros_like(self.results_lsh_cpu)) for _ in range(self.num_layers)]
+        self.grouped_nnz = torch.zeros(
+            (self.batch_size * self.num_key_value_heads,),
+            dtype=torch.int32
+        )
+        self.grouped_res = torch.full(
+            (self.batch_size * self.num_key_value_heads, self.max_length),
+            -1,
+            dtype=torch.int32
+        )
+
+        self.query_results = [(torch.zeros_like(self.grouped_nnz), torch.zeros_like(self.grouped_res)) for _ in range(self.num_layers)]
     
         ### store hashcode of queries during prefill
         ### use pinned memory to interact with cpp codes
@@ -157,17 +167,47 @@ class LSHServer:
                     self.sorted_hash_values_buffer, 
                     self.sorted_hash_indices_buffer)
 
+    def group_query_results_for_gqa(self, layer_idx):
+        self.grouped_nnz.zero_()
+        self.grouped_res.fill_(-1)
+        nnz_attn, res_attn = self.nnz, self.results_lsh_cpu
+        group_size = self.num_attention_heads // self.num_key_value_heads
+
+        for b in range(self.batch_size):
+            for kvh in range(self.num_key_value_heads):
+                row = b * self.num_key_value_heads + kvh
+
+                merged = []
+                seen = set()
+
+                start = b * self.num_attention_heads + kvh * group_size
+                end = start + group_size
+
+                for ah in range(start, end):
+                    n = int(nnz_attn[ah].item())
+                    ids = res_attn[ah, :n].tolist()
+                    for tok in ids:
+                        if tok >= 0 and tok not in seen:
+                            seen.add(tok)
+                            merged.append(tok)
+
+                # 如果你更想要按原始位置递增，也可以改成 merged.sort()
+                self.grouped_nnz[row] = len(merged)
+                if merged:
+                    self.grouped_res[row, :len(merged)] = torch.tensor(
+                        merged, dtype=torch.int32, device=res_attn.device
+                    )
+
+
     def record_query_results(self, layer_idx):
         nnz, res = self.query_results[layer_idx]
-        nnz.copy_(self.nnz)
-        res.copy_(self.results_lsh_cpu)
+        nnz.copy_(self.grouped_nnz)
+        res.copy_(self.grouped_res)
 
     def get_imp_idx(self, layer_idx):
         nnz, res = self.query_results[layer_idx]
-        for head_id, n in enumerate(nnz):
-            res[head_id, n:] = -1
         max_len = nnz.max()
-        print(f"layer : {layer_idx}, max_len: {max_len}")
+        # print(f"layer : {layer_idx}, max_len: {max_len}")
         avg_len = nnz.sum() / len(nnz)
         return res[:, :max_len], avg_len
 
@@ -209,27 +249,30 @@ class LSHServer:
         self.results_lsh_cpu.zero_()
         self.lsh_retriever.batch_retrieve_multi(layer_idx, self.pinned_hashcode_multi, q_len ,self.results_lsh_cpu, self.nnz, max_index)
         print(self.nnz)
+        self.group_query_results_for_gqa(layer_idx)
         self.record_query_results(layer_idx)
     
-    def load_kv(self, 
-        req_id: int, 
-        layer_idx: int, 
-        prefix_id: int):
+    def load_kv(self, req_id: int, layer_idx: int, prefix_id: int):
         if not self.offloaded or prefix_id == 0:
-            return None, None
-        
-        ### collect key value from kv_store
-        self.kv_store.collect_queried_key_value(prefix_id, layer_idx, self.results_lsh_cpu, self.nnz)
-        ### shape : n_head, max_length, head_dim
-        res_len = self.nnz.max().data
+            return None, None, None
+
+        self.kv_store.collect_queried_key_value(
+            prefix_id, layer_idx, self.grouped_res, self.grouped_nnz
+        )
+
         queried_key = self.kv_store.get_queried_key_cache()
         queried_value = self.kv_store.get_queried_value_cache()
+
         avg_k = self.avg_k[layer_idx][req_id].to("cpu")
         queried_key = queried_key + avg_k
-        queried_key = queried_key.transpose(0,1).contiguous()
-        queried_value = queried_value.transpose(0,1).contiguous()
 
-        return queried_key[:res_len], queried_value[:res_len]
+        max_len = int(self.grouped_nnz.max().item())
+
+        queried_key = queried_key.transpose(0, 1).contiguous()
+        queried_value = queried_value.transpose(0, 1).contiguous()
+
+        return queried_key[:max_len], queried_value[:max_len]
+
 
     ### for debug...
     ### get full kv from kv_store by generating indices of range(offloaded_len)
