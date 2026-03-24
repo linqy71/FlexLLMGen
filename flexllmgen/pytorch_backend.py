@@ -509,7 +509,18 @@ class TorchDevice:
         #logger.info(f"mha:k.data = {k.data[:,:3,:10]}")
 
         return TorchTensor.create_from_torch(value, self), k, v
-    
+
+    def warmup_gpu(self, typical_shapes):
+        for shapes in typical_shapes:
+            b, s, common_prefix_len, h = shapes
+            # 创建假数据
+            inputs = torch.randn(b, s, h, device='cuda')
+            k_cache = torch.randn(common_prefix_len, b * 3, 128, device='cuda')
+            attention_mask = torch.ones(b, common_prefix_len, dtype=torch.bool, device='cuda')
+            _ = F.layer_norm(inputs, (h,))
+            _ = torch.bmm(inputs, inputs.transpose(1, 2))
+            _ = F.softmax(torch.randn(1, s, common_prefix_len, device='cuda'), dim=-1)
+
     def get_important_token_idx(self, inputs, attention_mask, w_q, b_q,
                 w_ln, b_ln, n_head, k_cache, donate,
                 compress_cache, comp_config, important_ratio):
@@ -1347,14 +1358,15 @@ class TorchDisk:
         self.links = {}
 
         # Copy threads
-        self.copy_queue = queue.Queue()
-        self.copy_threads = [
-            threading.Thread(
-                target=copy_worker_func, args=(self.copy_queue, cuda_id)
-            ) for _ in range(num_copy_threads)
-        ]
-        for t in self.copy_threads:
-            t.start()
+        # self.copy_queue = queue.Queue()
+        # self.copy_threads = [
+        #     threading.Thread(
+        #         target=copy_worker_func, args=(self.copy_queue, cuda_id)
+        #     ) for _ in range(num_copy_threads)
+        # ]
+        # for t in self.copy_threads:
+        #     t.start()
+        self.copy_queue = None
 
         global global_disk_device
         global_disk_device = self
@@ -1393,18 +1405,21 @@ class TorchDisk:
         return k_cache, v_cache
 
     def submit_copy(self, *args):
-        self.copy_queue.put_nowait(args)
+        if self.copy_queue is not None:
+            self.copy_queue.put_nowait(args)
 
     def synchronize(self):
-        self.copy_queue.join()
+        if self.copy_queue is not None:
+            self.copy_queue.join()
 
     def close_copy_threads(self):
-        for _ in range(len(self.copy_threads)):
-            self.copy_queue.put_nowait(None)
-        for t in self.copy_threads:
-            t.join()
-        self.copy_queue.join()
-        self.copy_queue = None
+        if self.copy_queue is not None:
+            for _ in range(len(self.copy_threads)):
+                self.copy_queue.put_nowait(None)
+            for t in self.copy_threads:
+                t.join()
+            self.copy_queue.join()
+            self.copy_queue = None
 
     def mem_stats(self):
         raise NotImplementedError()

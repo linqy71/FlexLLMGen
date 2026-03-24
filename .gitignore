@@ -12,7 +12,8 @@ dist
 .vscode/
 .idea
 *.swp
-
+.claude/
+offload_dir/
 # cache
 *__pycache__
 *.egg-info

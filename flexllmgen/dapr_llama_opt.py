@@ -1,6 +1,6 @@
 """
 Usage:
-python3 -m flexllmgen.flex_llama --model meta/llama3.1-8b --gpu-batch-size 32 --percent 100 0 100 0 100 0 --path=/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/lqy/HF_HOME/hub --overlap=False
+python3 -m flexllmgen.flex_llama --model meta/llama3.1-8b --gpu-batch-size 32 --percent 100 0 100 0 100 0 --path= ~/HDD_POOL/lqy/HF_HOME/hub --overlap=False
 """
 
 import argparse
@@ -29,7 +29,7 @@ from flexllmgen.utils import (Task, ExecutionEnv, GB, T, ValueHolder,
     read_benchmark_log)
 
 from flexllmgen.metadata_manage import RadixTree, RadixTreeNode, RadixToken, CachePointer
-from flexllmgen.kv_cache_manage import ChunkPool
+from flexllmgen.kv_cache_manage import ChunkPool, ProbeChunkPool
 fix_recursive_import()
 
 DUMMY_WEIGHT = "_DUMMY_"  # Use dummy weights for benchmark purposes
@@ -80,10 +80,11 @@ class Policy:
     comp_cache_config: CompressionConfig
 
     # the ratio of important tokens in prefix kv cache
-    important_ratio: float = 0.4
+    important_ratio: float = 0.25
 
     # Config of Chunk Pool
     chunk_size: int = 256
+    probe_chunk_size: int = 3406
     #gpu_heap_size: int = 0
     #cpu_heap_size: int = 0
 
@@ -307,6 +308,9 @@ class SelfAttention:
     def set_chunk_pool(self, chunk_pool):
         self.chunk_pool = chunk_pool
 
+    def set_probe_chunk_pool(self, probe_chunk_pool):
+        self.probe_chunk_pool = probe_chunk_pool
+
     def init_weight(self, weight_home, path):
         h, dtype = (self.config.hidden_size, self.config.dtype)
         path = os.path.join(os.path.join(path, f"decoder.layers.{self.layer_id}"))
@@ -358,26 +362,27 @@ class SelfAttention:
             dst = self.attention_compute.compressed_device
         else:
             dst = self.attention_compute
-        # 首先确定shape,分配空间,然后从chunk_pool中获取数据
+        # 首先确定shape,分配空间,然后从probe_chunk_pool中获取数据
         n_head = self.config.n_head
         n_probe_head = 3
         batch_size = self.policy.gpu_batch_size
         head_dim = self.config.input_dim // n_head
-        
+
         probe_cache_shape = (self.task.common_prefix_len, batch_size * n_probe_head, head_dim)
 
         pin_memory = True if dst.device_type == DeviceType.CPU else False
         k_cache = dst.allocate(probe_cache_shape, np.float16, pin_memory=pin_memory)
 
-        # 第0个batch的第j个token的第i层的kv_ptr
+        # 使用ProbeChunkPool并发获取probe cache
+        # 构建请求字典: {chunk_id: [(src_offset, dst_offset), ...]}
+        req = defaultdict(list)
         for t_idx in range(self.task.common_prefix_len):
-            kv_ptr = self.task.common_prefix_kv_ptr[t_idx][j]
-            chunk_id, offset = kv_ptr.chunk_id, kv_ptr.offset
-            #logger.info(f"In load_probe_cahe token:{t_idx} layer:{j}: kv_ptr = {kv_ptr}")
-            self.chunk_pool.get_probe_cache(k_cache, t_idx, chunk_id, offset)
-        # global io_bytes
-        # io_bytes += self.task.common_prefix_len * n_probe_head * head_dim
-        cache_read_buf.store((k_cache,True))
+            probe_k_ptr = self.task.common_prefix_token[t_idx].probe_ptr
+            chunk_id, offset = probe_k_ptr[j].chunk_id, probe_k_ptr[j].offset
+            req[chunk_id].append((offset, t_idx))
+
+        self.probe_chunk_pool.get_probe_cache_concurrent_merge(k_cache, req)
+        cache_read_buf.store((k_cache, True))
 
     def get_prefix_kv(self, imp_token_idx, layer):
         n_head = self.config.n_head
@@ -390,15 +395,18 @@ class SelfAttention:
         shape = (n_important, batch_size * n_kv_head, head_dim)
 
         pin_memory = True if dst.device_type == DeviceType.CPU else False
-        
+
         k_cache = dst.allocate(shape, np.float16, pin_memory=pin_memory)
         v_cache = dst.allocate(shape, np.float16, pin_memory=pin_memory)
 
+        req = defaultdict(list)
         for j in range(n_important):
-            kv_ptr = self.task.common_prefix_kv_ptr[imp_token_idx[j]][layer]
+            kv_ptr = self.task.common_prefix_token[imp_token_idx[j]].kv_ptr[layer]
             chunk_id, offset = kv_ptr.chunk_id, kv_ptr.offset
-            #logger.info(f"Get prefix kv: chunk_id={chunk_id}, offset={offset}")
-            self.chunk_pool.get_full_head_cache(k_cache, v_cache, j, chunk_id, offset)
+            req[chunk_id].append((offset, j))
+        
+        self.chunk_pool.get_full_head_cache_concurrent_once(k_cache, v_cache, req)
+
         return k_cache, v_cache
 
     def load_cache(self, cache_home, cache_read_buf, i, j):
@@ -634,6 +642,9 @@ class TransformerLayer:
         self.attention.set_chunk_pool(chunk_pool)
         #self.mlp.set_chunk_pool(chunk_pool)
 
+    def set_probe_chunk_pool(self, probe_chunk_pool):
+        self.attention.set_probe_chunk_pool(probe_chunk_pool)
+
     def init_weight(self, weight_home, path):
         home1, home2 = ValueHolder(), ValueHolder()
         self.attention.init_weight(home1, path)
@@ -736,9 +747,11 @@ class LLAMA:
         self.task = None
         self.init_all_weights()
 
-        self.radix_tree = RadixTree() 
-        self.chunk_pool = ChunkPool(self.env, self.config, self.policy.chunk_size) # Initialize chunk pool
+        self.radix_tree = RadixTree()
+        self.chunk_pool = ChunkPool(self.env, self.config, chunk_size=self.policy.chunk_size) # Initialize chunk pool
+        self.probe_chunk_pool = ProbeChunkPool(self.env, self.config, batch_size=self.policy.gpu_batch_size, chunk_size=self.policy.probe_chunk_size) # Initialize probe chunk pool
         self.set_chunk_pool()
+        self.set_probe_chunk_pool()
         
         for j in range(num_layers):
             for k in range(num_gpu_batches):
@@ -757,6 +770,11 @@ class LLAMA:
     def set_chunk_pool(self):
         for l in self.layers:
             l.set_chunk_pool(self.chunk_pool)
+
+    def set_probe_chunk_pool(self):
+        for l in self.layers:
+            if hasattr(l, 'set_probe_chunk_pool'):
+                l.set_probe_chunk_pool(self.probe_chunk_pool)
 
     def init_weight(self, j):
         expanded_path = os.path.abspath(os.path.expanduser(
@@ -921,6 +939,12 @@ class LLAMA:
         for j in range(self.num_layers):
             self.delete_weight(j, 0)
 
+    def warmup(self):
+        typical_shapes = [(1, 1024, 4096, 128)]
+        timers('warmup').start()
+        self.env.gpu.warmup_gpu(typical_shapes)
+        timers('warmup').stop()
+
     def update_attention_mask(self, i, k):
         if i > 0:
             mask = self.attention_mask[k]
@@ -948,46 +972,28 @@ class LLAMA:
         common_prefix_len = self.task.common_prefix_len
         inputs = self.task.inputs[0]
         prompt_len = self.task.prompt_len
-        
+
         kv_ptr = [[] for _ in range(common_prefix_len, prompt_len)]
+        probe_ptr = [[] for _ in range(common_prefix_len, prompt_len)]
 
         for layer in range(self.num_layers):
             for t_idx in range(common_prefix_len, prompt_len):
-
-                if isinstance(self.layers[layer], SelfAttention) == False and  isinstance(self.layers[layer], TransformerLayer) == False:
+                if not hasattr(self.layers[layer], 'attention'):
                     kv_ptr[t_idx - common_prefix_len].append(None)
+                    probe_ptr[t_idx - common_prefix_len].append(None)
                     continue
-        
                 for b in range(self.policy.num_gpu_batches):
                     src = self.cache_home[layer][b]
                     k_cache, v_cache = src.val
-                    ptr = self.chunk_pool.store_prefix_cache(k_cache, v_cache, self.layers[layer].prefill_cache_shape + t_idx - prompt_len) 
-                    kv_ptr[t_idx - common_prefix_len].append(ptr)               
-        # cache_home 里存储的缓存形状是：(prefill_cache_shape + suffix_len + gen_len - 1, b * n_head, head_dim)
-        # n_imp部分的已经持久化了，只需要持久化suffix_len部分的。
-        # for t_idx in range(common_prefix_len,  prompt_len):
-        #     ptr = []
-        #     for layer in range (self.num_layers):
-        #         if isinstance(self.layers[layer], SelfAttention) == False:
-        #             ptr.append(None)# 如果不是注意力层就append一个None。 
-        #             continue
-        #         for b in range(self.policy.num_gpu_batches):
-        #             src = self.cache_home[layer][b]
-        #             k_cache, v_cache = src.val
-        #             # 在cache_home中该token的下标是n_imp + (t_idx - common_prefix_len) 或者 common_prefix_len + (t_idx - common_prefix_len)
-        #             # 如果是第二种情况，prefill_cache_shape = prompt_len 如果是第一种情况，prefill_cache_shape = n_imp + NR = n_imp + prompt_len - common_prefix_len
-        #             # n_imp = prefill_cache_shape + common_prefix_len - prompt_len
-        #             # 下标为prefill_cache_shape + common_prefix_len - prompt_len + idx - common_prefix_len = prefill_cache_shape - prompt_len + idx
-        #             #logger.info(f"Before storing prefix cache, k_cache shape: {k_cache.shape}, v_cache shape: {v_cache.shape}, layer: {layer}, batch: {b}, token index: {t_idx}, common_prefix_len: {common_prefix_len}, prefill_cache_shape: {self.layers[layer].prefill_cache_shape}")
-        #             #logger.info(f"Store Prefix Cache: k_cache.data={k_cache.data[self.layers[layer].prefill_cache_shape + t_idx - prompt_len,:3,:10]}")
-        #             ptr.append(self.chunk_pool.store_prefix_cache(k_cache, v_cache, self.layers[layer].prefill_cache_shape + t_idx - prompt_len))
-        #             self.env.disk.synchronize()
-        #             #logger.info(f"Store prefix cache for layer {layer}, batch {b}, token index {t_idx}, cache_offset {self.layers[layer].prefill_cache_shape + t_idx - prompt_len}, pointer: {ptr[-1]}")
-        #     kv_ptr.append(ptr)
-        logging.info(f"kv_ptr:{len(kv_ptr)}")
-        #logging.info(f"common_prefix_len={common_prefix_len}, prompt_len={prompt_len}")
+                    ptr = self.chunk_pool.store_prefix_cache(k_cache, v_cache, self.layers[layer].prefill_cache_shape + t_idx - prompt_len)
+                    kv_ptr[t_idx - common_prefix_len].append(ptr)
+                    pr_ptr = self.probe_chunk_pool.store_probe_k(k_cache, self.layers[layer].prefill_cache_shape + t_idx - prompt_len)
+                    probe_ptr[t_idx - common_prefix_len].append(pr_ptr)
 
-        self.radix_tree.insert(inputs, kv_ptr)
+
+        logging.info(f"kv_ptr:{len(kv_ptr)}")
+
+        self.radix_tree.insert(inputs, kv_ptr, probe_ptr)
 
     def generate(self,
                  inputs: Union[np.array, List[List[int]]],
@@ -998,7 +1004,7 @@ class LLAMA:
                  debug_mode: Optional[str] = None,
                  cut_gen_len: Optional[int] = None,
                  verbose: int = 0):
-        common_prefix_kv_ptr, common_prefix_len = self.generate_with_prefix(inputs[0])
+        common_prefix_token, common_prefix_len = self.generate_with_prefix(inputs[0])
         logger.info(f"generate: common_prefix_len={common_prefix_len}")
         task = Task(
             inputs=inputs,
@@ -1008,7 +1014,7 @@ class LLAMA:
             do_sample=do_sample,
             temperature=temperature,
             stop=stop,
-            common_prefix_kv_ptr=common_prefix_kv_ptr,
+            common_prefix_token=common_prefix_token,
             common_prefix_len=common_prefix_len
         )
         num_layers = self.num_layers
@@ -1092,9 +1098,12 @@ class LLAMA:
 
     def generation_loop_normal(self):
         for i in range(self.execute_gen_len):
-            timers("generate").start()
+            
             for k in range(self.num_gpu_batches):
                 self.update_attention_mask(i, k)
+            
+            self.warmup()
+            timers("generate").start()
             for j in range(self.num_layers):
                 for k in range(self.num_gpu_batches):
                     self.load_weight(i, j, k, overlap=False)
@@ -1197,8 +1206,10 @@ class LLAMA:
 
         # Generate
         for i in range(self.execute_gen_len):
-            timers("generate").start()
+            
             self.update_attention_mask(i, 0)
+            self.warmup() 
+            timers("generate").start()
             for j in range(self.num_layers):
                 self.load_weight(i, j+1, 0)
                 self.load_cache(i, j+1, 0)
@@ -1362,7 +1373,7 @@ def get_tokenized_inputs(prompt, max_prompt_len, tokenizer):
 
 def run_flexllmgen(args):
     print(f"<run_flexllmgen>: args.model: {args.model}")
-    tokenizer = AutoTokenizer.from_pretrained("/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/lqy/HF_HOME/hub/models--meta-llama--Meta-Llama-3.1-8B-Instruct/snapshots/0e9e39f249a16976918f6564b8830bc894c89659")
+    tokenizer = AutoTokenizer.from_pretrained("~/HDD_POOL/lqy/HF_HOME/hub/models--meta-llama--Meta-Llama-3.1-8B-Instruct/snapshots/0e9e39f249a16976918f6564b8830bc894c89659")
 
     # if args.model == "facebook/galactica-30b":
     #     tokenizer = AutoTokenizer.from_pretrained("facebook/galactica-30b", padding_side="left")
@@ -1460,7 +1471,7 @@ def run_flexllmgen(args):
         print(log_str)
 
 def process_dapr():
-    RootPath = "/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/lqy/HF_HOME/datasets/"
+    RootPath = "/HOME/nsccgz_qylin/nsccgz_qylinxy_1/HDD_POOL/lqy/HF_HOME/datasets/"
     docs = load_dataset(RootPath + "UKPLab___dapr/ConditionalQA-docs/0.0.0/67ae3daa13596700976d20605630f5f9db3bd732/", split="test")
     qrels = load_dataset(RootPath + "UKPLab___dapr/ConditionalQA-qrels/0.0.0/67ae3daa13596700976d20605630f5f9db3bd732/", split="test")
     queries = load_dataset(RootPath + "UKPLab___dapr/ConditionalQA-queries/0.0.0/67ae3daa13596700976d20605630f5f9db3bd732/", split="test")
@@ -1490,12 +1501,11 @@ def process_dapr():
     for q in target_queries:
         questions.append(q["text"])
     #print(questions)
-
     return context, questions
 
 def run_dapr_flexllmgen(args):
     print(f"<run_llama_dapr_flexllmgen>: args.model: {args.model}")
-    tokenizer = AutoTokenizer.from_pretrained("/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/lqy/HF_HOME/hub/models--meta-llama--Meta-Llama-3.1-8B-Instruct/snapshots/0e9e39f249a16976918f6564b8830bc894c89659")
+    tokenizer = AutoTokenizer.from_pretrained("/HOME/nsccgz_qylin/nsccgz_qylinxy_1/HDD_POOL/lqy/HF_HOME/hub/models--meta-llama--Meta-Llama-3.1-8B-Instruct/snapshots/0e9e39f249a16976918f6564b8830bc894c89659")
 
     num_prompts = args.num_gpu_batches * args.gpu_batch_size
     max_prompt_len, gen_len, cut_gen_len = args.prompt_len, args.gen_len, args.cut_gen_len
@@ -1527,18 +1537,17 @@ def run_dapr_flexllmgen(args):
           f"hidden size (prefill): {hidden_size/GB:.3f} GB")
     
     print("init weight...init_cache_home...")
-    max_length = 4096
+    max_length = 16384
     model = LLAMA(llama_config, env, args.path, policy, max_length, max_prompt_len, gen_len)
 
     context, questions = process_dapr()
-
-    inputs = [context[-8520:] +  query + "\n" for query in questions]
+    inputs = [context +  query + "\n" for query in questions]
     inputs_ids = tokenizer(inputs, truncation=True, max_length=max_prompt_len).input_ids
-
+    logger.info(f"max_input_tokens: {max([len(ids) for ids in inputs_ids])}")
     output_ids = model.generate(
         inputs=[inputs_ids[0]], max_new_tokens = 1, debug_mode=args.debug_mode, 
         cut_gen_len=cut_gen_len, verbose=args.verbose)
-
+    print("="*50,"warmup - generate finished", "=" * 50)
     for i in range(len(inputs)):
         timers("generate").reset()
         output_ids = model.generate(
@@ -1546,12 +1555,12 @@ def run_dapr_flexllmgen(args):
             cut_gen_len=cut_gen_len, verbose=args.verbose)
         if DUMMY_WEIGHT not in args.path:
             outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
-            show_str = "Outputs:\n" + 70 * '-' + "\n"
-            for j in range(0, len(outputs)):
-                show_str += f"{j}: {outputs[j]}\n"    
-                show_str += "-" * 70 + "\n"
-            if args.verbose >= 2:
-                print(show_str)
+            prompt_tail = tokenizer.decode(inputs_ids[i][-100:]) if len(inputs_ids[i]) > 100 else tokenizer.decode(inputs_ids[i])
+            print(f"\n{'='*60}")
+            print(f"Prompt (last 100 chars):\n{prompt_tail}")
+            print(f"{'-'*60}")
+            print(f"Generated:\n{outputs[0][-32:]}")
+            print(f"{'='*60}\n")
 
         print("prefill:",timers("generate").costs[0])
         model.finish_one_query(i == len(inputs) - 1)
