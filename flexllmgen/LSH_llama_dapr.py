@@ -299,7 +299,8 @@ class OutputEmbed:
             (norm, _), (w_lm, _) = weight_read_buf.val
 
         h = self.compute.llama_output_embed(h, norm, w_lm, self.rms_norm_eps, donate,
-            self.task.temperature)
+            self.task.temperature,
+            return_full_logits=getattr(self.task, 'is_logits_task', False))
         hidden.val = h
 
 
@@ -485,7 +486,7 @@ class SelfAttention:
         seq_len, _, _ = k_new.shape
 
         if self.task.prefix_only:
-            print(f"offloading prefix {self.task.new_prefix_id} to LSH")
+            # print(f"offloading prefix {self.task.new_prefix_id} to LSH")
             self.kv_server.offload_to_lsh(self.layer_id, 0, seq_len, self.task.new_prefix_id, k_new.data, v_new.data)
             return
 
@@ -1023,6 +1024,117 @@ class LLAMA:
             (self.policy.gpu_batch_size, self.task.prompt_len), bool)
         val.load_from_np((input_ids != self.config.pad_token_id))
         self.attention_mask[k].store(val)
+
+    def get_logits(self,
+                   inputs: Union[np.array, List[int]],
+                   temperature: float = 1.0,
+                   full: bool = False,
+                   req_id: int = 0):
+        """Compute full logits for the given input (prefill only, no generation).
+        Used by the lm_eval harness to evaluate model quality."""
+        matched_prefix = self.radix_tree.match(inputs[0])
+        prefix_only = False
+        new_prefix_id = 0
+        if full:
+            common_len = 0  # full kv
+        else:
+            common_len = sum(matched_prefix.values())
+        if common_len < 10:
+            del self.radix_tree
+            self.radix_tree = RadixTree()
+            self.kv_server.reset(switch=True)
+            prefix_only = True
+            new_prefix_id = self.radix_tree.insert(inputs[0])
+        else:
+            self.kv_server.reset(switch=False)
+            new_prefix_id = list(matched_prefix.keys())[0]
+        task = Task(
+            inputs=inputs,
+            prompt_len=len(inputs[0]),
+            gen_len=1,
+            cut_gen_len=1,
+            do_sample=False,
+            temperature=temperature,
+            stop=None,
+            matched_prefix=matched_prefix,
+            prefix_only=prefix_only,
+            new_prefix_id=new_prefix_id,
+            req_id=req_id,
+            is_logits_task=True,
+        )
+        print(f"get_logits: prompt_len={task.prompt_len}")
+        num_layers = self.num_layers
+        num_gpu_batches = self.num_gpu_batches
+        gpu_batch_size = self.policy.gpu_batch_size
+        prompt_len, gen_len = task.prompt_len, task.gen_len
+        self.execute_gen_len = task.cut_gen_len if task.cut_gen_len else task.gen_len
+
+        # Output token ids
+        self.output_ids = np.full((len(task.inputs), prompt_len + gen_len),
+            self.config.pad_token_id, dtype=np.int32)
+        self.stopped = np.zeros((len(task.inputs), 1), dtype=bool)
+        self.output_ids[:, :prompt_len] = np.asarray(task.inputs)
+        assert gpu_batch_size * num_gpu_batches == len(task.inputs)
+
+        # Intermediate tensors
+        num_layers, num_gpu_batches = self.num_layers, self.policy.num_gpu_batches
+        for j in range(num_layers):
+            for k in range(num_gpu_batches):
+                self.cache_read_buf[j][k].clear()
+                self.cache_write_buf[j][k].clear()
+
+        for j in range(num_layers):
+            self.weight_read_buf[j].clear()
+        for k in range(num_gpu_batches):
+            self.attention_mask[k].clear()
+        self.hidden = array_3d(gen_len, num_layers, num_gpu_batches, ValueHolder)
+
+        self.set_task(task)
+        logits_tensor = self.logits_loop_normal()
+        return logits_tensor
+
+    def logits_loop_normal(self):
+        """Prefill-only loop that returns full logits from the last layer."""
+        i = 0
+        for k in range(self.num_gpu_batches):
+            self.update_attention_mask(i, k)
+
+        for j in range(self.num_layers):
+            for k in range(self.num_gpu_batches):
+                self.load_weight(i, j, k, overlap=False)
+
+            for k in range(self.num_gpu_batches):
+                self.load_cache(i, j, k, overlap=False)
+                self.load_hidden(i, j, k)
+                self.compute_layer(i, j, k)
+                if j == self.num_layers - 1:
+                    pass  # keep hidden — it contains the logits
+                else:
+                    self.store_hidden(i, j, k)
+                self.store_cache(i, j, k, overlap=False)
+
+        return self._extract_logits_from_hidden()
+
+    def _extract_logits_from_hidden(self):
+        """Extract full logits tensor from the last layer's hidden state."""
+        last_layer_idx = self.num_layers - 1
+        batch_logits = []
+        for k in range(self.num_gpu_batches):
+            hidden_tensor = self.hidden[0][last_layer_idx][k].val
+            if hidden_tensor is not None:
+                logits_data = hidden_tensor.data.detach().cpu()
+                if logits_data.dim() == 3 and logits_data.dtype in [torch.float32, torch.float16]:
+                    batch_logits.append(logits_data.to(torch.float32))
+                else:
+                    raise RuntimeError(
+                        f"_extract_logits_from_hidden: unexpected tensor shape={logits_data.shape}, "
+                        f"dtype={logits_data.dtype}")
+            else:
+                raise RuntimeError(
+                    f"_extract_logits_from_hidden: hidden is None for batch {k}")
+        if not batch_logits:
+            raise RuntimeError("_extract_logits_from_hidden: no logits extracted")
+        return torch.cat(batch_logits, dim=0)
 
     def generate(self,
                  inputs: Union[np.array, List[List[int]]],
@@ -1803,6 +1915,40 @@ def add_parser_arguments(parser):
     parser.add_argument("--save-res", type=str2bool, nargs='?', const=True, default=False)
     parser.add_argument("--collision-threshold", type=int, default=2,
         help="LSH collision threshold: a token must appear in at least this many hash tables to be selected.")
+    parser.add_argument("--tokenizer-path", type=str, default=None,
+        help="Path to the tokenizer (HuggingFace format). Used by the eval harness.")
+    parser.add_argument("--K", type=int, default=10,
+        help="LSH K parameter (bits per hash, 2^K buckets per table).")
+    parser.add_argument("--L", type=int, default=150,
+        help="LSH L parameter (number of hash tables).")
+
+
+def get_model(args):
+    """Create and return a LLAMA model instance. Used by the eval harness."""
+    gpu = TorchDevice("cuda:0")
+    cpu = TorchDevice("cpu")
+    disk = TorchDisk(args.offload_dir)
+    env = ExecutionEnv(gpu=gpu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gpu, cpu, disk]))
+
+    policy = Policy(args.gpu_batch_size, args.num_gpu_batches,
+                    args.percent[0], args.percent[1],
+                    args.percent[2], args.percent[3],
+                    args.percent[4], args.percent[5],
+                    args.overlap, args.sep_layer, args.pin_weight,
+                    args.cpu_cache_compute, args.attn_sparsity,
+                    args.compress_weight,
+                    CompressionConfig(num_bits=4, group_size=64,
+                                      group_dim=0, symmetric=False),
+                    args.compress_cache,
+                    CompressionConfig(num_bits=4, group_size=64,
+                                      group_dim=2, symmetric=False))
+
+    llama_config = get_llama_config(args.model)
+    model = LLAMA(llama_config, env, args.path, args.offload_dir, policy,
+                  args.prompt_len, args.gen_len, args.strategy,
+                  collision_threshold=args.collision_threshold)
+    model.env = env
+    return model
 
 
 if __name__ == "__main__":

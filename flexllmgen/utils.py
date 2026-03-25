@@ -41,6 +41,7 @@ class Task:
     new_prefix_id: int = None
     req_id: int = 0
     save_res: bool = False
+    is_logits_task: bool = False
 
 @dataclasses.dataclass(frozen=True)
 class ExecutionEnv:

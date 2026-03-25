@@ -364,25 +364,30 @@ class TorchDevice:
 
         return final_indices.squeeze(-1)
 
-    def llama_output_embed(self, inputs, norm, w_lm, eps, donate, temperature=0.6, topp=0.9):
+    def llama_output_embed(self, inputs, norm, w_lm, eps, donate, temperature=0.6, topp=0.9,
+                           return_full_logits=False):
         # decompress weights
         if w_lm.device.device_type == DeviceType.COMPRESSED:
             w_lm = w_lm.device.decompress(w_lm)
             norm = norm.device.decompress(norm)
-        
+
         b, s, h = inputs.shape
-        
+
         hidden = F.rms_norm(inputs.data, (h,), weight=norm.data, eps=eps)
         if donate[0]: inputs.delete()
-        
+
         logits = F.linear(hidden, w_lm.data)
+
+        if return_full_logits:
+            return TorchTensor.create_from_torch(logits, self)
+
         last_token_logits = logits[:, -1:, :]
-        
+
         if temperature < 0.1:
             ids = last_token_logits.argmax(dim=-1)
         else :
             ids = self.topp_temperature_decode(last_token_logits, temperature, topp)
-        
+
         return TorchTensor.create_from_torch(ids, self)
 
     def opt_output_embed(self, inputs, w_ln, b_ln, w_token, donate,
@@ -568,6 +573,7 @@ class TorchDevice:
         imp_token_idx = imp_token_idx.view(b, n_kv_head, n_imp)
         # 扩成 attention-head 维度，和 repeat 后的 K/V 对齐
         prefix_token_idxs = imp_token_idx.repeat_interleave(repeat_kv, dim=1)  # [b, n_head, n_imp]
+        valid_prefix = (prefix_token_idxs >= 0) & (prefix_token_idxs < common_prefix_len)
 
         #input_layernorm
         hidden = F.rms_norm(inputs.data, (h,), weight=i_n.data, eps=eps)
@@ -624,7 +630,7 @@ class TorchDevice:
         expanded_mask = F.pad(causal_mask, (0, 1), value=False)  # [s, s+1]
 
         token_idxs = token_idxs.clone()
-        token_idxs[token_idxs < 0] = s
+        token_idxs[:, :, :n_imp][~valid_prefix] = s
 
         attn_mask = expanded_mask.view(1, 1, s, s + 1).expand(b, n_head, s, s + 1).gather(
             dim=3,
