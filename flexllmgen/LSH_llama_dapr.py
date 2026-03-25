@@ -38,8 +38,35 @@ fix_recursive_import()
 HF_ROOT = "/HOME/nsccgz_qylin/nsccgz_qylinxy_1/HDD_POOL/lqy/HF_HOME/"
 
 DUMMY_WEIGHT = "_DUMMY_"  # Use dummy weights for benchmark purposes
-os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+# os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 import logging
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
+
+def set_cpu_affinity(gpu_id, cpu_cores=None):
+    if psutil is None:
+        print("psutil is not installed, skip cpu affinity binding")
+        return
+
+    process = psutil.Process(os.getpid())
+    if cpu_cores is None:
+        if gpu_id < 4:
+            cpu_cores = list(range(0, 32)) + list(range(64, 96))
+        else:
+            cpu_cores = list(range(12, 24)) + list(range(36, 48))
+
+    try:
+        process.cpu_affinity(cpu_cores)
+        print(f"GPU{gpu_id} process binding to cpu cores: {cpu_cores}")
+    except Exception as exc:
+        print(f"Set CPU affinity failed: {exc}")
+
+
+# set_cpu_affinity(0)
 
 logging.basicConfig(#filename="test.log", filemode="w",
                     format="%(asctime)s %(name)s:%(levelname)s:%(message)s", 
@@ -294,6 +321,7 @@ class SelfAttention:
         self.sin_cache = None
         
         self.task = None
+        self.copy_stream = torch.cuda.Stream(priority=-1)
 
     def set_task(self, task):
         self.task = task
@@ -375,7 +403,7 @@ class SelfAttention:
         assert(dst.device.device_type == DeviceType.CPU or DeviceType.CUDA)
         length = src.shape[0]
         dst = dst.data[start: start + length]
-        dst.copy_(src, non_blocking=False)
+        dst.copy_(src, non_blocking=True)
         return length
     
     ### for impress
@@ -517,23 +545,33 @@ class SelfAttention:
                         w_k, w_v, w_out, self.rms_norm_eps, freqs_cis,n_head, num_key_value_heads,
                         donate, self.policy.compress_cache, self.policy.comp_cache_config, matched_prefix)
                     
-                    self.kv_server.lsh_retrieve(0, self.layer_id, query_states, prefix_id, max_common_len)
-                    k_cache_data, v_cache_data = self.kv_server.load_kv(0, self.layer_id, prefix_id)
+                    timers("imp calc").start()
+                    self.kv_server.lsh_retrieve(self.task.req_id, self.layer_id, query_states, prefix_id, max_common_len, self.task.save_res)
+                    timers("imp calc").stop()
+                    timers("imp io").start()
+                    timers("imp load and compute").start()
+                    k_cache_data, v_cache_data = self.kv_server.load_kv(self.task.req_id, self.layer_id, prefix_id)
+                    timers("imp io").stop()
                     # k_cache_data, v_cache_data = self.kv_server.get_full_kv(0, self.layer_id, prefix_id)
 
-                    length = self.copy_prefix(k_cache, k_cache_data, cur_pos)
-                    length = self.copy_prefix(v_cache, v_cache_data, cur_pos)
+                    with torch.cuda.stream(self.copy_stream):
+                        length = self.copy_prefix(k_cache, k_cache_data, cur_pos)
+                        length = self.copy_prefix(v_cache, v_cache_data, cur_pos)
+                    timers("imp load and compute").stop()
                     cur_pos += length
             
                 ### kv_server的layer统一用layer_id管理
                 imp_token_idx, avg_n_imp = self.kv_server.get_imp_idx(self.layer_id)
                 # imp_token_idx, avg_n_imp = self.kv_server.get_full_idx(self.layer_id)
                 print(f"get {avg_n_imp} important tokens")
+                timers("compute").start()
+                self.copy_stream.synchronize()
                 h, new_k_cache, new_v_cache = self.compute.gqa_prefill_with_kv(h, mask, i_n, w_q,
                         w_k, w_v, w_out, self.rms_norm_eps, freqs_cis,n_head, num_key_value_heads,
                         k_cache, v_cache,
                         donate, self.policy.compress_cache, self.policy.comp_cache_config, matched_prefix,
                         imp_token_idx)
+                timers("compute").stop()
                 self.prefill_cache_shape = new_k_cache.shape[0]
                 print(f"self.prefill_cache_shape: {self.prefill_cache_shape}")
             else:
@@ -990,6 +1028,8 @@ class LLAMA:
                  stop: Optional[int] = None,
                  debug_mode: Optional[str] = None,
                  cut_gen_len: Optional[int] = None,
+                 req_id: int = 0,
+                 save_res: bool = False,
                  verbose: int = 0):
         matched_prefix = self.radix_tree.match(inputs[0])
         prefix_only = False
@@ -1012,7 +1052,9 @@ class LLAMA:
             stop=stop,
             matched_prefix=matched_prefix,
             prefix_only=prefix_only,
-            new_prefix_id = new_prefix_id
+            new_prefix_id=new_prefix_id,
+            req_id=req_id,
+            save_res=save_res,
         )
         logger.info(f"generate: Task={task}")
         num_layers = self.num_layers
@@ -1474,7 +1516,7 @@ def run_dapr_flexllmgen(args):
     inputs_ids = get_tokenized_inputs(inputs, max_prompt_len=max_prompt_len, tokenizer=tokenizer)
     # inputs_ids = tokenizer(inputs, truncation=False, max_length=max_prompt_len).input_ids
     
-    for i in range(1):
+    for i in  range(len(inputs)):
         global io_bytes 
         io_bytes = 0
         global last_id,last_offset,cur_continue_addr,average_continue_addr
@@ -1489,9 +1531,11 @@ def run_dapr_flexllmgen(args):
         timers("compute").reset()
         timers("imp load and compute").reset()
         timers("cache store").reset()
+        timers("io part test").reset()
+        timers("load LSH meta").reset()
         output_ids = model.generate(
-            inputs=[inputs_ids[i]], max_new_tokens = args.gen_len, debug_mode=args.debug_mode, 
-            cut_gen_len=cut_gen_len, verbose=args.verbose)
+            inputs=[inputs_ids[i]], max_new_tokens=args.gen_len, debug_mode=args.debug_mode, 
+            cut_gen_len=cut_gen_len, verbose=args.verbose, req_id=i, save_res=args.save_res)
         if DUMMY_WEIGHT not in args.path:
             outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
             show_str = "Outputs:\n" + 70 * '-' + "\n"
@@ -1516,15 +1560,18 @@ def run_dapr_flexllmgen(args):
         #print("imp calc:{}",timers("imp calc").costs)
         print("compute average:",timers("compute").elapsed("average"))
         print("compute sum:",timers("compute").elapsed("sum"))
-        #print("compute:{}",timers("compute").costs)
+        print("compute:{}",timers("compute").costs)
         print("prefill:",timers("generate").costs[0])
         print((timers("imp io").elapsed("sum") + timers("imp calc").elapsed("sum"))/timers("generate").costs[0] * 100)
 
-        print("imp load :",timers("imp load and compute").elapsed("average"))
-        print("imp sum:",timers("imp load and compute").elapsed("sum"))
+        print("imp load avg:",timers("imp load and compute").elapsed("average"))
+        print("imp load sum:",timers("imp load and compute").elapsed("sum"))
         print("store cache:",timers("cache store").costs)
         print("generate:", timers("generate").costs)
         print("generate sum:", timers("generate").elapsed("sum"))
+        print("io part test:", timers("io part test").costs)
+        print("io part test avg:", timers("io part test").elapsed("average"))
+        print("io part test sum:", timers("io part test").elapsed("sum"))
         # print("total io token:", io_bytes)
         # print("total continue token", cur_continue_addr)
         # if i!=0:
@@ -1749,6 +1796,7 @@ def add_parser_arguments(parser):
         const=True, default=True)
     ## query for query_group_persist; seq for sequential_persist
     parser.add_argument("--strategy", type=str, default="seq")
+    parser.add_argument("--save-res", type=str2bool, nargs='?', const=True, default=False)
 
 
 if __name__ == "__main__":

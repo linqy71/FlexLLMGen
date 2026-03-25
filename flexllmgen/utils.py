@@ -39,6 +39,8 @@ class Task:
     matched_prefix: dict = None
     prefix_only: bool = None
     new_prefix_id: int = None
+    req_id: int = 0
+    save_res: bool = False
 
 @dataclasses.dataclass(frozen=True)
 class ExecutionEnv:
