@@ -92,7 +92,13 @@ void LSH::alloc(
   memset(mask, 0, this->batch_size * this->num_attention_heads * this->max_length * sizeof(uint8_t));
   // cudaHostAlloc((void**)&query_buffer, this->batch_size * this->num_attention_heads * this->L * sizeof(int), cudaHostAllocDefault);
   // cudaStreamCreate(&this->stream);
+  this->threshold = 2;
   this->allocated = true;
+}
+
+void LSH::set_threshold(int threshold)
+{
+  this->threshold = threshold;
 }
 
 void LSH::fastfill(
@@ -340,6 +346,7 @@ int LSH::retrieve(
 
   int offset = 0;
   int *result_ptr = result;
+  const int thresh = this->threshold;
 
   for (int i = 0; i < this->L; ++i)
   {
@@ -353,14 +360,13 @@ int LSH::retrieve(
     {
       int idx = m_content[j];
       uint8_t mask_val = tmask[idx];
-      // 提示编译器 mask_val == 0 是更可能的情况
-      if (__builtin_expect(mask_val == 0, 1))
+      if (__builtin_expect(mask_val < thresh - 1, 1))
       {
-        tmask[idx] = 1;
+        tmask[idx] = mask_val + 1;
       }
-      else if (__builtin_expect(mask_val == 1, 0))
+      else if (__builtin_expect(mask_val == thresh - 1, 0))
       {
-        tmask[idx] = 2;
+        tmask[idx] = thresh;
         *result_ptr++ = idx;
       }
     }
@@ -424,6 +430,7 @@ int LSH::retrieve_multi(
   memset(tmask, 0, this->max_length);
   int offset = 0;
   int *result_ptr = result;
+  const int thresh = this->threshold;
 
   for (int n = 0; n < num_queries; n++)
   {
@@ -431,10 +438,9 @@ int LSH::retrieve_multi(
     memset(tmask, 0, this->max_length);
 
     // prevent queried indices being added again
-    // set them to 2
     for (auto tmp_ptr = result; tmp_ptr < result_ptr; tmp_ptr++)
     {
-      tmask[*tmp_ptr] = 2;
+      tmask[*tmp_ptr] = thresh;
     }
 
     for (int i = 0; i < this->L; ++i)
@@ -448,18 +454,14 @@ int LSH::retrieve_multi(
       for (int j = start_pos; j < end_pos; ++j)
       {
         int idx = m_content[j];
-        // if (idx >= max_index) {
-        //   break;
-        // }
         uint8_t mask_val = tmask[idx];
-        // 提示编译器 mask_val == 0 是更可能的情况
-        if (__builtin_expect(mask_val == 0, 1))
+        if (__builtin_expect(mask_val < thresh - 1, 1))
         {
-          tmask[idx] = 1;
+          tmask[idx] = mask_val + 1;
         }
-        else if (__builtin_expect(mask_val == 1, 0))
+        else if (__builtin_expect(mask_val == thresh - 1, 0))
         {
-          tmask[idx] = 2;
+          tmask[idx] = thresh;
           *result_ptr++ = idx;
         }
       }
@@ -467,6 +469,90 @@ int LSH::retrieve_multi(
   }
   offset = result_ptr - result;
   return offset;
+}
+
+void LSH::batch_retrieve_multi_kv(
+    int layer_id,
+    torch::Tensor query_pt,
+    int num_queries,
+    torch::Tensor results_pt,
+    torch::Tensor nnz_pt,
+    int max_index)
+{
+
+  int *query = static_cast<int *>(query_pt.data_ptr());
+  int *results = static_cast<int *>(results_pt.data_ptr());
+  int *nnz = static_cast<int *>(nnz_pt.data_ptr());
+
+#pragma omp parallel for schedule(static, 1) num_threads(LSH_THREADS)
+  for (int kv_head_id = 0; kv_head_id < this->batch_size * this->num_key_value_heads; ++kv_head_id)
+  {
+    nnz[kv_head_id] = this->retrieve_multi_kv(
+        layer_id,
+        kv_head_id,
+        query,
+        num_queries,
+        results,
+        max_index);
+  }
+}
+
+int LSH::retrieve_multi_kv(
+    int layer_id,
+    int kv_head_id,
+    int *__restrict query,
+    int num_queries,
+    int *__restrict results,
+    int max_index)
+{
+
+  // Direct kv_head indexing — no group_id division
+  int *__restrict start = this->table_start[layer_id] + kv_head_id * this->L * this->num_buckets;
+  int *__restrict end = this->table_end[layer_id] + kv_head_id * this->L * this->num_buckets;
+  int *__restrict content = this->table[layer_id] + kv_head_id * this->L * this->max_length;
+  int *__restrict result = results + kv_head_id * this->max_length;
+  int *query_head = query + kv_head_id * 1024 * this->L;
+  uint8_t *__restrict tmask = reinterpret_cast<uint8_t *>(mask + kv_head_id * this->max_length);
+  memset(tmask, 0, this->max_length);
+  int *result_ptr = result;
+  const int thresh = this->threshold;
+
+  for (int n = 0; n < num_queries; n++)
+  {
+    const int *__restrict q = query_head + n * this->L;
+    memset(tmask, 0, this->max_length);
+
+    // prevent queried indices being added again
+    for (auto tmp_ptr = result; tmp_ptr < result_ptr; tmp_ptr++)
+    {
+      tmask[*tmp_ptr] = thresh;
+    }
+
+    for (int i = 0; i < this->L; ++i)
+    {
+      int q_i = q[i];
+      int *__restrict m_start = start + i * this->num_buckets;
+      int *__restrict m_end = end + i * this->num_buckets;
+      int *__restrict m_content = content + i * this->max_length;
+      int start_pos = m_start[q_i];
+      int end_pos = m_end[q_i];
+      for (int j = start_pos; j < end_pos; ++j)
+      {
+        int idx = m_content[j];
+        uint8_t mask_val = tmask[idx];
+        if (__builtin_expect(mask_val < thresh - 1, 1))
+        {
+          tmask[idx] = mask_val + 1;
+        }
+        else if (__builtin_expect(mask_val == thresh - 1, 0))
+        {
+          tmask[idx] = thresh;
+          *result_ptr++ = idx;
+        }
+      }
+    }
+  }
+  return result_ptr - result;
 }
 
 void LSH::clear()
@@ -497,6 +583,7 @@ PYBIND11_MODULE(lsh, m)
   py::class_<LSH>(m, "LSH")
       .def(py::init<>())
       .def("alloc", &LSH::alloc)
+      .def("set_threshold", &LSH::set_threshold)
       .def("fill", &LSH::fill)
       .def("save_to_file", &LSH::save_to_file)
       .def("load_from_file", &LSH::load_from_file)
@@ -505,5 +592,6 @@ PYBIND11_MODULE(lsh, m)
       .def("fastfill", &LSH::fastfill)
       .def("batch_retrieve", &LSH::batch_retrieve)
       .def("batch_retrieve_multi", &LSH::batch_retrieve_multi)
+      .def("batch_retrieve_multi_kv", &LSH::batch_retrieve_multi_kv)
       .def("get_mask", &LSH::get_mask);
 }

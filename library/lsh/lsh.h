@@ -13,10 +13,11 @@
 #define LSH_THREADS 32
 
 class LSH{
-    public: 
+    public:
         LSH();
         ~LSH();
         void alloc(int K, int L, int num_layers, int num_attention_heads, int num_key_value_heads, int batch_size, int max_length);
+        void set_threshold(int threshold);
         void fill(int layer_id, int request_id, torch::Tensor sorted_hash_code_pt, torch::Tensor sorted_indices_pt);
         void save_to_file(const std::string filename);
         void load_from_file(const std::string filename);
@@ -24,6 +25,7 @@ class LSH{
         void copy(torch::Tensor query_pt);
         void clear();
         void batch_retrieve_multi(int layer_id, torch::Tensor query_pt, int num_queries, torch::Tensor results_pt, torch::Tensor nnz_pt, int max_index);
+        void batch_retrieve_multi_kv(int layer_id, torch::Tensor query_pt, int num_queries, torch::Tensor results_pt, torch::Tensor nnz_pt, int max_index);
         void batch_retrieve(int layer_id, torch::Tensor query_pt, torch::Tensor results_pt, torch::Tensor nnz_pt);
         torch::Tensor get_table_start(int layer_id);
         torch::Tensor get_table_end(int layer_id);
@@ -39,6 +41,7 @@ class LSH{
         int num_attention_groups;
         int batch_size;
         int max_length;
+        int threshold;
         bool allocated;
         uint8_t* mask;
         std::vector<int*> table_start;
@@ -46,4 +49,5 @@ class LSH{
         std::vector<int*> table;
         int retrieve(int layer_id, int head_id, const int* __restrict query, int* __restrict results);
         int retrieve_multi(int layer_id, int head_id, int* __restrict query, int num_queries, int* __restrict results, int max_index);
+        int retrieve_multi_kv(int layer_id, int kv_head_id, int* __restrict query, int num_queries, int* __restrict results, int max_index);
 };

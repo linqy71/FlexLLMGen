@@ -528,8 +528,8 @@ void KVStore::concurrent_merge_collect_queried_key_value(
 
     auto end_time = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> duration = end_time - start_time;
-    std::cout << "[TIMER] concurrent compute and IO for layer " << layer_id
-              << " took " << duration.count() << " seconds." << std::endl;
+    // std::cout << "[TIMER] concurrent compute and IO for layer " << layer_id
+    //           << " took " << duration.count() << " seconds." << std::endl;
 }
 
 void KVStore::concurrent_merge_load_key_value_from_file(

@@ -20,6 +20,7 @@ class LSHServer:
         max_length: int = 8192,
         device: str = "cuda:0",
         dtype=torch.float16,
+        collision_threshold: int = 2,
     ):
         self.config = config
         self.K = K
@@ -50,11 +51,13 @@ class LSHServer:
 
         self.current_prefix_id = 0
         self.prefix_to_server = {}
+        self.collision_threshold = collision_threshold
         self.lsh_retriever = LSH()
         self.lsh_retriever.alloc(
             self.K, self.L, self.num_layers, self.num_attention_heads,
             self.num_key_value_heads, self.batch_size, self.max_length
         )
+        self.lsh_retriever.set_threshold(self.collision_threshold)
         self.kv_store = KVStore()
         self.kv_store.alloc(self.num_layers, self.num_attention_heads, self.num_key_value_heads, self.head_dim, max_length)
         self.kv_store_path = kv_store_path
@@ -79,6 +82,7 @@ class LSHServer:
 
         self.max_query_tokens = 1024
         self.pinned_hashcode_multi = torch.zeros((self.num_attention_heads, self.max_query_tokens, self.L), dtype=torch.int32).pin_memory()
+        self.pinned_hashcode_multi_kv = torch.zeros((self.num_key_value_heads, self.max_query_tokens, self.L), dtype=torch.int32).pin_memory()
         self.pinned_hashcode = torch.zeros((self.num_attention_heads, self.L), dtype=torch.int32).pin_memory()
         self.copy_stream = torch.cuda.Stream()
 
@@ -208,21 +212,26 @@ class LSHServer:
             return None, None
 
         q_len, _, _ = query_states.shape
+        group_size = self.num_attention_heads // self.num_key_value_heads
+
         with torch.cuda.stream(self.copy_stream):
-            query_states = query_states.transpose(0, 1).contiguous()
+            # Average queries per KV group: (q_len, n_attn_heads, head_dim) -> (q_len, n_kv_heads, head_dim)
+            query_states = query_states.view(q_len, self.num_key_value_heads, group_size, self.head_dim)
+            query_states = query_states.mean(dim=2)  # (q_len, n_kv_heads, head_dim)
+            query_states = query_states.transpose(0, 1).contiguous()  # (n_kv_heads, q_len, head_dim)
+
             norm_q = query_states.reshape(-1, self.head_dim)
             norm_q = norm_q / norm_q.norm(p=2, dim=-1, keepdim=True)
             q_hashcode = torch.matmul(norm_q, self.hash_func).gt(0)
             q_hashcode = q_hashcode.reshape(-1, self.K).to(torch.float16)
             q_hashcode = torch.mv(q_hashcode, self.binary_pack).int()
-            q_hashcode = q_hashcode.reshape(self.num_attention_heads, q_len, self.L)
-            self.pinned_hashcode_multi[..., :q_len, :].copy_(q_hashcode, non_blocking=True)
+            q_hashcode = q_hashcode.reshape(self.num_key_value_heads, q_len, self.L)
+            self.pinned_hashcode_multi_kv[:, :q_len, :].copy_(q_hashcode, non_blocking=True)
         self.copy_stream.synchronize()
 
-        self.results_lsh_cpu.zero_()
-        self.nnz.zero_()
-        self.lsh_retriever.batch_retrieve_multi(layer_idx, self.pinned_hashcode_multi, q_len, self.results_lsh_cpu, self.nnz, max_index)
-        self.group_query_results_for_gqa(layer_idx)
+        self.grouped_res.fill_(-1)
+        self.grouped_nnz.zero_()
+        self.lsh_retriever.batch_retrieve_multi_kv(layer_idx, self.pinned_hashcode_multi_kv, q_len, self.grouped_res, self.grouped_nnz, max_index)
         self.record_query_results(layer_idx)
 
         if save_res:
@@ -339,6 +348,7 @@ class LSHServer:
                 self.K, self.L, self.num_layers, self.num_attention_heads,
                 self.num_key_value_heads, self.batch_size, self.max_length
             )
+            self.lsh_retriever.set_threshold(self.collision_threshold)
             self.kv_store = KVStore()
             self.kv_store.alloc(self.num_layers, self.num_attention_heads, self.num_key_value_heads, self.head_dim, self.max_length)
 
@@ -348,6 +358,7 @@ class LSHServer:
         self.grouped_res.fill_(-1)
         self.hash_code_buffer.zero_()
         self.pinned_hashcode_multi.zero_()
+        self.pinned_hashcode_multi_kv.zero_()
         self.pinned_hashcode.zero_()
         self.query_results = [
             (torch.zeros_like(self.grouped_nnz), torch.zeros_like(self.grouped_res))

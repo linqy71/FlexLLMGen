@@ -563,7 +563,9 @@ class SelfAttention:
                 ### kv_server的layer统一用layer_id管理
                 imp_token_idx, avg_n_imp = self.kv_server.get_imp_idx(self.layer_id)
                 # imp_token_idx, avg_n_imp = self.kv_server.get_full_idx(self.layer_id)
-                print(f"get {avg_n_imp} important tokens")
+                offload_len = self.kv_server.offload_len
+                retention = avg_n_imp / offload_len if offload_len > 0 else 0
+                print(f"layer {self.layer_id}: imp={avg_n_imp:.1f}/{offload_len}, retention={retention:.2%}")
                 timers("compute").start()
                 self.copy_stream.synchronize()
                 h, new_k_cache, new_v_cache = self.compute.gqa_prefill_with_kv(h, mask, i_n, w_q,
@@ -573,7 +575,7 @@ class SelfAttention:
                         imp_token_idx)
                 timers("compute").stop()
                 self.prefill_cache_shape = new_k_cache.shape[0]
-                print(f"self.prefill_cache_shape: {self.prefill_cache_shape}")
+                print(f"layer {self.layer_id}: prefill_cache={self.prefill_cache_shape} (imp {int(avg_n_imp)}+suffix {self.prefill_cache_shape - int(avg_n_imp)})")
             else:
                 ### only compute prefix kv
                 s = self.task.prompt_len
@@ -750,7 +752,8 @@ class LLAMA:
                  policy: Policy,
                  max_prompt_len: int,
                  max_gen_len: int,
-                 persist_strategy: str):
+                 persist_strategy: str,
+                 collision_threshold: int = 2):
         self.config = config
         self.env = env
         self.path = path
@@ -815,7 +818,8 @@ class LLAMA:
         self.kv_store_path = os.path.join(offload_dir, "kv_store_llama")
         if not os.path.exists(self.kv_store_path):
             os.makedirs(self.kv_store_path)
-        self.kv_server = LSHServer(self.config, self.num_hidden_layers, self.kv_store_path, K=10, L=150, batch_size=1, max_length=8192, device='cuda:0')
+        self.collision_threshold = collision_threshold
+        self.kv_server = LSHServer(self.config, self.num_hidden_layers, self.kv_store_path, K=10, L=150, batch_size=1, max_length=8192, device='cuda:0', collision_threshold=collision_threshold)
         self.set_kv_server()
         
         for j in range(num_layers):
@@ -1490,8 +1494,8 @@ def run_dapr_flexllmgen(args):
           f"hidden size (prefill): {hidden_size/GB:.3f} GB")
 
     print("init weight...")
-    model = LLAMA(llama_config, env, args.path, args.offload_dir, policy, args.prompt_len, args.gen_len, args.strategy)
-    
+    model = LLAMA(llama_config, env, args.path, args.offload_dir, policy, args.prompt_len, args.gen_len, args.strategy, collision_threshold=args.collision_threshold)
+
     context, questions = process_dapr()
     context = context[:4096]
     ### feed prefix
@@ -1627,7 +1631,7 @@ def run_prefix_flexllmgen(args):
 
     print("init weight...")
     max_length = 4096
-    model = LLAMA(llama_config, env, args.path, args.offload_dir, policy, args.prompt_len, args.gen_len, args.strategy)
+    model = LLAMA(llama_config, env, args.path, args.offload_dir, policy, args.prompt_len, args.gen_len, args.strategy, collision_threshold=args.collision_threshold)
 
     prefix = "Guangzhou is the capital and largest city of Guangdong province in southern China." + \
       "Located on the Pearl River about 120 km (75 mi) northwest of Hong Kong and 145 km (90 mi) north of Macau, " + \
@@ -1797,6 +1801,8 @@ def add_parser_arguments(parser):
     ## query for query_group_persist; seq for sequential_persist
     parser.add_argument("--strategy", type=str, default="seq")
     parser.add_argument("--save-res", type=str2bool, nargs='?', const=True, default=False)
+    parser.add_argument("--collision-threshold", type=int, default=2,
+        help="LSH collision threshold: a token must appear in at least this many hash tables to be selected.")
 
 
 if __name__ == "__main__":
