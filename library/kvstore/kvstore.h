@@ -92,6 +92,7 @@ class KVStore{
         torch::Tensor get_queried_key_cache();
         torch::Tensor get_queried_value_cache();
         int get_num_io_and_reset();
+        long long get_reorder_io_bytes_and_reset();
         // torch::Tensor get_key_norm(int layer_id);
         // torch::Tensor get_score();
     private:
@@ -102,7 +103,8 @@ class KVStore{
         int max_length;
         int offload_len;
         int num_io;
-        
+        long long reorder_io_bytes;
+
         bool allocated;
         std::vector<DTYPE *>key_cache;// 每一层的 一个kv_head*max_length*head_dim的开辟好的空间  lsh_server存下来的用于持久化
         std::vector<DTYPE *>value_cache;

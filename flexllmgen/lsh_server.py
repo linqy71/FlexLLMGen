@@ -437,9 +437,17 @@ class LSHServer:
                 for token_id in ind:
                     promote_token_info.append( (head_id, token_id) )
             promote_token_tensor = torch.tensor(promote_token_info, dtype=torch.long, device="cpu")
-            self.kv_store.reorder_persist(self.kv_store_path, prefix_id, 
+            self.kv_store.reorder_persist(self.kv_store_path, prefix_id,
                                           layer_idx, promote_token_tensor)
-            #print(f"Successfully promote prefix {prefix_id} to storage in {self.kv_store_path}") 
+            #print(f"Successfully promote prefix {prefix_id} to storage in {self.kv_store_path}")
+        reorder_io_bytes = self.kv_store.get_reorder_io_bytes()
+        # total offloaded prefix KV data: num_layers * num_kv_heads * offload_len * 2(K+V) * head_dim * sizeof(dtype)
+        dtype_size = 2  # bfloat16
+        total_prefix_kv_bytes = self.num_layers * self.num_key_value_heads * self.offload_len * 2 * self.head_dim * dtype_size
+        reorder_ratio = reorder_io_bytes / total_prefix_kv_bytes if total_prefix_kv_bytes > 0 else 0
+        print(f"reorder I/O: {reorder_io_bytes / 1024 / 1024:.2f} MB, "
+              f"prefix KV total: {total_prefix_kv_bytes / 1024 / 1024:.2f} MB, "
+              f"reorder I/O ratio: {reorder_ratio:.4f}")
     ### arrange tokens into groups according to first req's query results
     # def single_query_group_strategy(self, layer_idx, q_hashcode, offload_len, prefix_id):
     #     _, q_len, _ = q_hashcode.shape

@@ -17,6 +17,7 @@ KVStore::KVStore(){
     this->kv_meta = new std::unordered_map<uint64_t, FileOffsetInfo>();
     this->persisted = false;
     this->num_io = 0;
+    this->reorder_io_bytes = 0;
 }
 
 KVStore::~KVStore(){
@@ -63,6 +64,7 @@ void KVStore::alloc(
     memset(this->queried_value, 0, this->num_key_value_heads * this->max_length * this->head_dim * sizeof(DTYPE));
 
     this->num_io = 0;
+    this->reorder_io_bytes = 0;
     //this->layer_stats.assign(num_layers, LayerStats());
 
 }
@@ -78,6 +80,7 @@ void KVStore::clear() {
     memset(this->queried_value, 0, this->num_key_value_heads * this->max_length * this->head_dim * sizeof(DTYPE));
 
     this->num_io = 0;
+    this->reorder_io_bytes = 0;
 }
 
 void KVStore::fill(
@@ -1357,6 +1360,7 @@ void KVStore::reorder_persist(std::string path, int prefix_id, int layer_id, con
     }
 
     std::vector<char> buffer(entry_size);
+    long long promoted_count = 0;
 
     auto accessor = reorder_token_info.accessor<long, 2>();
     for (int i = 0; i < accessor.size(0); i++){
@@ -1378,12 +1382,15 @@ void KVStore::reorder_persist(std::string path, int prefix_id, int layer_id, con
 
                 // c. 将数据追加写入到目标文件
                 dest_file.write(buffer.data(), entry_size);
-                
+
                 info.file_index = 1;
                 info.offset = static_cast<uint64_t>(new_offset);
-            }  
+                promoted_count++;
+            }
         }
     }
+    // promotion I/O: read + write for each promoted token
+    this->reorder_io_bytes += promoted_count * entry_size * 2;
     dest_file.flush();
     dest_file.close();
     ///// compact /////
@@ -1460,6 +1467,9 @@ void KVStore::reorder_persist(std::string path, int prefix_id, int layer_id, con
         // 更新偏移量
         current_offset += entry_size;
     }
+
+    // compaction I/O: read + write for each remaining token in file0
+    this->reorder_io_bytes += (long long)data_to_move.size() * entry_size * 2;
 
     new_file0.close();
 }
@@ -1557,6 +1567,12 @@ torch::Tensor KVStore::get_queried_value_cache()
 int KVStore::get_num_io_and_reset(){
     int n = this->num_io;
     this->num_io = 0;
+    return n;
+}
+
+long long KVStore::get_reorder_io_bytes_and_reset(){
+    long long n = this->reorder_io_bytes;
+    this->reorder_io_bytes = 0;
     return n;
 }
 
@@ -1852,5 +1868,6 @@ PYBIND11_MODULE(kvstore, m) {
         .def("reorder_persist", &KVStore::reorder_persist)
         .def("get_queried_value_cache", &KVStore::get_queried_value_cache)
         .def("clear", &KVStore::clear)
-        .def("get_num_io", &KVStore::get_num_io_and_reset);
+        .def("get_num_io", &KVStore::get_num_io_and_reset)
+        .def("get_reorder_io_bytes", &KVStore::get_reorder_io_bytes_and_reset);
 }
