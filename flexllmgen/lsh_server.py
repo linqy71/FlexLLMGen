@@ -21,6 +21,7 @@ class LSHServer:
         device: str = "cuda:0",
         dtype=torch.float16,
         collision_threshold: int = 2,
+        merge: bool = True,
     ):
         self.config = config
         self.K = K
@@ -39,6 +40,7 @@ class LSHServer:
 
         self.offloaded = False
         self.persisted = False
+        self.merge = merge
 
         self.avg_k = [torch.zeros(
             self.batch_size,
@@ -84,16 +86,46 @@ class LSHServer:
         self.pinned_hashcode_multi = torch.zeros((self.num_attention_heads, self.max_query_tokens, self.L), dtype=torch.int32).pin_memory()
         self.pinned_hashcode_multi_kv = torch.zeros((self.num_key_value_heads, self.max_query_tokens, self.L), dtype=torch.int32).pin_memory()
         self.pinned_hashcode = torch.zeros((self.num_attention_heads, self.L), dtype=torch.int32).pin_memory()
-        self.copy_stream = torch.cuda.Stream()
+        self.pinned_queried_key = torch.zeros((self.max_length, self.num_key_value_heads, self.head_dim), dtype=torch.float16).pin_memory()
+        self.pinned_queried_value = torch.zeros((self.max_length, self.num_key_value_heads, self.head_dim), dtype=torch.float16).pin_memory()
+
+        self.copy_stream = torch.cuda.Stream(priority=-1)
+        self.build_stream = torch.cuda.Stream()
+
+        self.prefix_lens = []
+        self.imp_lens = []
 
         self.hash_code_buffer = torch.zeros((self.num_key_value_heads, self.L, self.max_length), dtype=torch.int16, device=self.device)
         self.sorted_hash_values_buffer: torch.Tensor = None
         self.sorted_hash_indices_buffer: torch.Tensor = None
         self.persist_strategy = [None for _ in range(self.num_layers)]
 
+    def _warmup_lsh_kernels(self, q_len):
+        """Warmup LSH kernel to avoid first-call overhead."""
+        dummy_query = torch.randn(
+            (q_len, self.num_attention_heads, self.head_dim),
+            device='cuda',
+            dtype=torch.float16
+        )
+        group_size = self.num_attention_heads // self.num_key_value_heads
+        with torch.cuda.stream(self.copy_stream):
+            dummy_query = dummy_query.view(q_len, self.num_key_value_heads, group_size, self.head_dim)
+            dummy_query = dummy_query.mean(dim=2)
+            query_states = dummy_query.transpose(0, 1).contiguous()
+            norm_q = query_states.reshape(-1, self.head_dim)
+            norm_q = norm_q / norm_q.norm(p=2, dim=-1, keepdim=True)
+            q_hashcode = torch.matmul(norm_q, self.hash_func).gt(0)
+            q_hashcode = q_hashcode.reshape(-1, self.K).to(torch.float16)
+            q_hashcode = torch.mv(q_hashcode, self.binary_pack).int()
+            q_hashcode = q_hashcode.reshape(self.num_key_value_heads, q_len, self.L)
+            if q_len <= self.pinned_hashcode_multi_kv.shape[1]:
+                self.pinned_hashcode_multi_kv[:, :q_len, :].copy_(q_hashcode, non_blocking=True)
+        self.copy_stream.synchronize()
+        print("LSH kernel warmup done.")
+
     def alloc_buffer(self, seq_len):
-        self.sorted_hash_values_buffer = torch.zeros((self.num_key_value_heads, self.L, seq_len), dtype=torch.int16, device="cpu")
-        self.sorted_hash_indices_buffer = torch.zeros((self.num_key_value_heads, self.L, seq_len), dtype=torch.int32, device="cpu")
+        self.sorted_hash_values_buffer = torch.zeros((self.num_key_value_heads, self.L, seq_len), dtype=torch.int16, device="cpu", pin_memory=True)
+        self.sorted_hash_indices_buffer = torch.zeros((self.num_key_value_heads, self.L, seq_len), dtype=torch.int32, device="cpu", pin_memory=True)
 
     def _request_slot(self, req_id: int) -> int:
         if self.batch_size <= 1:
@@ -147,10 +179,15 @@ class LSHServer:
             torch.save(self.hash_code_buffer[:, :, :offload_len].cpu(), hash_code_file)
 
     def build_table(self, layer_idx: int, request_id: int, seq_len: int):
-        for i in range(self.num_key_value_heads):
-            sorted_hash_values, sorted_hash_indices = self.hash_code_buffer[i, :, :seq_len].sort()
-            self.sorted_hash_values_buffer[i].copy_(sorted_hash_values)
-            self.sorted_hash_indices_buffer[i].copy_(sorted_hash_indices)
+        timers("build table").start()
+        # Batched sort across all KV heads on GPU
+        hash_codes = self.hash_code_buffer.view(-1, self.hash_code_buffer.size(-1))
+        sorted_hash_values, sorted_hash_indices = hash_codes[:, :seq_len].sort(dim=-1)
+
+        self.sorted_hash_values_buffer.copy_(sorted_hash_values.view_as(self.sorted_hash_values_buffer), non_blocking=True)
+        self.sorted_hash_indices_buffer.copy_(sorted_hash_indices.view_as(self.sorted_hash_indices_buffer), non_blocking=True)
+        torch.cuda.synchronize()
+        timers("build table").stop()
 
         self.lsh_retriever.fill(layer_idx, request_id, self.sorted_hash_values_buffer, self.sorted_hash_indices_buffer)
 
@@ -191,6 +228,7 @@ class LSHServer:
             res[head_id, n:] = -1
         max_len = nnz.max()
         avg_len = nnz.sum() / len(nnz)
+        self.imp_lens.append(avg_len)
         return res[:, :max_len], avg_len
 
     def get_full_idx(self, layer_idx):
@@ -210,7 +248,7 @@ class LSHServer:
     ):
         if not self.offloaded or prefix_id == 0:
             return None, None
-
+        timers("hash compute").start()
         q_len, _, _ = query_states.shape
         group_size = self.num_attention_heads // self.num_key_value_heads
 
@@ -228,11 +266,14 @@ class LSHServer:
             q_hashcode = q_hashcode.reshape(self.num_key_value_heads, q_len, self.L)
             self.pinned_hashcode_multi_kv[:, :q_len, :].copy_(q_hashcode, non_blocking=True)
         self.copy_stream.synchronize()
+        timers("hash compute").stop()
 
-        self.grouped_res.fill_(-1)
-        self.grouped_nnz.zero_()
+        timers("id retrieve").start()
         self.lsh_retriever.batch_retrieve_multi_kv(layer_idx, self.pinned_hashcode_multi_kv, q_len, self.grouped_res, self.grouped_nnz, max_index)
+        timers("id retrieve").stop()
+
         self.record_query_results(layer_idx)
+        self.prefix_lens.append(max_index)
 
         if save_res:
             save_dir = os.path.join(self.kv_store_path, f"saved_query_results_{req_id}")
@@ -244,19 +285,28 @@ class LSHServer:
             return None, None
 
         timers("io part test").start()
-        self.kv_store.concurrent_merge_collect_queried_key_value(prefix_id, layer_idx, self.grouped_res, self.grouped_nnz)
+        if self.merge:
+            self.kv_store.merge_collect_queried_key_value(prefix_id, layer_idx, self.grouped_res, self.grouped_nnz)
+        else:
+            self.kv_store.collect_queried_key_value(prefix_id, layer_idx, self.grouped_res, self.grouped_nnz)
         timers("io part test").stop()
 
         queried_key = self.kv_store.get_queried_key_cache()
         queried_value = self.kv_store.get_queried_value_cache()
+
+        timers("avgk").start()
         request_slot = self._request_slot(req_id)
         avg_k = self.avg_k[layer_idx][request_slot].to("cpu")
-        queried_key = queried_key + avg_k
+        queried_key += avg_k
 
         max_len = int(self.grouped_nnz.max().item())
-        queried_key = queried_key.transpose(0, 1).contiguous()
-        queried_value = queried_value.transpose(0, 1).contiguous()
-        return queried_key[:max_len], queried_value[:max_len]
+        queried_key = queried_key[:, :max_len, :].transpose(0, 1)
+        queried_value = queried_value[:, :max_len, :].transpose(0, 1)
+        self.pinned_queried_key[:max_len].copy_(queried_key)
+        self.pinned_queried_value[:max_len].copy_(queried_value)
+        timers("avgk").stop()
+
+        return self.pinned_queried_key[:max_len], self.pinned_queried_value[:max_len]
 
     def get_full_kv(self, req_id, layer_idx, prefix_id):
         if not self.offloaded:
@@ -343,15 +393,20 @@ class LSHServer:
 
     def reset(self, switch=False):
         if switch:
+            del self.lsh_retriever
             self.lsh_retriever = LSH()
             self.lsh_retriever.alloc(
                 self.K, self.L, self.num_layers, self.num_attention_heads,
                 self.num_key_value_heads, self.batch_size, self.max_length
             )
             self.lsh_retriever.set_threshold(self.collision_threshold)
+            del self.kv_store
             self.kv_store = KVStore()
             self.kv_store.alloc(self.num_layers, self.num_attention_heads, self.num_key_value_heads, self.head_dim, self.max_length)
+            self.persisted = False
 
+        if hasattr(self.kv_store, 'get_num_io'):
+            print("req done, sum of io count: ", self.kv_store.get_num_io())
         self.nnz.zero_()
         self.results_lsh_cpu.zero_()
         self.grouped_nnz.zero_()
@@ -408,10 +463,13 @@ class LSHServer:
             hash_code_file = os.path.join(self.kv_store_path, f"hash_code_prefix_{prefix_id}_layer_{layer_idx}.pt")
             if not os.path.exists(hash_code_file):
                 continue
+            timers("load table").start()
             loaded_hash_code = torch.load(hash_code_file, map_location=self.device)
+            timers("load table").stop()
             _, _, seq_len = loaded_hash_code.shape
             self.offload_len = seq_len
-            self.alloc_buffer(seq_len)
+            if layer_idx == 0:
+                self.alloc_buffer(seq_len)
             self.hash_code_buffer[:, :, :seq_len].copy_(loaded_hash_code)
             self.build_table(layer_idx, 0, seq_len)
         timers("load LSH meta").stop()
