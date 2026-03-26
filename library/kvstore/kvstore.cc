@@ -220,9 +220,9 @@ void KVStore::recover_meta(std::string path, int prefix_id) {
 
 // }
 void KVStore::write_to_layer_promote_file(
-    std::string path, 
-    int prefix_id, 
-    int layer_id, 
+    std::string path,
+    int prefix_id,
+    int layer_id,
     const std::vector<std::vector<int>>& strategy
 ) {
     this->store_path = path;
@@ -251,7 +251,7 @@ void KVStore::write_to_layer_promote_file(
             std::streampos entry_offset = head_base_offset;
             DTYPE* cur_key = head_key + idx * this->head_dim; //当前token的数据位置
             DTYPE* cur_value = head_value + idx * this->head_dim;
-            
+
             file.write(reinterpret_cast<char*>(cur_key), this->head_dim * sizeof(DTYPE));
             file.write(reinterpret_cast<char*>(cur_value), this->head_dim * sizeof(DTYPE));
             uint64_t meta_id = get_meta_id(idx, layer_id, i);
@@ -261,6 +261,58 @@ void KVStore::write_to_layer_promote_file(
     }
     file.flush();
     file.close();
+    this->persisted = true;
+}
+
+void KVStore::write_to_layer_split_file(
+    std::string path,
+    int prefix_id,
+    int layer_id,
+    const std::vector<std::vector<int>>& strategy,
+    const std::vector<int>& seen_counts
+) {
+    this->store_path = path;
+    DTYPE * k = this->key_cache[layer_id];
+    DTYPE * v = this->value_cache[layer_id];
+
+    size_t entry_size = 2 * this->head_dim * sizeof(DTYPE);
+
+    std::string file_name0 = this->store_path + "/" + std::to_string(prefix_id) + "_layer" + std::to_string(layer_id) + "_part0.bin";
+    std::string file_name1 = this->store_path + "/" + std::to_string(prefix_id) + "_layer" + std::to_string(layer_id) + "_part1.bin";
+    std::ofstream file0(file_name0, std::ios::app | std::ios::binary);
+    std::ofstream file1(file_name1, std::ios::app | std::ios::binary);
+
+    for (int i = 0; i < this->num_key_value_heads; i++){
+        const std::vector<int>& head_strategy = strategy[i];
+        size_t head_entries = head_strategy.size();
+        int seen_count = seen_counts[i];
+
+        DTYPE* head_key = k + i * this->max_length * this->head_dim;
+        DTYPE* head_value = v + i * this->max_length * this->head_dim;
+
+        for (size_t j = 0; j < head_entries; j++) {
+            int idx = head_strategy[j];
+            DTYPE* cur_key = head_key + idx * this->head_dim;
+            DTYPE* cur_value = head_value + idx * this->head_dim;
+
+            // seen tokens (first seen_count entries) go to part1, rest to part0
+            bool is_seen = (int)j < seen_count;
+            std::ofstream& file = is_seen ? file1 : file0;
+            uint64_t file_index = is_seen ? 1 : 0;
+
+            std::streampos entry_offset = file.tellp();
+            file.write(reinterpret_cast<char*>(cur_key), this->head_dim * sizeof(DTYPE));
+            file.write(reinterpret_cast<char*>(cur_value), this->head_dim * sizeof(DTYPE));
+
+            uint64_t meta_id = get_meta_id(idx, layer_id, i);
+            FileOffsetInfo file_offset_info(file_index, uint64_t(entry_offset));
+            kv_meta->insert({meta_id, file_offset_info});
+        }
+    }
+    file0.flush();
+    file0.close();
+    file1.flush();
+    file1.close();
     this->persisted = true;
 }
 
@@ -1873,6 +1925,7 @@ PYBIND11_MODULE(kvstore, m) {
         .def("recover_meta", &KVStore::recover_meta)
         //.def("write_to_storage", &KVStore::write_to_storage)
         .def("write_to_layer_promote_file", &KVStore::write_to_layer_promote_file)
+        .def("write_to_layer_split_file", &KVStore::write_to_layer_split_file)
         .def("write_to_file", &KVStore::write_to_file)
         .def("write_to_layer_file", &KVStore::write_to_layer_file)
         .def("collect_queried_key_value", &KVStore::collect_queried_key_value)

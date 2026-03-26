@@ -58,6 +58,7 @@ class KVStore{
         void write_to_file(std::string path, int prefix_id, int layer_id, const std::vector<std::vector<int>>& strategy);
         void write_to_layer_file(std::string path, int prefix_id, int layer_id, const std::vector<std::vector<int>>& strategy);
         void write_to_layer_promote_file(std::string path, int prefix_id, int layer_id, const std::vector<std::vector<int>>& strategy);
+        void write_to_layer_split_file(std::string path, int prefix_id, int layer_id, const std::vector<std::vector<int>>& strategy, const std::vector<int>& seen_counts);
         
         void clear();
         uint64_t get_meta_id(int token_id, int layer_id, int head_id);

@@ -404,15 +404,14 @@ class LSHServer:
             all_token_ids = set(range(self.offload_len))
             for head_id in range(self.num_key_value_heads):
                 remaining_ids = sorted(all_token_ids - seen_token_ids[head_id])
-                # print(len(remaining_ids))
                 new_token_orders[head_id].extend(remaining_ids)
 
             # Save strategy
             self.persist_strategy[layer_idx] = new_token_orders
-            #self.kv_store.write_to_file(self.kv_store_path,
-            #self.kv_store.write_to_layer_file(self.kv_store_path,
-            self.kv_store.write_to_layer_promote_file(self.kv_store_path,
-                                            prefix_id, layer_idx, new_token_orders)
+            # Split write: seen tokens -> part1 (pre-promoted), remaining -> part0
+            seen_counts = [len(seen_token_ids[head_id]) for head_id in range(self.num_key_value_heads)]
+            self.kv_store.write_to_layer_split_file(self.kv_store_path,
+                                            prefix_id, layer_idx, new_token_orders, seen_counts)
 
         self.persisted = True
     
