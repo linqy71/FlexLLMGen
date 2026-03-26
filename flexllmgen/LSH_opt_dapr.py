@@ -1162,19 +1162,23 @@ class OptLM:
 
     def finish_one_query(self):
         self.sync()
-        
+
         ### if kv not persisted, persist
         if self.kv_server.persisted == False:
+            timers("kv first persist").start()
             if self.persist_strategy == "query":
                 self.kv_server.query_group_persist(self.task.new_prefix_id)
             elif self.persist_strategy == "seq":
                 self.kv_server.sequential_persist(self.task.new_prefix_id)
             else:
                 raise ValueError(f"Invalid strategy: {self.persist_strategy}")
+            timers("kv first persist").stop()
         else:
             #self.kv_server.promote_persist(self.task.new_prefix_id)
             if self.persist_strategy == "query":
+                timers("kv reorder persist").start()
                 self.kv_server.reorder_persist(self.task.new_prefix_id)
+                timers("kv reorder persist").stop()
             #self.kv_server.persist_kv_store_meta(self.task.new_prefix_id)
         self.kv_server.reset(switch=False)
         logger.info("query finished , now sync the model")
@@ -1867,6 +1871,11 @@ def run_dapr_flexllmgen(args):
 
         print("load table:", timers("load table").elapsed("sum"))
         print("build table:", timers("build table").elapsed("sum"))
+
+        print("kv first persist:", timers("kv first persist").costs)
+        print("kv first persist sum:", timers("kv first persist").elapsed("sum"))
+        print("kv reorder persist:", timers("kv reorder persist").costs)
+        print("kv reorder persist sum:", timers("kv reorder persist").elapsed("sum"))
 
         # print("total io token:", io_bytes)
         # print("total continue token", cur_continue_addr)

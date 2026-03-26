@@ -1084,15 +1084,17 @@ class OptLM:
 
     def finish_one_query(self, final=False):
         self.sync()
-        
+
         ### if kv not persisted, persist
         if self.kv_server.persisted == False:
+            timers("kv first persist").start()
             if self.persist_strategy == "query":
                 self.kv_server.query_group_persist(self.task.new_prefix_id)
             elif self.persist_strategy == "seq":
                 self.kv_server.sequential_persist(self.task.new_prefix_id)
             else:
                 raise ValueError(f"Invalid strategy: {self.persist_strategy}")
+            timers("kv first persist").stop()
 
         self.kv_server.reset(switch=False)
         logger.info("query finished , now sync the model")
@@ -1525,8 +1527,11 @@ def run_prefix_flexllmgen(args):
             if args.verbose >= 2:
                 print(show_str)
 
-        print("=" * 50)  
+        print("=" * 50)
         model.finish_one_query(True)
+
+        print("kv first persist:", timers("kv first persist").costs)
+        print("kv first persist sum:", timers("kv first persist").elapsed("sum"))
 
     finally:
         env.close_copy_threads()
