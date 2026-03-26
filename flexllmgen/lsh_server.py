@@ -19,6 +19,7 @@ class LSHServer:
         device: str = 'cuda:0',
         dtype = torch.float16,
         merge = True,
+        compaction_threshold: float = 0.0,
         ):
         # 2^K=哈希表桶数，L=哈希表个数
         self.config = config  ### OptConfig or LlamaConfig
@@ -55,6 +56,8 @@ class LSHServer:
         self.lsh_retriever.alloc(self.K, self.L, self.num_layers, self.num_attention_heads, self.num_key_value_heads, self.batch_size, self.max_length)
         self.kv_store = KVStore()
         self.kv_store.alloc(self.num_layers, self.num_attention_heads, self.num_key_value_heads, self.head_dim, max_length)
+        self.kv_store.set_compaction_threshold(compaction_threshold)
+        self.compaction_threshold = compaction_threshold
         self.kv_store_path = kv_store_path
         
         hash_func_path = os.path.join(self.kv_store_path, f"hash_func_{self.K}_{self.L}.pt")

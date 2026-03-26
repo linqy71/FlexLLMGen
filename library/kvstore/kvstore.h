@@ -86,6 +86,7 @@ class KVStore{
         void merge_load_key_value(std::vector<std::tuple<uint64_t, uint64_t, uint64_t, int>>& content, std::vector<int> &token_order, int prefix_id, int layer_id, int head_id);
         void promote_persist(std::string path, int prefix_id, int layer_idx, const torch::Tensor& promote_token_info);
         void reorder_persist(std::string path, int prefix_id, int layer_id, const torch::Tensor& reorder_token_info);
+        void set_compaction_threshold(double threshold);
         torch::Tensor to_tensor(DTYPE* start, int length);
         torch::Tensor get_key_cache(int layer_id);
         torch::Tensor get_value_cache(int layer_id);
@@ -104,6 +105,7 @@ class KVStore{
         int offload_len;
         int num_io;
         long long reorder_io_bytes;
+        double compaction_threshold;
 
         bool allocated;
         std::vector<DTYPE *>key_cache;// 每一层的 一个kv_head*max_length*head_dim的开辟好的空间  lsh_server存下来的用于持久化

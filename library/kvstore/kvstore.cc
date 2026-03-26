@@ -18,6 +18,7 @@ KVStore::KVStore(){
     this->persisted = false;
     this->num_io = 0;
     this->reorder_io_bytes = 0;
+    this->compaction_threshold = 0.0;
 }
 
 KVStore::~KVStore(){
@@ -65,6 +66,7 @@ void KVStore::alloc(
 
     this->num_io = 0;
     this->reorder_io_bytes = 0;
+    this->compaction_threshold = 0.0;
     //this->layer_stats.assign(num_layers, LayerStats());
 
 }
@@ -1393,8 +1395,14 @@ void KVStore::reorder_persist(std::string path, int prefix_id, int layer_id, con
     this->reorder_io_bytes += promoted_count * entry_size * 2;
     dest_file.flush();
     dest_file.close();
-    ///// compact /////
-    // 收集需要保留的数据信息
+
+    ///// lazy compact: only compact when fragmentation exceeds threshold /////
+    // get file0 size to compute fragmentation
+    source_file.seekg(0, std::ios::end);
+    std::streampos file0_size = source_file.tellg();
+    size_t total_entries_in_file = static_cast<size_t>(file0_size) / entry_size;
+
+    // count valid (non-hole) entries still in file0
     struct KeepInfo {
         uint64_t meta_id;
         uint64_t source_offset;
@@ -1404,67 +1412,70 @@ void KVStore::reorder_persist(std::string path, int prefix_id, int layer_id, con
     std::vector<KeepInfo> to_keep;
     to_keep.reserve(num_key_value_heads * offload_len);
 
-    // 先统计file0中需要保留的数据
     for (int head_id = 0; head_id < this->num_key_value_heads; head_id++) {
         for (int token_id = 0; token_id < this->offload_len; token_id++) {
             uint64_t meta_id = get_meta_id(token_id, layer_id, head_id);
             if (kv_meta->find(meta_id) != kv_meta->end()) {
                 FileOffsetInfo& info = kv_meta->at(meta_id);
-                // 只保留仍然在file0中的数据
                 if (info.file_index == 0) {
                     to_keep.push_back({meta_id, info.offset, &info});
                 }
             }
         }
     }
-    // 按源偏移量排序，减少磁盘寻道
-    std::sort(to_keep.begin(), to_keep.end(), 
-        [](const KeepInfo& a, const KeepInfo& b) {
-            return a.source_offset < b.source_offset;
-        });
-    // 计算新的文件大小
-    std::streampos new_file_size = static_cast<std::streampos>(to_keep.size() * entry_size);
 
-    // 如果不需要移动数据，直接返回
+    // fragmentation = fraction of file0 occupied by holes
+    double fragmentation = 0.0;
+    if (total_entries_in_file > 0) {
+        fragmentation = 1.0 - (double)to_keep.size() / (double)total_entries_in_file;
+    }
+
+    // skip compaction if fragmentation is below threshold
+    if (fragmentation <= this->compaction_threshold) {
+        source_file.close();
+        return;
+    }
+
+    // all data promoted out, truncate file0
     if (to_keep.empty()) {
         source_file.close();
-        // 可以清空文件或删除
         std::ofstream empty_file(file_name0, std::ios::binary | std::ios::trunc);
         return;
     }
+
+    // sort by offset to reduce disk seeks
+    std::sort(to_keep.begin(), to_keep.end(),
+        [](const KeepInfo& a, const KeepInfo& b) {
+            return a.source_offset < b.source_offset;
+        });
 
     std::vector<char> read_buffer(entry_size);
     std::vector<std::pair<uint64_t, std::vector<char>>> data_to_move;
     data_to_move.reserve(to_keep.size());
 
-    // 1. 先读取所有需要保留的数据到内存
+    // 1. read all valid entries into memory
     for (const auto& keep : to_keep) {
         source_file.seekg(keep.source_offset, std::ios::beg);
         source_file.read(read_buffer.data(), entry_size);
-        
+
         if (!source_file) {
             throw std::runtime_error("read data failed");
         }
-        
+
         data_to_move.emplace_back(keep.meta_id, read_buffer);
     }
 
-    // 2. 清空文件并重新写入数据
     source_file.close();
 
-    // 重新以截断模式打开文件
+    // 2. truncate and rewrite file0
     std::ofstream new_file0(file_name0, std::ios::binary | std::ios::trunc);
 
-    // 3. 重新写入数据并更新元数据
     std::streampos current_offset = 0;
     for (size_t i = 0; i < data_to_move.size(); i++) {
         const auto& [meta_id, data] = data_to_move[i];
-        // 写入数据
         new_file0.write(data.data(), entry_size);
-        // 更新元数据
         FileOffsetInfo& info = kv_meta->at(meta_id);
         info.offset = static_cast<uint64_t>(current_offset);
-        // 更新偏移量
         current_offset += entry_size;
     }
 
@@ -1574,6 +1585,10 @@ long long KVStore::get_reorder_io_bytes_and_reset(){
     long long n = this->reorder_io_bytes;
     this->reorder_io_bytes = 0;
     return n;
+}
+
+void KVStore::set_compaction_threshold(double threshold){
+    this->compaction_threshold = threshold;
 }
 
 void KVStore::concurrent_merge_collect_queried_key_value(
@@ -1869,5 +1884,6 @@ PYBIND11_MODULE(kvstore, m) {
         .def("get_queried_value_cache", &KVStore::get_queried_value_cache)
         .def("clear", &KVStore::clear)
         .def("get_num_io", &KVStore::get_num_io_and_reset)
-        .def("get_reorder_io_bytes", &KVStore::get_reorder_io_bytes_and_reset);
+        .def("get_reorder_io_bytes", &KVStore::get_reorder_io_bytes_and_reset)
+        .def("set_compaction_threshold", &KVStore::set_compaction_threshold);
 }
