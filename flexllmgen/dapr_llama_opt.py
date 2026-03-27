@@ -520,7 +520,7 @@ class SelfAttention:
             mask, donate[1] = attention_mask.val.smart_copy(self.compute)
             if self.task.common_prefix_len > 0:
                 (k_cache, donate[9]) = cache_read_buf.pop()
-                imp_token_idx = self.compute.get_important_token_idx_llama(h, mask, i_n, w_q, self.rms_norm_eps,
+                imp_token_idx = self.compute.get_important_token_idx_llama_modified(h, mask, i_n, w_q, self.rms_norm_eps,
                                 freqs_cis, n_head, num_key_value_heads, donate, self.policy.compress_cache, self.policy.comp_cache_config,
                                 k_cache, self.policy.important_ratio)
 
@@ -530,7 +530,7 @@ class SelfAttention:
 
                 k_cache, v_cache = self.get_prefix_kv(imp_token_idx, j)
                 
-                h, new_k_cache, new_v_cache = self.compute.gqa_prefill(h, mask, i_n, w_q, w_k, w_v, w_out, self.rms_norm_eps,
+                h, new_k_cache, new_v_cache = self.compute.gqa_prefill_modified(h, mask, i_n, w_q, w_k, w_v, w_out, self.rms_norm_eps,
                                 freqs_cis, n_head, num_key_value_heads, k_cache, v_cache, donate, self.policy.compress_cache, self.policy.comp_cache_config,
                                 self.task.common_prefix_len)
                 
@@ -1081,19 +1081,21 @@ class LLAMA:
 
         return self.output_ids
 
-    def finish_one_query(self, final=False):
+    def finish_one_query(self, idx=0):
         self.sync()
-        self.store_prefix_cache()
+        if idx == 0:
+            self.store_prefix_cache()
         self.sync()
         logger.info("query finished , now sync the model")
+
+    def final_finish(self):
         num_layers, num_gpu_batches = self.num_layers, self.policy.num_gpu_batches
-        if final:
-            # Delete cache
-            for j in range(num_layers):
-                for k in range(num_gpu_batches):
-                    self.delete_cache(j, k)
-            if self.policy.cpu_cache_compute:
-                self.env.cpu.del_attention_compute_workspace()
+        # Delete cache
+        for j in range(num_layers):
+            for k in range(num_gpu_batches):
+                self.delete_cache(j, k)
+        if self.policy.cpu_cache_compute:
+            self.env.cpu.del_attention_compute_workspace()
 
 
     def generation_loop_normal(self):
@@ -1555,16 +1557,23 @@ def run_dapr_flexllmgen(args):
             cut_gen_len=cut_gen_len, verbose=args.verbose)
         if DUMMY_WEIGHT not in args.path:
             outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
-            prompt_tail = tokenizer.decode(inputs_ids[i][-100:]) if len(inputs_ids[i]) > 100 else tokenizer.decode(inputs_ids[i])
-            print(f"\n{'='*60}")
-            print(f"Prompt (last 100 chars):\n{prompt_tail}")
-            print(f"{'-'*60}")
-            print(f"Generated:\n{outputs[0][-32:]}")
-            print(f"{'='*60}\n")
+            # prompt_tail = tokenizer.decode(inputs_ids[i][-100:]) if len(inputs_ids[i]) > 100 else tokenizer.decode(inputs_ids[i])
+            # print(f"\n{'='*60}")
+            # print(f"Prompt (last 100 chars):\n{prompt_tail}")
+            # print(f"{'-'*60}")
+            # print(f"Generated:\n{outputs[0][-32:]}")
+            # print(f"{'='*60}\n")
+            show_str = "Outputs:\n" + 70 * '-' + "\n"
+            for i in [0, len(outputs)-1]:
+                show_str += f"{i}: {outputs[i]}\n"
+                show_str += "-" * 70 + "\n"
+            if args.verbose >= 2:
+                print(show_str)
 
         print("prefill:",timers("generate").costs[0])
-        model.finish_one_query(i == len(inputs) - 1)
+        model.finish_one_query(i)
         print("=" * 50)
+    model.final_finish()
     env.close_copy_threads()
     _, gpu_peak_mem = gpu.mem_stats()
     _, cpu_peak_mem = cpu.mem_stats()

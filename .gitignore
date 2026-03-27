@@ -31,6 +31,6 @@ flexllmgen/apps/data_wrangle/core
 *.tsv
 *.log
 *.raw
-
+logs/
 # tmp scripts
 today_job.sh
