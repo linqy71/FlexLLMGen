@@ -1444,7 +1444,7 @@ void KVStore::reorder_persist(std::string path, int prefix_id, int layer_id, con
         }
     }
     // promotion I/O: read + write for each promoted token
-    this->reorder_io_bytes += promoted_count * entry_size * 2;
+    this->reorder_io_bytes += promoted_count * entry_size;
     dest_file.flush();
     dest_file.close();
 
@@ -1532,7 +1532,7 @@ void KVStore::reorder_persist(std::string path, int prefix_id, int layer_id, con
     }
 
     // compaction I/O: read + write for each remaining token in file0
-    this->reorder_io_bytes += (long long)data_to_move.size() * entry_size * 2;
+    this->reorder_io_bytes += (long long)data_to_move.size() * entry_size;
 
     new_file0.close();
 }

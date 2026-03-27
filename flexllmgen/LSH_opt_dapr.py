@@ -1679,6 +1679,12 @@ def run_full_dapr_flexllmgen(args):
             print("imp load sum:",timers("imp load and compute").elapsed("sum"))
             print("copy prefix sum:",timers("copy prefix").elapsed("sum"))
 
+            print("kv first persist:", timers("kv first persist").costs)
+            print("kv first persist sum:", timers("kv first persist").elapsed("sum"))
+            print("kv reorder persist:", timers("kv reorder persist").costs)
+            print("kv reorder persist sum:", timers("kv reorder persist").elapsed("sum"))
+
+
             print("store cache:",timers("cache store").costs)
             print("generate sum:", timers("generate").elapsed("sum"))
 
