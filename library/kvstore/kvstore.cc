@@ -728,15 +728,9 @@ void KVStore::mmap_collect_queried_key_value(
     }
 
     // --- persisted case: mmap files, access via page faults ---
-
-    // Step 1: collect all (file_index, offset, head_id, token_order_idx) tuples
-    //         across all heads, then group by file_index for mmap.
-    struct MmapAccess {
-        uint64_t file_index;
-        uint64_t offset;      // byte offset in the file
-        int head_id;
-        int token_order_idx;  // position in the output queried_key/value for this head
-    };
+    // Each mmap'd region is accessed sparsely (only LSH-selected tokens).
+    // After reading, MADV_DONTNEED + POSIX_FADV_DONTNEED evict pages from the
+    // page cache so the next generation step measures authentic SSD latency.
 
     // Per-head: sort token accesses by file offset so that sequential memcpy
     // benefits from OS readahead on the mmap'd region.
@@ -765,9 +759,11 @@ void KVStore::mmap_collect_queried_key_value(
         for (const auto& [file_index, offset, out_pos] : accesses) {
             // Open & mmap a new file if needed
             if (file_index != cur_file_index) {
-                // Unmap previous file
+                // Evict & unmap previous file
                 if (mmap_ptr != MAP_FAILED) {
+                    madvise(mmap_ptr, mmap_size, MADV_DONTNEED);
                     munmap(mmap_ptr, mmap_size);
+                    posix_fadvise(mmap_fd, 0, mmap_size, POSIX_FADV_DONTNEED);
                     ::close(mmap_fd);
                 }
 
@@ -814,9 +810,11 @@ void KVStore::mmap_collect_queried_key_value(
             memcpy(this->queried_value + key_offset, cur_value, this->head_dim * sizeof(DTYPE));
         }
 
-        // Clean up last mmap
+        // Evict pages from page cache & clean up last mmap
         if (mmap_ptr != MAP_FAILED) {
+            madvise(mmap_ptr, mmap_size, MADV_DONTNEED);
             munmap(mmap_ptr, mmap_size);
+            posix_fadvise(mmap_fd, 0, mmap_size, POSIX_FADV_DONTNEED);
             ::close(mmap_fd);
         }
     }
