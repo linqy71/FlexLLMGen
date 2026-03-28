@@ -776,7 +776,8 @@ class OptLM:
                  merge: bool,
                  K: int,
                  L: int,
-                 compaction_threshold: float = 0.0):
+                 compaction_threshold: float = 0.0,
+                 use_mmap: bool = False):
         if isinstance(config, str):
             config = get_opt_config(config, max_seq_len=8192)
         self.config = config
@@ -787,6 +788,7 @@ class OptLM:
         self.max_prompt_len = max_prompt_len
         self.max_gen_len = max_gen_len
         self.persist_strategy = persist_strategy
+        self.use_mmap = use_mmap
 
         layers = []
         layers.append(InputEmbed(self.config, self.env, self.policy))
@@ -838,6 +840,7 @@ class OptLM:
         if not os.path.exists(self.kv_store_path):
             os.makedirs(self.kv_store_path)
         self.kv_server = LSHServer(self.config, self.num_hidden_layers, self.kv_store_path, K=K, L=L, batch_size=1, max_length=8192, device='cuda:0', merge=merge, compaction_threshold=compaction_threshold)
+        self.kv_server.use_mmap = self.use_mmap
         self.set_kv_server()
         
         for j in range(num_layers):
@@ -1603,7 +1606,7 @@ def run_full_dapr_flexllmgen(args):
     
     print("init weight...init_cache_home...")
 
-    model = OptLM(opt_config, env, args.path, args.offload_dir, policy, args.prompt_len, args.gen_len, args.strategy, args.merge, args.K, args.L, args.compaction_threshold)
+    model = OptLM(opt_config, env, args.path, args.offload_dir, policy, args.prompt_len, args.gen_len, args.strategy, args.merge, args.K, args.L, args.compaction_threshold, args.use_mmap)
 
     requests = process_full_dapr()
     print(len(requests), flush=True)
@@ -1764,7 +1767,7 @@ def run_dapr_flexllmgen(args):
     
     print("init weight...init_cache_home...")
 
-    model = OptLM(opt_config, env, args.path, args.offload_dir, policy, args.prompt_len, args.gen_len, args.strategy, args.merge, args.K, args.L, args.compaction_threshold)
+    model = OptLM(opt_config, env, args.path, args.offload_dir, policy, args.prompt_len, args.gen_len, args.strategy, args.merge, args.K, args.L, args.compaction_threshold, args.use_mmap)
 
     context, questions = process_dapr()
     # context = context[:8192]
@@ -1959,6 +1962,9 @@ def add_parser_arguments(parser):
     parser.add_argument("--compaction-threshold", type=float, default=0.0,
         help="Fragmentation threshold for lazy compaction during reorder_persist. "
              "0.0 = always compact (default), 1.0 = never compact.")
+    parser.add_argument("--use-mmap", type=str2bool, nargs='?',
+        const=True, default=False,
+        help="Use OS-level mmap paging for KV loading instead of explicit read() calls.")
 
 def process_full_longbench():
     RootPath = "/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/lqy/HF_HOME/datasets/THUDM___long_bench/data/"
@@ -2024,7 +2030,7 @@ def run_full_longbench_flexllmgen(args):
     
     print("init weight...init_cache_home...")
 
-    model = OptLM(opt_config, env, args.path, args.offload_dir, policy, args.prompt_len, args.gen_len, args.strategy, args.merge, args.K, args.L, args.compaction_threshold)
+    model = OptLM(opt_config, env, args.path, args.offload_dir, policy, args.prompt_len, args.gen_len, args.strategy, args.merge, args.K, args.L, args.compaction_threshold, args.use_mmap)
     requests = process_full_longbench()
     print(len(requests), flush=True)
 

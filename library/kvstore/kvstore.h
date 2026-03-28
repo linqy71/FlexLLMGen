@@ -85,6 +85,8 @@ class KVStore{
         void load_key_value(std::vector<std::tuple<uint64_t, uint64_t, int>>& content, std::vector<int> &key_order, int prefix_id, int layer_id, int head_id);
 
         void merge_load_key_value(std::vector<std::tuple<uint64_t, uint64_t, uint64_t, int>>& content, std::vector<int> &token_order, int prefix_id, int layer_id, int head_id);
+        void mmap_collect_queried_key_value(int prefix_id, int layer_id, torch::Tensor ind_pt, torch::Tensor nnz_pt);
+
         void promote_persist(std::string path, int prefix_id, int layer_idx, const torch::Tensor& promote_token_info);
         void reorder_persist(std::string path, int prefix_id, int layer_id, const torch::Tensor& reorder_token_info);
         void set_compaction_threshold(double threshold);

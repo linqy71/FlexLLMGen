@@ -40,6 +40,7 @@ class LSHServer:
         self.offloaded = False ### check whether there are keys offloaded to lsh
         self.persisted = False
         self.merge = merge
+        self.use_mmap = False
     
         ### key -= avg_k before fill to lsh, so record avg_k for recovery
         self.avg_k = [torch.zeros(
@@ -309,13 +310,16 @@ class LSHServer:
             self.results_lsh_cpu[i][:n].copy_(imp_ids)
             self.nnz[i] = n
 
-    def load_kv(self, 
-        req_id: int, 
-        layer_idx: int, 
+    def load_kv(self,
+        req_id: int,
+        layer_idx: int,
         prefix_id: int):
         if not self.offloaded or prefix_id == 0:
             return None, None
-        timers("io part test").start()       
+        ### dispatch to mmap path when enabled
+        if self.use_mmap:
+            return self.mmap_load_kv(req_id, layer_idx, prefix_id)
+        timers("io part test").start()
         ### collect key value from kv_store
         #timers("io part test").start()
         # self.kv_store.collect_queried_key_value(prefix_id, layer_idx, self.results_lsh_cpu, self.nnz)
@@ -340,6 +344,33 @@ class LSHServer:
         self.pinned_queried_key[:res_len].copy_(queried_key)
         self.pinned_queried_value[:res_len].copy_(queried_value)
 
+        timers("avgk").stop()
+
+        return self.pinned_queried_key[:res_len], self.pinned_queried_value[:res_len]
+
+    ### load kv via OS-level mmap paging instead of explicit read() calls.
+    ### The kernel page-fault mechanism loads 4KB-aligned pages + readahead.
+    def mmap_load_kv(self,
+        req_id: int,
+        layer_idx: int,
+        prefix_id: int):
+        if not self.offloaded or prefix_id == 0:
+            return None, None
+        timers("io part test").start()
+        self.kv_store.mmap_collect_queried_key_value(prefix_id, layer_idx, self.results_lsh_cpu, self.nnz)
+        timers("io part test").stop()
+
+        res_len = self.nnz.max().data
+        queried_key = self.kv_store.get_queried_key_cache()
+        queried_value = self.kv_store.get_queried_value_cache()
+
+        timers("avgk").start()
+        avg_k = self.avg_k[layer_idx][req_id].to("cpu")
+        queried_key += avg_k
+        queried_key = queried_key[...,:res_len,:].transpose(0,1)
+        queried_value = queried_value[...,:res_len,:].transpose(0,1)
+        self.pinned_queried_key[:res_len].copy_(queried_key)
+        self.pinned_queried_value[:res_len].copy_(queried_value)
         timers("avgk").stop()
 
         return self.pinned_queried_key[:res_len], self.pinned_queried_value[:res_len]

@@ -683,8 +683,148 @@ void KVStore::merge_collect_queried_key_value(
     }
     auto end_time = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> duration = end_time - start_time;
-    std::cout << "[TIMER] compute and IO for layer " << layer_id 
+    std::cout << "[TIMER] compute and IO for layer " << layer_id
               << " took " << duration.count()  << " seconds." << std::endl;
+}
+
+// ---------------------------------------------------------------------------
+// mmap-based KV collection: lets the OS page-fault mechanism load KV data
+// from SSD instead of issuing explicit read() calls.
+// ---------------------------------------------------------------------------
+void KVStore::mmap_collect_queried_key_value(
+    int prefix_id,
+    int layer_id,
+    torch::Tensor ind_pt,
+    torch::Tensor nnz_pt
+) {
+    auto start_time = std::chrono::high_resolution_clock::now();
+
+    int * ind = static_cast<int *>(ind_pt.data_ptr());
+    int * nnz = static_cast<int *>(nnz_pt.data_ptr());
+
+    // --- non-persisted case: same as merge path, collect from memory ---
+    if (this->persisted == false) {
+        int stride = this->max_length * this->head_dim;
+        DTYPE* key = this->key_cache[layer_id];
+        DTYPE* value = this->value_cache[layer_id];
+        for (int i = 0; i < this->num_key_value_heads; i++) {
+            auto head_ind = ind + i * this->max_length;
+            int num_indices = nnz[i];
+            auto queried_key_ptr = this->queried_key + i * stride;
+            auto queried_value_ptr = this->queried_value + i * stride;
+            auto key_ptr = key + i * stride;
+            auto value_ptr = value + i * stride;
+            for (int j = 0; j < num_indices; j++) {
+                auto cur_ind = head_ind[j];
+                memcpy(queried_key_ptr + j * this->head_dim,
+                       key_ptr + cur_ind * this->head_dim,
+                       this->head_dim * sizeof(DTYPE));
+                memcpy(queried_value_ptr + j * this->head_dim,
+                       value_ptr + cur_ind * this->head_dim,
+                       this->head_dim * sizeof(DTYPE));
+            }
+        }
+        return;
+    }
+
+    // --- persisted case: mmap files, access via page faults ---
+
+    // Step 1: collect all (file_index, offset, head_id, token_order_idx) tuples
+    //         across all heads, then group by file_index for mmap.
+    struct MmapAccess {
+        uint64_t file_index;
+        uint64_t offset;      // byte offset in the file
+        int head_id;
+        int token_order_idx;  // position in the output queried_key/value for this head
+    };
+
+    // Per-head: sort token accesses by file offset so that sequential memcpy
+    // benefits from OS readahead on the mmap'd region.
+    #pragma omp parallel for schedule(static) num_threads(64)
+    for (int i = 0; i < this->num_key_value_heads; i++) {
+        auto head_ind = ind + i * this->max_length;
+        int num_indices = nnz[i];
+
+        // Collect (file_index, offset, output_position) for this head
+        std::vector<std::tuple<uint64_t, uint64_t, int>> accesses;
+        accesses.reserve(num_indices);
+        for (int j = 0; j < num_indices; j++) {
+            uint64_t meta_id = get_meta_id(head_ind[j], layer_id, i);
+            FileOffsetInfo& info = kv_meta->at(meta_id);
+            accesses.emplace_back(info.file_index, info.offset, j);
+        }
+        // Sort by (file_index, offset) for sequential access pattern
+        std::sort(accesses.begin(), accesses.end());
+
+        // Group accesses by file_index, mmap each file once
+        uint64_t cur_file_index = std::numeric_limits<uint64_t>::max();
+        void* mmap_ptr = MAP_FAILED;
+        size_t mmap_size = 0;
+        int mmap_fd = -1;
+
+        for (const auto& [file_index, offset, out_pos] : accesses) {
+            // Open & mmap a new file if needed
+            if (file_index != cur_file_index) {
+                // Unmap previous file
+                if (mmap_ptr != MAP_FAILED) {
+                    munmap(mmap_ptr, mmap_size);
+                    ::close(mmap_fd);
+                }
+
+                std::string file_name = this->store_path + "/"
+                    + std::to_string(prefix_id) + "_layer"
+                    + std::to_string(layer_id) + "_part"
+                    + std::to_string(file_index) + ".bin";
+
+                mmap_fd = ::open(file_name.c_str(), O_RDONLY);
+                if (mmap_fd < 0) {
+                    std::cerr << "mmap_collect: failed to open " << file_name << std::endl;
+                    cur_file_index = file_index;
+                    mmap_ptr = MAP_FAILED;
+                    continue;
+                }
+
+                struct stat st;
+                fstat(mmap_fd, &st);
+                mmap_size = st.st_size;
+
+                mmap_ptr = mmap(nullptr, mmap_size, PROT_READ, MAP_PRIVATE, mmap_fd, 0);
+                if (mmap_ptr == MAP_FAILED) {
+                    std::cerr << "mmap_collect: mmap failed for " << file_name << std::endl;
+                    ::close(mmap_fd);
+                    mmap_fd = -1;
+                    cur_file_index = file_index;
+                    continue;
+                }
+
+                cur_file_index = file_index;
+            }
+
+            if (mmap_ptr == MAP_FAILED) continue;
+
+            // Access the KV entry through the mmap'd region — triggers page fault
+            // if the page isn't resident. The kernel loads 4KB-aligned pages and
+            // may trigger readahead for surrounding pages.
+            const char* entry = static_cast<const char*>(mmap_ptr) + offset;
+            const DTYPE* cur_key = reinterpret_cast<const DTYPE*>(entry);
+            const DTYPE* cur_value = cur_key + this->head_dim;
+
+            int key_offset = i * this->max_length * this->head_dim + out_pos * this->head_dim;
+            memcpy(this->queried_key + key_offset, cur_key, this->head_dim * sizeof(DTYPE));
+            memcpy(this->queried_value + key_offset, cur_value, this->head_dim * sizeof(DTYPE));
+        }
+
+        // Clean up last mmap
+        if (mmap_ptr != MAP_FAILED) {
+            munmap(mmap_ptr, mmap_size);
+            ::close(mmap_fd);
+        }
+    }
+
+    auto end_time = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> duration = end_time - start_time;
+    std::cout << "[TIMER] mmap IO for layer " << layer_id
+              << " took " << duration.count() << " seconds." << std::endl;
 }
 
 void analyze_content_segments(const std::vector<std::tuple<uint64_t, uint64_t, int>>& content, int layer_id, int head_id,
@@ -1930,6 +2070,7 @@ PYBIND11_MODULE(kvstore, m) {
         .def("write_to_layer_file", &KVStore::write_to_layer_file)
         .def("collect_queried_key_value", &KVStore::collect_queried_key_value)
         .def("merge_collect_queried_key_value", &KVStore::merge_collect_queried_key_value)
+        .def("mmap_collect_queried_key_value", &KVStore::mmap_collect_queried_key_value)
         .def("concurrent_merge_collect_queried_key_value", &KVStore::concurrent_merge_collect_queried_key_value)
         .def("get_queried_key_cache", &KVStore::get_queried_key_cache)
         .def("promote_persist", &KVStore::promote_persist)
