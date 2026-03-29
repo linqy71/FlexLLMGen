@@ -93,6 +93,12 @@ class KVStore{
         torch::Tensor get_value_cache(int layer_id);
         torch::Tensor get_queried_key_cache();
         torch::Tensor get_queried_value_cache();
+        void transpose_queried_key_value_with_avgk(
+            torch::Tensor avg_k,
+            torch::Tensor out_key,
+            torch::Tensor out_value,
+            int res_len
+        );
         int get_num_io_and_reset();
         long long get_reorder_io_bytes_and_reset();
         // torch::Tensor get_key_norm(int layer_id);

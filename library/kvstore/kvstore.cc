@@ -1627,6 +1627,48 @@ torch::Tensor KVStore::get_queried_value_cache()
     return tensor;
 }
 
+void KVStore::transpose_queried_key_value_with_avgk(
+    torch::Tensor avg_k,
+    torch::Tensor out_key,
+    torch::Tensor out_value,
+    int res_len
+) {
+    if (res_len <= 0) {
+        return;
+    }
+    int heads = this->num_key_value_heads;
+    int head_dim = this->head_dim;
+    int max_len = this->max_length;
+    if (res_len > max_len) {
+        res_len = max_len;
+    }
+
+    auto avg_ptr = avg_k.data_ptr<at::Half>();
+    auto out_key_ptr = out_key.data_ptr<at::Half>();
+    auto out_value_ptr = out_value.data_ptr<at::Half>();
+    auto src_key_ptr = reinterpret_cast<at::Half *>(this->queried_key);
+    auto src_value_ptr = reinterpret_cast<at::Half *>(this->queried_value);
+
+    int src_stride = max_len * head_dim;
+    int dst_stride = heads * head_dim;
+
+    for (int i = 0; i < heads; ++i) {
+        auto *src_key_head = src_key_ptr + i * src_stride;
+        auto *src_value_head = src_value_ptr + i * src_stride;
+        auto *avg_head = avg_ptr + i * head_dim;
+        for (int j = 0; j < res_len; ++j) {
+            auto *src_key_row = src_key_head + j * head_dim;
+            auto *src_value_row = src_value_head + j * head_dim;
+            auto *dst_key_row = out_key_ptr + j * dst_stride + i * head_dim;
+            auto *dst_value_row = out_value_ptr + j * dst_stride + i * head_dim;
+            for (int d = 0; d < head_dim; ++d) {
+                dst_key_row[d] = src_key_row[d] + avg_head[d];
+            }
+            memcpy(dst_value_row, src_value_row, head_dim * sizeof(at::Half));
+        }
+    }
+}
+
 int KVStore::get_num_io_and_reset(){
     int n = this->num_io;
     this->num_io = 0;
@@ -1932,6 +1974,7 @@ PYBIND11_MODULE(kvstore, m) {
         .def("merge_collect_queried_key_value", &KVStore::merge_collect_queried_key_value)
         .def("concurrent_merge_collect_queried_key_value", &KVStore::concurrent_merge_collect_queried_key_value)
         .def("get_queried_key_cache", &KVStore::get_queried_key_cache)
+        .def("transpose_queried_key_value_with_avgk", &KVStore::transpose_queried_key_value_with_avgk)
         .def("promote_persist", &KVStore::promote_persist)
         .def("reorder_persist", &KVStore::reorder_persist)
         .def("get_queried_value_cache", &KVStore::get_queried_value_cache)

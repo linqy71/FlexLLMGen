@@ -12,7 +12,7 @@
 
 rm /ssd/nsccgz_zgchen_6/lqy/flexllmgen_offload_dir/gathering_1/kv_store/*.bin
 K=6
-L=15
+L=8
 python3 -u -m flexllmgen.LSH_opt_dapr --model facebook/opt-6.7b \
         --percent 100 0 100 0 100 0 \
         --path /HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/hyk/opt_weights \
@@ -32,7 +32,7 @@ echo "done 6.7b"
 
 rm /ssd/nsccgz_zgchen_6/lqy/flexllmgen_offload_dir/gathering_1/kv_store/*.bin
 K=6
-L=15
+L=8
 python3 -u -m flexllmgen.LSH_opt_dapr --model facebook/opt-6.7b \
         --percent 100 0 100 0 100 0 \
         --path /HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/hyk/opt_weights \

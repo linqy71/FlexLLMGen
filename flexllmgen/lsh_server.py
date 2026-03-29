@@ -50,6 +50,15 @@ class LSHServer:
             device=self.device,
             dtype=self.dtype
         ) for _ in range(self.num_layers)]
+        self.avg_k_cpu = [torch.zeros(
+            self.batch_size,
+            self.num_key_value_heads,
+            1,
+            self.head_dim,
+            device="cpu",
+            dtype=self.dtype,
+            pin_memory=True
+        ) for _ in range(self.num_layers)]
         self.current_prefix_id = 0 ### 0 means nothing
         self.prefix_to_server = {} ### record lsh_retriever and kv_store here
         self.lsh_retriever = LSH()
@@ -150,6 +159,7 @@ class LSHServer:
         avg_k = offload_key.mean(dim=1, keepdim=True)
         offload_key = offload_key - avg_k
         self.avg_k[layer_idx][request_id] = avg_k
+        self.avg_k_cpu[layer_idx][request_id].copy_(avg_k)
         
         offload_len = offload_key.shape[1]
         # print(offload_key.shape, seq_len, flush=True)
@@ -329,17 +339,14 @@ class LSHServer:
         #timers("io part test").stop()
         ### shape : n_head, max_length, head_dim
         res_len = self.nnz.max().data
-        queried_key = self.kv_store.get_queried_key_cache()  # collect后保存在kvstore里,这里将数据包装成tensor后拿出来
-        queried_value = self.kv_store.get_queried_value_cache()
 
         timers("avgk").start()
-        avg_k = self.avg_k[layer_idx][req_id].to("cpu")
-        queried_key += avg_k
-        queried_key = queried_key[...,:res_len,:].transpose(0,1)
-        queried_value = queried_value[...,:res_len,:].transpose(0,1)
-        self.pinned_queried_key[:res_len].copy_(queried_key)
-        self.pinned_queried_value[:res_len].copy_(queried_value)
-
+        avg_k = self.avg_k_cpu[layer_idx][req_id]
+        queried_key = self.kv_store.get_queried_key_cache()  # collect后保存在kvstore里,这里将数据包装成tensor后拿出来
+        queried_value = self.kv_store.get_queried_value_cache()
+        queried_key[:, :res_len, :].add_(avg_k)
+        self.pinned_queried_key[:res_len].copy_(queried_key[:, :res_len, :].transpose(0, 1), non_blocking=True)
+        self.pinned_queried_value[:res_len].copy_(queried_value[:, :res_len, :].transpose(0, 1), non_blocking=True)
         timers("avgk").stop()
 
         return self.pinned_queried_key[:res_len], self.pinned_queried_value[:res_len]
@@ -357,7 +364,7 @@ class LSHServer:
         self.kv_store.collect_queried_key_value(prefix_id, layer_idx, self.results_lsh_cpu, self.nnz)
         queried_key = self.kv_store.get_queried_key_cache()
         queried_value = self.kv_store.get_queried_value_cache()
-        avg_k = self.avg_k[layer_idx][req_id].to("cpu")
+        avg_k = self.avg_k_cpu[layer_idx][req_id]
         queried_key += avg_k
         res_len = self.nnz.max().data
         

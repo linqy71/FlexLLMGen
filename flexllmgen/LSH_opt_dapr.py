@@ -333,6 +333,10 @@ class SelfAttention:
     
     def set_kv_server(self, kv_server):
         self.kv_server = kv_server
+    
+    def _sync(self):
+        self.env.disk.synchronize()
+        torch.cuda.synchronize()
 
     def init_weight(self, weight_home, path):
         h, dtype = (self.config.input_dim, self.config.dtype)
@@ -575,28 +579,28 @@ class SelfAttention:
                 for prefix_id, max_common_len in matched_prefix.items():
                     ## j is layer_id
                     ## get query_states from compute
-                    timers("imp calc").start()
+                    timers("imp calc").start(self._sync)
                     query_states = self.compute.get_suffix_query_states(h, mask, w_q, b_q, 
                         w_ln, b_ln, n_head, k_cache, donate, self.policy.compress_cache, 
                         self.policy.comp_cache_config, matched_prefix)
-                    timers("lsh calc").start()
+                    timers("imp calc").stop(self._sync)
+                    timers("lsh calc").start(self._sync)
                     self.kv_server.lsh_retrieve(self.task.req_id, self.layer_id, query_states, prefix_id, max_common_len, self.task.save_res)
-                    timers("lsh calc").stop()
-                    timers("imp calc").stop()
-                    timers("imp load and compute").start()
+                    timers("lsh calc").stop(self._sync)
+                    timers("imp load and compute").start(self._sync)
                     
                     k_cache_data, v_cache_data = self.kv_server.load_kv(0, self.layer_id, prefix_id)
+                    timers("imp load and compute").stop(self._sync)
                         
                     # k_cache_data, v_cache_data = self.kv_server.get_full_kv(0, self.layer_id, query_states, prefix_id)
                     # print(k_cache_data)
-                    timers("copy prefix").start()
+                    timers("copy prefix").start(self._sync)
                     with torch.cuda.stream(self.copy_stream):
                         # k_cache_data, v_cache_data = self.kv_server.get_full_kv(0, j, query_states, prefix_id)
                         length = self.copy_prefix(k_cache, k_cache_data, cur_pos)
                         length = self.copy_prefix(v_cache, v_cache_data, cur_pos)
                     self.copy_stream.synchronize()
-                    timers("copy prefix").stop()
-                    timers("imp load and compute").stop()
+                    timers("copy prefix").stop(self._sync)
                     cur_pos += length
                 # n_imp = cur_pos
                 ### kv_server的layer统一用layer_id管理
@@ -604,12 +608,12 @@ class SelfAttention:
                 # imp_token_idx = self.kv_server.get_full_idx(self.layer_id)
                 print(f"get {avg_n_imp} important tokens")
                 # print(imp_token_idx[:3])
-                timers("compute").start()
+                timers("compute").start(self._sync)
                 h, new_k_cache, new_v_cache = self.compute.mha_prefill_with_kv(h, mask, w_q, b_q,
                     w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln, n_head, k_cache, v_cache, donate,
                     self.policy.compress_cache, self.policy.comp_cache_config, matched_prefix, 
                     imp_token_idx, self.kv_server.K, self.kv_server.L)
-                timers("compute").stop()
+                timers("compute").stop(self._sync)
                 self.prefill_cache_shape = new_k_cache.shape[0]
                 # logger.info(f"SelfAttention Prefix cache shape: {self.prefill_cache_shape}")
             else:
@@ -654,6 +658,10 @@ class MLP:
     
     def set_kv_server(self, kv_server):
         pass
+    
+    def _sync(self):
+        self.env.disk.synchronize()
+        torch.cuda.synchronize()
 
     def init_weight(self, weight_home, path):
         h, dtype = (self.config.input_dim, self.config.dtype)
@@ -710,7 +718,9 @@ class MLP:
             ((wi, _), (bi, _), (wo, _), (bo, _),
              (w_ln, _), (b_ln, _)) = weight_read_buf.val
 
+        timers("mlp").start(self._sync)
         h = self.compute.mlp(h, wi, bi, wo, bo, w_ln, b_ln, donate)
+        timers("mlp").stop(self._sync)
         hidden.val = h
 
 
@@ -1211,7 +1221,7 @@ class OptLM:
 
     def generation_loop_normal(self):
         for i in range(self.execute_gen_len):
-            timers("generate").start()
+            timers("generate").start(self.sync)
             for k in range(self.num_gpu_batches):
                 self.update_attention_mask(i, k)
             for j in range(self.num_layers):
@@ -1224,7 +1234,7 @@ class OptLM:
                     self.compute_layer(i, j, k)
                     self.store_hidden(i, j, k)
                     self.store_cache(i, j, k, overlap=False)
-            timers("generate").stop()
+            timers("generate").stop(self.sync)
 
     def generation_loop_debug_normal(self):
         execute_num_batches = 20
@@ -1637,6 +1647,8 @@ def run_full_dapr_flexllmgen(args):
             timers("imp calc").reset()
             timers("lsh calc").reset()
             timers("compute").reset()
+            timers("mlp").reset()
+            timers("mlp").reset()
             timers("imp load and compute").reset()
             timers("copy prefix").reset()
             timers("cache store").reset()
@@ -1674,6 +1686,8 @@ def run_full_dapr_flexllmgen(args):
             print("imp calc sum:",timers("imp calc").elapsed("sum")) #hash comp
             print("lsh calc sum:",timers("lsh calc").elapsed("sum"))
             print("compute sum:",timers("compute").elapsed("sum"))
+            print("mlp sum:",timers("mlp").elapsed("sum"))
+            print("mlp sum:",timers("mlp").elapsed("sum"))
             print("prefill:",timers("generate").costs[0])
             prefill_history.append(timers("generate").costs[0])
             print("imp load sum:",timers("imp load and compute").elapsed("sum"))
@@ -1804,6 +1818,7 @@ def run_dapr_flexllmgen(args):
         timers("imp calc").reset()
         timers("lsh calc").reset()
         timers("compute").reset()
+        timers("mlp").reset()
         timers("imp load and compute").reset()
         timers("copy prefix").reset()
         timers("cache store").reset()
@@ -1852,6 +1867,8 @@ def run_dapr_flexllmgen(args):
         #print("imp calc:{}",timers("imp calc").costs)
         print("compute average:",timers("compute").elapsed("average")) # attn comp
         print("compute sum:",timers("compute").elapsed("sum"))
+        print("mlp average:",timers("mlp").elapsed("average"))
+        print("mlp sum:",timers("mlp").elapsed("sum"))
         print("compute:{}",timers("compute").costs)
         print("prefill:",timers("generate").costs[0])
         prefill_history.append(timers("generate").costs[0])
