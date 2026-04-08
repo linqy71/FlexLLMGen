@@ -43,6 +43,13 @@ logging.basicConfig(#filename="test.log", filemode="w",
                     datefmt="%m-%d %H:%M:%S", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+DEFAULT_DATASET_ROOT = "/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/lqy/HF_HOME/datasets/"
+DEFAULT_TOKENIZER_PATH = (
+    "/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/lqy/HF_HOME/hub/"
+    "models--meta-llama--Meta-Llama-3.1-8B-Instruct/snapshots/"
+    "0e9e39f249a16976918f6564b8830bc894c89659"
+)
+
 @dataclasses.dataclass(frozen=True)
 class Policy:
     gpu_batch_size: int
@@ -1373,9 +1380,186 @@ def get_tokenized_inputs(prompt, max_prompt_len, tokenizer):
     inputs_ids = tokenizer(prompt, max_length=max_prompt_len, truncation=True).input_ids
     return inputs_ids
 
+
+def get_llama_tokenizer(args):
+    return AutoTokenizer.from_pretrained(
+        args.tokenizer_path,
+        truncation_side="left",
+    )
+
+
+def init_llama_runtime(args):
+    num_prompts = args.num_gpu_batches * args.gpu_batch_size
+    max_prompt_len, gen_len = args.prompt_len, args.gen_len
+
+    gpu = TorchDevice("cuda:0")
+    cpu = TorchDevice("cpu")
+    disk = TorchDisk(args.offload_dir)
+    env = ExecutionEnv(
+        gpu=gpu,
+        cpu=cpu,
+        disk=disk,
+        mixed=TorchMixedDevice([gpu, cpu, disk]),
+    )
+
+    policy = Policy(
+        args.gpu_batch_size,
+        args.num_gpu_batches,
+        args.percent[0],
+        args.percent[1],
+        args.percent[2],
+        args.percent[3],
+        args.percent[4],
+        args.percent[5],
+        args.overlap,
+        args.sep_layer,
+        args.pin_weight,
+        args.cpu_cache_compute,
+        args.attn_sparsity,
+        args.compress_weight,
+        CompressionConfig(num_bits=4, group_size=64, group_dim=0, symmetric=False),
+        args.compress_cache,
+        CompressionConfig(num_bits=4, group_size=64, group_dim=2, symmetric=False),
+    )
+    assert not (args.compress_cache and args.attn_sparsity < 1.0), "Not implemented"
+
+    llama_config = preset_llama3_config()
+    cache_size = llama_config.cache_bytes(num_prompts, max_prompt_len + gen_len)
+    hidden_size = llama_config.hidden_bytes(num_prompts, max_prompt_len + gen_len)
+    print(
+        f"model size: {llama_config.model_bytes()/GB:.3f} GB, "
+        f"cache size: {cache_size/GB:.3f} GB, "
+        f"hidden size (prefill): {hidden_size/GB:.3f} GB"
+    )
+
+    print("init weight...init_cache_home...")
+    max_length = max(16384, max_prompt_len + gen_len)
+    model = LLAMA(
+        llama_config,
+        env,
+        args.path,
+        policy,
+        max_length,
+        max_prompt_len,
+        gen_len,
+    )
+    return model, env, gpu, cpu
+
+
+def reset_full_test_timers():
+    for timer_name in (
+        "generate",
+        "warmup",
+        "imp io",
+        "imp calc",
+        "compute",
+        "imp load and compute",
+        "cache store",
+        "probe_cache",
+        "full_cache",
+        "imp choose1",
+        "imp choose2",
+        "imp choose3",
+        "imp choose4",
+        "chunk io",
+        "mlp",
+        "load cache",
+        "load weight",
+        "store cache",
+        "compute layer",
+    ):
+        timers(timer_name).reset()
+
+
+def print_generation_outputs(tokenizer, output_ids, args):
+    if DUMMY_WEIGHT in args.path:
+        return
+
+    outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
+    show_str = "Outputs:\n" + 70 * "-" + "\n"
+    for idx, output in enumerate(outputs):
+        show_str += f"{idx}: {output}\n"
+        show_str += "-" * 70 + "\n"
+    if args.verbose >= 2:
+        print(show_str)
+
+
+def log_full_test_metrics():
+    print("warmup sum:", timers("warmup").elapsed("sum"))
+    print("warmup:", timers("warmup").costs)
+    print("imp io average:", timers("imp io").elapsed("average"))
+    print("imp io sum:", timers("imp io").elapsed("sum"))
+    print("imp calc average:", timers("imp calc").elapsed("average"))
+    print("imp calc sum:", timers("imp calc").elapsed("sum"))
+    print("imp calc:", timers("imp calc").costs)
+    print("compute average:", timers("compute").elapsed("average"))
+    print("compute sum:", timers("compute").elapsed("sum"))
+    print("prefill:", timers("generate").costs[0])
+    print(
+        (timers("imp io").elapsed("sum") + timers("imp calc").elapsed("sum"))
+        / timers("generate").costs[0]
+        * 100
+    )
+    print("imp load :", timers("imp load and compute").elapsed("average"))
+    print("imp sum:", timers("imp load and compute").elapsed("sum"))
+    print("generate:", timers("generate").costs)
+    print("generate sum:", timers("generate").elapsed("sum"))
+    print(
+        "probe_cache: ",
+        timers("probe_cache").elapsed("average"),
+        "  ",
+        timers("probe_cache").elapsed("sum"),
+    )
+    print(
+        "full_cache: ",
+        timers("full_cache").elapsed("average"),
+        "  ",
+        timers("full_cache").elapsed("sum"),
+    )
+
+
+def run_full_request_set(model, tokenizer, args, context, questions):
+    max_prompt_len, cut_gen_len = args.prompt_len, args.cut_gen_len
+
+    prefix_input = get_tokenized_inputs(
+        context,
+        max_prompt_len=max_prompt_len,
+        tokenizer=tokenizer,
+    )
+    print(len(prefix_input[0]))
+    model.generate(
+        prefix_input,
+        max_new_tokens=1,
+        debug_mode=args.debug_mode,
+        cut_gen_len=cut_gen_len,
+        verbose=args.verbose,
+    )
+    model.sync()
+
+    inputs = [context + query + "\n" for query in questions]
+    inputs_ids = tokenizer(inputs, truncation=True, max_length=max_prompt_len).input_ids
+    logger.info("num_questions=%d max_input_tokens=%d", len(inputs_ids), max(len(ids) for ids in inputs_ids))
+
+    prefill_history = []
+    for idx, input_ids in enumerate(inputs_ids):
+        reset_full_test_timers()
+        output_ids = model.generate(
+            inputs=[input_ids],
+            max_new_tokens=args.gen_len,
+            debug_mode=args.debug_mode,
+            cut_gen_len=cut_gen_len,
+            verbose=args.verbose,
+        )
+        print_generation_outputs(tokenizer, output_ids, args)
+        prefill_history.append(timers("generate").costs[0])
+        model.finish_one_query(idx)
+        log_full_test_metrics()
+
+    return prefill_history
+
 def run_flexllmgen(args):
     print(f"<run_flexllmgen>: args.model: {args.model}")
-    tokenizer = AutoTokenizer.from_pretrained("~/HDD_POOL/lqy/HF_HOME/hub/models--meta-llama--Meta-Llama-3.1-8B-Instruct/snapshots/0e9e39f249a16976918f6564b8830bc894c89659")
+    tokenizer = get_llama_tokenizer(args)
 
     # if args.model == "facebook/galactica-30b":
     #     tokenizer = AutoTokenizer.from_pretrained("facebook/galactica-30b", padding_side="left")
@@ -1415,8 +1599,8 @@ def run_flexllmgen(args):
           f"hidden size (prefill): {hidden_size/GB:.3f} GB")
 
     print("init weight...")
-    max_length = 4096
-    model = LLAMA(llama_config, env, args.path, policy, max_length)
+    max_length = max(4096, prompt_len + gen_len)
+    model = LLAMA(llama_config, env, args.path, policy, max_length, prompt_len, gen_len)
 
     try:
         print("warmup - generate")
@@ -1473,10 +1657,18 @@ def run_flexllmgen(args):
         print(log_str)
 
 def process_dapr():
-    RootPath = "/HOME/nsccgz_qylin/nsccgz_qylinxy_1/HDD_POOL/lqy/HF_HOME/datasets/"
-    docs = load_dataset(RootPath + "UKPLab___dapr/ConditionalQA-docs/0.0.0/67ae3daa13596700976d20605630f5f9db3bd732/", split="test")
-    qrels = load_dataset(RootPath + "UKPLab___dapr/ConditionalQA-qrels/0.0.0/67ae3daa13596700976d20605630f5f9db3bd732/", split="test")
-    queries = load_dataset(RootPath + "UKPLab___dapr/ConditionalQA-queries/0.0.0/67ae3daa13596700976d20605630f5f9db3bd732/", split="test")
+    docs = load_dataset(
+        DEFAULT_DATASET_ROOT + "UKPLab___dapr/ConditionalQA-docs/0.0.0/67ae3daa13596700976d20605630f5f9db3bd732/",
+        split="test",
+    )
+    qrels = load_dataset(
+        DEFAULT_DATASET_ROOT + "UKPLab___dapr/ConditionalQA-qrels/0.0.0/67ae3daa13596700976d20605630f5f9db3bd732/",
+        split="test",
+    )
+    queries = load_dataset(
+        DEFAULT_DATASET_ROOT + "UKPLab___dapr/ConditionalQA-queries/0.0.0/67ae3daa13596700976d20605630f5f9db3bd732/",
+        split="test",
+    )
     print(queries)
     qrels_dict = defaultdict(set)
 
@@ -1505,42 +1697,71 @@ def process_dapr():
     #print(questions)
     return context, questions
 
+
+def process_full_dapr():
+    docs = load_dataset(
+        DEFAULT_DATASET_ROOT + "UKPLab___dapr/ConditionalQA-docs/0.0.0/67ae3daa13596700976d20605630f5f9db3bd732/",
+        split="test",
+    )
+    qrels = load_dataset(
+        DEFAULT_DATASET_ROOT + "UKPLab___dapr/ConditionalQA-qrels/0.0.0/67ae3daa13596700976d20605630f5f9db3bd732/",
+        split="test",
+    )
+    queries = load_dataset(
+        DEFAULT_DATASET_ROOT + "UKPLab___dapr/ConditionalQA-queries/0.0.0/67ae3daa13596700976d20605630f5f9db3bd732/",
+        split="test",
+    )
+    print(queries)
+    qrels_dict = defaultdict(set)
+
+    for row in qrels:
+        corpus_id = row["corpus_id"]
+        doc_id = corpus_id.split("-")[0]
+        qrels_dict[doc_id].add(row["query_id"])
+
+    def process_doc(target_doc_id):
+        target_docs = docs.filter(lambda row: row["doc_id"] == target_doc_id)
+        passages = target_docs[0]["passages"]
+        return "".join(f"{passage}\n" for passage in passages)
+
+    def process_query(query_ids):
+        target_queries = queries.filter(lambda query: query["_id"] in query_ids)
+        return [query["text"] for query in target_queries]
+
+    requests = {}
+    for doc_id, query_ids in qrels_dict.items():
+        if len(query_ids) < 5:
+            continue
+        requests[doc_id] = (process_doc(doc_id), process_query(query_ids))
+
+    return requests
+
+
+def process_full_longbench():
+    task_name = "narrativeqa"
+    file_path = DEFAULT_DATASET_ROOT + f"THUDM___long_bench/data/{task_name}.jsonl"
+    dataset = load_dataset("json", data_files=file_path)["train"]
+
+    context_to_questions = defaultdict(list)
+    for row in dataset:
+        context_to_questions[row["context"]].append(row["input"])
+
+    requests = {}
+    request_id = 0
+    for context, questions in context_to_questions.items():
+        if len(questions) < 10:
+            continue
+        requests[request_id] = (context[:18000], questions)
+        request_id += 1
+
+    return requests
+
+
 def run_dapr_flexllmgen(args):
     print(f"<run_llama_dapr_flexllmgen>: args.model: {args.model}")
-    tokenizer = AutoTokenizer.from_pretrained("/HOME/nsccgz_qylin/nsccgz_qylinxy_1/HDD_POOL/lqy/HF_HOME/hub/models--meta-llama--Meta-Llama-3.1-8B-Instruct/snapshots/0e9e39f249a16976918f6564b8830bc894c89659")
-
-    num_prompts = args.num_gpu_batches * args.gpu_batch_size
-    max_prompt_len, gen_len, cut_gen_len = args.prompt_len, args.gen_len, args.cut_gen_len
-    
-    gpu = TorchDevice("cuda:0")
-    cpu = TorchDevice("cpu")
-    disk = TorchDisk(args.offload_dir)
-    env = ExecutionEnv(gpu=gpu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gpu, cpu, disk]))
-
-    policy = Policy(args.gpu_batch_size, args.num_gpu_batches,
-                    args.percent[0], args.percent[1],
-                    args.percent[2], args.percent[3],
-                    args.percent[4], args.percent[5],
-                    args.overlap, args.sep_layer, args.pin_weight,
-                    args.cpu_cache_compute, args.attn_sparsity,
-                    args.compress_weight,
-                    CompressionConfig(num_bits=4, group_size=64,
-                                      group_dim=0, symmetric=False),
-                    args.compress_cache,
-                    CompressionConfig(num_bits=4, group_size=64,
-                                      group_dim=2, symmetric=False))
-    assert not (args.compress_cache and args.attn_sparsity < 1.0), "Not implemented"
-
-    llama_config = preset_llama3_config()
-    cache_size = llama_config.cache_bytes(num_prompts, max_prompt_len + gen_len)
-    hidden_size = llama_config.hidden_bytes(num_prompts, max_prompt_len + gen_len)
-    print(f"model size: {llama_config.model_bytes()/GB:.3f} GB, "
-          f"cache size: {cache_size/GB:.3f} GB, "
-          f"hidden size (prefill): {hidden_size/GB:.3f} GB")
-    
-    print("init weight...init_cache_home...")
-    max_length = 16384
-    model = LLAMA(llama_config, env, args.path, policy, max_length, max_prompt_len, gen_len)
+    tokenizer = get_llama_tokenizer(args)
+    model, env, gpu, cpu = init_llama_runtime(args)
+    max_prompt_len, cut_gen_len = args.prompt_len, args.cut_gen_len
 
     context, questions = process_dapr()
     inputs = [context +  query + "\n" for query in questions]
@@ -1580,9 +1801,77 @@ def run_dapr_flexllmgen(args):
     print(f"peak gpu mem: {gpu_peak_mem / GB:.3f} GB\t" + f"peak cpu mem: {cpu_peak_mem / GB:.3f} GB\t")
 
 
+def run_full_dapr_flexllmgen(args):
+    print(f"<run_full_dapr_flexllmgen>: args.model: {args.model}")
+    tokenizer = get_llama_tokenizer(args)
+    model, env, gpu, cpu = init_llama_runtime(args)
+
+    requests = process_full_dapr()
+    print(len(requests), flush=True)
+
+    for doc_id, (context, questions) in requests.items():
+        logger.info("start full_dapr doc_id=%s num_questions=%d", doc_id, len(questions))
+        prefill_history = run_full_request_set(model, tokenizer, args, context, questions)
+
+        _, gpu_peak_mem = gpu.mem_stats()
+        _, cpu_peak_mem = cpu.mem_stats()
+        print(f"peak gpu mem: {gpu_peak_mem / GB:.3f} GB\t" + f"peak cpu mem: {cpu_peak_mem / GB:.3f} GB\t")
+        if prefill_history:
+            recent_prefill = prefill_history[1:]
+            print(f"Last {len(recent_prefill)} prefill values: {recent_prefill}")
+            if recent_prefill:
+                print(
+                    f"Average of last {len(recent_prefill)} prefill values: "
+                    f"{sum(recent_prefill)/len(recent_prefill):.6f}"
+                )
+
+        del model.radix_tree
+        model.radix_tree = RadixTree()
+
+    model.final_finish()
+    env.close_copy_threads()
+
+
+def run_full_longbench_flexllmgen(args):
+    print(f"<run_full_longbench_flexllmgen>: args.model: {args.model}")
+    tokenizer = get_llama_tokenizer(args)
+    model, env, gpu, cpu = init_llama_runtime(args)
+
+    requests = process_full_longbench()
+    print(len(requests), flush=True)
+
+    for request_id, (context, questions) in requests.items():
+        logger.info(
+            "start full_longbench request_id=%s num_questions=%d",
+            request_id,
+            len(questions),
+        )
+        prefill_history = run_full_request_set(model, tokenizer, args, context, questions)
+
+        _, gpu_peak_mem = gpu.mem_stats()
+        _, cpu_peak_mem = cpu.mem_stats()
+        print(f"peak gpu mem: {gpu_peak_mem / GB:.3f} GB\t" + f"peak cpu mem: {cpu_peak_mem / GB:.3f} GB\t")
+        if prefill_history:
+            recent_prefill = prefill_history[1:]
+            print(f"Last {len(recent_prefill)} prefill values: {recent_prefill}")
+            if recent_prefill:
+                print(
+                    f"Average of last {len(recent_prefill)} prefill values: "
+                    f"{sum(recent_prefill)/len(recent_prefill):.6f}"
+                )
+
+        del model.radix_tree
+        model.radix_tree = RadixTree()
+
+    model.final_finish()
+    env.close_copy_threads()
+
+
 def add_parser_arguments(parser):
     parser.add_argument("--model", type=str, default="facebook/opt-6.7b",
         help="The model name.")
+    parser.add_argument("--tokenizer-path", type=str, default=DEFAULT_TOKENIZER_PATH,
+        help="The path to the tokenizer.")
     parser.add_argument("--path", type=str, default="~/opt_weights",
         help="The path to the model weights. If there are no cached weights, "
              "FlexLLMGen will automatically download them from HuggingFace.")
@@ -1623,6 +1912,8 @@ def add_parser_arguments(parser):
 
     parser.add_argument("--overlap", type=str2bool, nargs='?',
         const=True, default=True)
+    parser.add_argument("--input", type=str,
+        choices=["dapr", "full_dapr", "full_longbench"], default="dapr")
 
 
 if __name__ == "__main__":
@@ -1632,5 +1923,9 @@ if __name__ == "__main__":
 
     assert len(args.percent) == 6
 
-    #run_prefix_flexllmgen(args)
-    run_dapr_flexllmgen(args)
+    if args.input == "dapr":
+        run_dapr_flexllmgen(args)
+    elif args.input == "full_dapr":
+        run_full_dapr_flexllmgen(args)
+    elif args.input == "full_longbench":
+        run_full_longbench_flexllmgen(args)
