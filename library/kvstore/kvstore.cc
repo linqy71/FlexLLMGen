@@ -279,8 +279,8 @@ void KVStore::write_to_layer_split_file(
 
     std::string file_name0 = this->store_path + "/" + std::to_string(prefix_id) + "_layer" + std::to_string(layer_id) + "_part0.bin";
     std::string file_name1 = this->store_path + "/" + std::to_string(prefix_id) + "_layer" + std::to_string(layer_id) + "_part1.bin";
-    std::ofstream file0(file_name0, std::ios::app | std::ios::binary);
-    std::ofstream file1(file_name1, std::ios::app | std::ios::binary);
+    std::ofstream file0(file_name0, std::ios::out | std::ios::binary);
+    std::ofstream file1(file_name1, std::ios::out | std::ios::binary);
 
     for (int i = 0; i < this->num_key_value_heads; i++){
         const std::vector<int>& head_strategy = strategy[i];

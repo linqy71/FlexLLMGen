@@ -508,6 +508,7 @@ class LSHServer:
             del self.kv_store
             self.kv_store = KVStore()
             self.kv_store.alloc(self.num_layers, self.num_attention_heads, self.num_key_value_heads, self.head_dim, self.max_length)
+            self.kv_store.set_compaction_threshold(self.compaction_threshold)
             self.persisted = False
 
         print("req done, sum of io count: ", self.kv_store.get_num_io())
