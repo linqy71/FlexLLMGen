@@ -281,6 +281,7 @@ class SelfAttention:
 
     def init_weight(self, weight_home, path):
         h, dtype = (self.config.hidden_size, self.config.dtype)
+        kv_hidden_size = (self.config.hidden_size // self.config.n_head) * self.config.num_key_value_heads
         path = os.path.join(os.path.join(path, f"decoder.layers.{self.layer_id}"))
         weight_specs = [
             # i_n
@@ -288,9 +289,9 @@ class SelfAttention:
             # w_q
             ((h, h), dtype, path + ".self_attn.q_proj.weight"),
             # w_k
-            ((h // 4, h), dtype, path + ".self_attn.k_proj.weight"),
+            ((kv_hidden_size, h), dtype, path + ".self_attn.k_proj.weight"),
             # w_v
-            ((h // 4, h), dtype, path + ".self_attn.v_proj.weight"),
+            ((kv_hidden_size, h), dtype, path + ".self_attn.v_proj.weight"),
             # w_out
             ((h, h), dtype, path + ".self_attn.o_proj.weight")
         ]
@@ -467,16 +468,17 @@ class MLP:
 
     def init_weight(self, weight_home, path):
         h, dtype = (self.config.hidden_size, self.config.dtype)
+        intermediate_size = self.config.intermediate_size
         path = os.path.join(os.path.join(path, f"decoder.layers.{self.layer_id}."))
         weight_specs = [
             # pos_n
             ((h, ), dtype, path + "post_attn_layernorm.weight"),
             # gate
-            ((14336, h), dtype, path + "mlp.gate_proj.weight"),
+            ((intermediate_size, h), dtype, path + "mlp.gate_proj.weight"),
             # up
-            ((14336, h), dtype, path + "mlp.up_proj.weight"),
+            ((intermediate_size, h), dtype, path + "mlp.up_proj.weight"),
             # down
-            ((h, 14336), dtype, path + "mlp.down_proj.weight"),
+            ((h, intermediate_size), dtype, path + "mlp.down_proj.weight"),
         ]
         weights = init_weight_list(weight_specs, self.policy, self.env)
         weight_home.store(weights)

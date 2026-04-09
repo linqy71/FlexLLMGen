@@ -16,7 +16,7 @@ import torch
 from transformers import AutoTokenizer
 
 from flexllmgen.compression import CompressionConfig
-from flexllmgen.llama_config import LlamaConfig, preset_llama3_config
+from flexllmgen.llama_config import LlamaConfig, get_llama_config_from
 
 
 
@@ -44,11 +44,18 @@ logging.basicConfig(#filename="test.log", filemode="w",
 logger = logging.getLogger(__name__)
 
 DEFAULT_DATASET_ROOT = "/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/lqy/HF_HOME/datasets/"
-DEFAULT_TOKENIZER_PATH = (
-    "/HOME/nsccgz_zgchen/nsccgz_zgchen_6/HDD_POOL/lqy/HF_HOME/hub/"
-    "models--meta-llama--Meta-Llama-3.1-8B-Instruct/snapshots/"
-    "0e9e39f249a16976918f6564b8830bc894c89659"
-)
+DEFAULT_TOKENIZER_PATH = None
+
+LLAMA_MODEL_SPECS = {
+    "meta/llama3.1-8b": {
+        "config_name": "llama3.1-8b",
+        "hf_cache_dir": "models--meta-llama--Meta-Llama-3.1-8B-Instruct",
+    },
+    "meta/llama3.3-70b": {
+        "config_name": "llama3.3-70b",
+        "hf_cache_dir": "models--meta-llama--Llama-3.3-70B-Instruct",
+    },
+}
 
 @dataclasses.dataclass(frozen=True)
 class Policy:
@@ -308,9 +315,14 @@ class SelfAttention:
         self.sin_cache = None
         
         self.task = None
+        self.prefill_cache_shape = 0
         
     def set_task(self, task):
         self.task = task
+
+    def sync(self):
+        self.env.disk.synchronize()
+        torch.cuda.synchronize()
         
     def set_chunk_pool(self, chunk_pool):
         self.chunk_pool = chunk_pool
@@ -320,6 +332,7 @@ class SelfAttention:
 
     def init_weight(self, weight_home, path):
         h, dtype = (self.config.hidden_size, self.config.dtype)
+        kv_hidden_size = (self.config.hidden_size // self.config.n_head) * self.config.num_key_value_heads
         path = os.path.join(os.path.join(path, f"decoder.layers.{self.layer_id}"))
         weight_specs = [
             # i_n
@@ -327,9 +340,9 @@ class SelfAttention:
             # w_q
             ((h, h), dtype, path + ".self_attn.q_proj.weight"),
             # w_k
-            ((h // 4, h), dtype, path + ".self_attn.k_proj.weight"),
+            ((kv_hidden_size, h), dtype, path + ".self_attn.k_proj.weight"),
             # w_v
-            ((h // 4, h), dtype, path + ".self_attn.v_proj.weight"),
+            ((kv_hidden_size, h), dtype, path + ".self_attn.v_proj.weight"),
             # w_out
             ((h, h), dtype, path + ".self_attn.o_proj.weight")
         ]
@@ -388,7 +401,9 @@ class SelfAttention:
             chunk_id, offset = probe_k_ptr[j].chunk_id, probe_k_ptr[j].offset
             req[chunk_id].append((offset, t_idx))
 
+        timers("probe_cache").start(self.sync)
         self.probe_chunk_pool.get_probe_cache_concurrent_merge(k_cache, req)
+        timers("probe_cache").stop(self.sync)
         cache_read_buf.store((k_cache, True))
 
     def get_prefix_kv(self, imp_token_idx, layer):
@@ -411,8 +426,10 @@ class SelfAttention:
             kv_ptr = self.task.common_prefix_token[imp_token_idx[j]].kv_ptr[layer]
             chunk_id, offset = kv_ptr.chunk_id, kv_ptr.offset
             req[chunk_id].append((offset, j))
-        
+
+        timers("full_cache").start(self.sync)
         self.chunk_pool.get_full_head_cache_concurrent_once(k_cache, v_cache, req)
+        timers("full_cache").stop(self.sync)
 
         return k_cache, v_cache
 
@@ -527,25 +544,33 @@ class SelfAttention:
             mask, donate[1] = attention_mask.val.smart_copy(self.compute)
             if self.task.common_prefix_len > 0:
                 (k_cache, donate[9]) = cache_read_buf.pop()
+                timers("imp calc").start(self.sync)
                 imp_token_idx = self.compute.get_important_token_idx_llama_modified(h, mask, i_n, w_q, self.rms_norm_eps,
                                 freqs_cis, n_head, num_key_value_heads, donate, self.policy.compress_cache, self.policy.comp_cache_config,
                                 k_cache, self.policy.important_ratio)
+                timers("imp calc").stop(self.sync)
 
                 imp_token_idx = imp_token_idx[0] # 解开batch维度
 
-                logger.info(f"Get Important token indices in layer_{j}: {imp_token_idx}")
+                # logger.info(f"Get Important token indices in layer_{j}: {imp_token_idx}")
 
+                timers("imp load and compute").start(self.sync)
                 k_cache, v_cache = self.get_prefix_kv(imp_token_idx, j)
+                timers("imp load and compute").stop(self.sync)
                 
+                timers("compute").start(self.sync)
                 h, new_k_cache, new_v_cache = self.compute.gqa_prefill_modified(h, mask, i_n, w_q, w_k, w_v, w_out, self.rms_norm_eps,
                                 freqs_cis, n_head, num_key_value_heads, k_cache, v_cache, donate, self.policy.compress_cache, self.policy.comp_cache_config,
                                 self.task.common_prefix_len)
+                timers("compute").stop(self.sync)
                 
                 self.prefill_cache_shape = new_k_cache.shape[0]
             else:
+                timers("compute").start(self.sync)
                 h, new_k_cache, new_v_cache = self.compute.gqa(h, mask, i_n, w_q,
                     w_k, w_v, w_out, self.rms_norm_eps, freqs_cis,
                     n_head, num_key_value_heads, donate, self.policy.compress_cache, self.policy.comp_cache_config)
+                timers("compute").stop(self.sync)
                 self.prefill_cache_shape = self.task.prompt_len
             cache_write_buf.store((new_k_cache, new_v_cache))
         else:  # decoding
@@ -582,16 +607,17 @@ class MLP:
 
     def init_weight(self, weight_home, path):
         h, dtype = (self.config.hidden_size, self.config.dtype)
+        intermediate_size = self.config.intermediate_size
         path = os.path.join(os.path.join(path, f"decoder.layers.{self.layer_id}."))
         weight_specs = [
             # pos_n
             ((h, ), dtype, path + "post_attn_layernorm.weight"),
             # gate
-            ((14336, h), dtype, path + "mlp.gate_proj.weight"),
+            ((intermediate_size, h), dtype, path + "mlp.gate_proj.weight"),
             # up
-            ((14336, h), dtype, path + "mlp.up_proj.weight"),
+            ((intermediate_size, h), dtype, path + "mlp.up_proj.weight"),
             # down
-            ((h, 14336), dtype, path + "mlp.down_proj.weight"),
+            ((h, intermediate_size), dtype, path + "mlp.down_proj.weight"),
         ]
         weights = init_weight_list(weight_specs, self.policy, self.env)
         weight_home.store(weights)
@@ -1381,9 +1407,56 @@ def get_tokenized_inputs(prompt, max_prompt_len, tokenizer):
     return inputs_ids
 
 
+def normalize_llama_model_name(model_name):
+    model_name = model_name.lower()
+    if model_name in LLAMA_MODEL_SPECS:
+        return model_name
+    if "70b" in model_name:
+        return "meta/llama3.3-70b"
+    if "8b" in model_name:
+        return "meta/llama3.1-8b"
+    raise ValueError(f"Unsupported llama model: {model_name}")
+
+
+def resolve_snapshot_dir(model_dir):
+    model_dir = os.path.abspath(os.path.expanduser(model_dir))
+    snapshots_dir = os.path.join(model_dir, "snapshots")
+    if not os.path.isdir(snapshots_dir):
+        return model_dir
+
+    snapshot_names = sorted(
+        name for name in os.listdir(snapshots_dir)
+        if os.path.isdir(os.path.join(snapshots_dir, name))
+    )
+    if not snapshot_names:
+        raise FileNotFoundError(f"No snapshots found under {snapshots_dir}")
+    return os.path.join(snapshots_dir, snapshot_names[-1])
+
+
+def resolve_llama_artifacts(args):
+    model_key = normalize_llama_model_name(args.model)
+    spec = LLAMA_MODEL_SPECS[model_key]
+
+    tokenizer_root = args.tokenizer_path
+    if not tokenizer_root:
+        tokenizer_root = os.path.join(args.path, spec["hf_cache_dir"])
+    tokenizer_path = resolve_snapshot_dir(tokenizer_root)
+
+    llama_config = get_llama_config_from(spec["config_name"], tokenizer_path)
+    weights_dir = os.path.abspath(os.path.expanduser(
+        os.path.join(args.path, f"{llama_config.name}-np")
+    ))
+    if not os.path.isdir(weights_dir):
+        raise FileNotFoundError(f"Weight directory not found: {weights_dir}")
+
+    return tokenizer_path, llama_config, weights_dir
+
+
 def get_llama_tokenizer(args):
+    tokenizer_path, _, _ = resolve_llama_artifacts(args)
+    logger.info("use tokenizer from %s", tokenizer_path)
     return AutoTokenizer.from_pretrained(
-        args.tokenizer_path,
+        tokenizer_path,
         truncation_side="left",
     )
 
@@ -1391,6 +1464,7 @@ def get_llama_tokenizer(args):
 def init_llama_runtime(args):
     num_prompts = args.num_gpu_batches * args.gpu_batch_size
     max_prompt_len, gen_len = args.prompt_len, args.gen_len
+    _, llama_config, weights_dir = resolve_llama_artifacts(args)
 
     gpu = TorchDevice("cuda:0")
     cpu = TorchDevice("cpu")
@@ -1423,13 +1497,20 @@ def init_llama_runtime(args):
     )
     assert not (args.compress_cache and args.attn_sparsity < 1.0), "Not implemented"
 
-    llama_config = preset_llama3_config()
     cache_size = llama_config.cache_bytes(num_prompts, max_prompt_len + gen_len)
     hidden_size = llama_config.hidden_bytes(num_prompts, max_prompt_len + gen_len)
     print(
         f"model size: {llama_config.model_bytes()/GB:.3f} GB, "
         f"cache size: {cache_size/GB:.3f} GB, "
         f"hidden size (prefill): {hidden_size/GB:.3f} GB"
+    )
+    logger.info(
+        "resolved model=%s config_name=%s num_layers=%d hidden=%d weights=%s",
+        args.model,
+        llama_config.name,
+        llama_config.num_hidden_layers,
+        llama_config.hidden_size,
+        weights_dir,
     )
 
     print("init weight...init_cache_home...")
@@ -1502,6 +1583,8 @@ def log_full_test_metrics():
     )
     print("imp load :", timers("imp load and compute").elapsed("average"))
     print("imp sum:", timers("imp load and compute").elapsed("sum"))
+    print("cache store average:", timers("cache store").elapsed("average"))
+    print("cache store sum:", timers("cache store").elapsed("sum"))
     print("generate:", timers("generate").costs)
     print("generate sum:", timers("generate").elapsed("sum"))
     print(
@@ -1552,7 +1635,12 @@ def run_full_request_set(model, tokenizer, args, context, questions):
         )
         print_generation_outputs(tokenizer, output_ids, args)
         prefill_history.append(timers("generate").costs[0])
+        start_cache_store = torch.cuda.Event(enable_timing=True)
+        end_cache_store = torch.cuda.Event(enable_timing=True)
+        timers("cache store").start(start_cache_store.record())
         model.finish_one_query(idx)
+        end_cache_store.record()
+        timers("cache store").stop(end_cache_store.synchronize())
         log_full_test_metrics()
 
     return prefill_history
@@ -1560,6 +1648,7 @@ def run_full_request_set(model, tokenizer, args, context, questions):
 def run_flexllmgen(args):
     print(f"<run_flexllmgen>: args.model: {args.model}")
     tokenizer = get_llama_tokenizer(args)
+    _, llama_config, weights_dir = resolve_llama_artifacts(args)
 
     # if args.model == "facebook/galactica-30b":
     #     tokenizer = AutoTokenizer.from_pretrained("facebook/galactica-30b", padding_side="left")
@@ -1591,12 +1680,19 @@ def run_flexllmgen(args):
                                       group_dim=2, symmetric=False))
     assert not (args.compress_cache and args.attn_sparsity < 1.0), "Not implemented"
 
-    llama_config = preset_llama3_config()
     cache_size = llama_config.cache_bytes(num_prompts, prompt_len + gen_len)
     hidden_size = llama_config.hidden_bytes(num_prompts, prompt_len + gen_len)
     print(f"model size: {llama_config.model_bytes()/GB:.3f} GB, "
           f"cache size: {cache_size/GB:.3f} GB, "
           f"hidden size (prefill): {hidden_size/GB:.3f} GB")
+    logger.info(
+        "resolved model=%s config_name=%s num_layers=%d hidden=%d weights=%s",
+        args.model,
+        llama_config.name,
+        llama_config.num_hidden_layers,
+        llama_config.hidden_size,
+        weights_dir,
+    )
 
     print("init weight...")
     max_length = max(4096, prompt_len + gen_len)
@@ -1908,7 +2004,7 @@ def add_parser_arguments(parser):
 
     parser.add_argument("--log-file", type=str, default="auto")
     parser.add_argument("--no-log", action="store_true")
-    parser.add_argument("--verbose", type=int, default=2)
+    parser.add_argument("--verbose", type=int, default=1)
 
     parser.add_argument("--overlap", type=str2bool, nargs='?',
         const=True, default=True)

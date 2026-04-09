@@ -186,7 +186,7 @@ class ChunkPool:
         else:
             bandwidth_mbps = float('inf')
 
-        print(f"Chunk IO Time: {last_io_time:.4f} s, Chunks Read: {num_chunks}, Calculated Bandwidth: {bandwidth_mbps:.2f} MB/s")
+        # print(f"Chunk IO Time: {last_io_time:.4f} s, Chunks Read: {num_chunks}, Calculated Bandwidth: {bandwidth_mbps:.2f} MB/s")
 
 
         timers("chunk io").start()
@@ -203,7 +203,7 @@ class ChunkPool:
                 
         timers("chunk io").stop()
         last_io_time = timers("chunk io").costs[-1]
-        logger.info(f"chunk iteration time:{last_io_time}")
+        # logger.info(f"chunk iteration time:{last_io_time}")
 
         k_len = k_cache.shape[0]
         k_cache.data.copy_(self.cpu_buf_k[:k_len], non_blocking=True)
@@ -342,7 +342,7 @@ class ProbeChunkPool:
             bandwidth_mbps = bandwidth_bps / (1024 * 1024)
         else:
             bandwidth_mbps = float('inf')
-        print(f"Probe Chunk IO Time: {last_io_time:.4f} s, Chunks Read: {num_chunks}, Calculated Bandwidth: {bandwidth_mbps:.2f} MB/s")
+        # print(f"Probe Chunk IO Time: {last_io_time:.4f} s, Chunks Read: {num_chunks}, Calculated Bandwidth: {bandwidth_mbps:.2f} MB/s")
 
         timers("chunk io").reset()
         

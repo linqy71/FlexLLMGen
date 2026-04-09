@@ -1,4 +1,4 @@
-from transformers import LlamaForCausalLM, LlamaConfig
+from transformers import AutoConfig, LlamaForCausalLM
 import torch
 import os
 import numpy as np
@@ -12,6 +12,7 @@ class LlamaConfig:
     vocab_size: int = 128256
     max_position_embeddings: int = 131072
     hidden_size: int = 4096
+    intermediate_size: int = 14336
     n_head: int = 32
     num_key_value_heads: int = 8
     rms_norm_eps: float = 0.00001
@@ -24,7 +25,7 @@ class LlamaConfig:
         d = self.hidden_size
         L = self.num_hidden_layers
         V = self.vocab_size
-        d_ff = int(2.67 * d)  # for SwiGLU
+        d_ff = self.intermediate_size
 
         # Q, K, V, O: 4 * d * d
         # FFN: d × d_ff + d_ff × d = 2 × d × d_ff
@@ -47,6 +48,7 @@ def preset_llama3_config():
         num_hidden_layers = 32,
         max_position_embeddings = 131072,
         hidden_size = 4096,
+        intermediate_size = 14336,
         n_head = 32,
         num_key_value_heads = 8,
         rms_norm_eps = 0.00001,
@@ -55,18 +57,21 @@ def preset_llama3_config():
     return config
 
 def get_llama_config_from(name, model_dir):
-    lm_config = LlamaConfig.from_pretrained(model_dir)
+    lm_config = AutoConfig.from_pretrained(model_dir, local_files_only=True)
     
     config = LlamaConfig(
         name = name,
         num_hidden_layers = lm_config.num_hidden_layers,
+        vocab_size = lm_config.vocab_size,
         max_position_embeddings = lm_config.max_position_embeddings,
         hidden_size = lm_config.hidden_size,
+        intermediate_size = lm_config.intermediate_size,
         n_head = lm_config.num_attention_heads,
         num_key_value_heads = lm_config.num_key_value_heads,
         rms_norm_eps = lm_config.rms_norm_eps,
         rope_theta = lm_config.rope_theta,
-        eos_token_id = lm_config.eos_token_id
+        pad_token_id = lm_config.pad_token_id if lm_config.pad_token_id is not None else 1,
+        input_dim = lm_config.hidden_size,
     )
     
     return config
