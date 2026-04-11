@@ -416,14 +416,19 @@ class TorchDevice:
         '''
         b, s, h = inputs.shape
         head_dim = h // n_head
-        scaling = head_dim ** -0.5
         common_prefix_len = sum(matched_prefix.values())
+        total_prompt_len = attention_mask.shape[1]
 
         hidden = F.layer_norm(inputs.data, (h,), weight=w_ln.data, bias=b_ln.data)
-        hidden = hidden[:, common_prefix_len:, :]
+        if s == total_prompt_len:
+            hidden = hidden[:, common_prefix_len:, :]
+        else:
+            assert s == total_prompt_len - common_prefix_len, (
+                f"Expected suffix-only hidden length {total_prompt_len - common_prefix_len}, got {s}"
+            )
         # shape: (b, s, h)
         q = F.linear(hidden, w_q.data, bias=b_q.data)
-        q = q.view(b, s - common_prefix_len, n_head, head_dim)
+        q = q.view(b, hidden.shape[1], n_head, head_dim)
         return q[0]
 
     def mha_prefill_with_kv(self, inputs, attention_mask, w_q, b_q, w_k, b_k, w_v, b_v,
@@ -464,24 +469,35 @@ class TorchDevice:
         head_dim = h // n_head
         scaling = head_dim ** -0.5
 
+        total_prompt_len = attention_mask.shape[1]
         common_prefix_len = sum(matched_prefix.values())
-        suffix_len = s - common_prefix_len
+        suffix_len = total_prompt_len - common_prefix_len
         
         hidden = F.layer_norm(inputs.data, (h,), weight=w_ln.data, bias=b_ln.data)
-        suffix_hidden = hidden[:, common_prefix_len:, :]  # hidden for suffix tokens
-        # shape: (b, s, h)
-        q = F.linear(hidden, w_q.data, bias=b_q.data)
+        if s == total_prompt_len:
+            suffix_hidden = hidden[:, common_prefix_len:, :]
+            residual = inputs.data[:, common_prefix_len:, :]
+        else:
+            assert s == suffix_len, f"Expected suffix-only hidden length {suffix_len}, got {s}"
+            suffix_hidden = hidden
+            residual = inputs.data
+
+        query_len = suffix_hidden.shape[1]
+        query_start = total_prompt_len - query_len
+
+        # shape: (b, query_len, h)
+        q = F.linear(suffix_hidden, w_q.data, bias=b_q.data) * scaling
         # shape: (b, suffix_len, h)
         k_new = F.linear(suffix_hidden, w_k.data, bias=b_k.data)
         v_new = F.linear(suffix_hidden, w_v.data, bias=b_v.data)
 
-        # shape: (b, s, n_head, head_dim)
-        q = q.view(b, s, n_head, head_dim)
+        # shape: (b, query_len, n_head, head_dim)
+        q = q.view(b, query_len, n_head, head_dim)
         # shape: (b, suffix_len, n_head, head_dim)
         k_new = k_new.view(b, suffix_len, n_head, head_dim)
         v_new = v_new.view(b, suffix_len, n_head, head_dim)
-        # shape: (b * n_head, s, head_dim)
-        q = q.permute(0, 2, 1, 3).reshape(b * n_head, s, head_dim)
+        # shape: (b * n_head, query_len, head_dim)
+        q = q.permute(0, 2, 1, 3).reshape(b * n_head, query_len, head_dim)
 
         # shape: (suffix_len, b * n_head, head_dim)
         k_new = k_new.permute(1, 0, 2, 3).reshape(suffix_len, b * n_head, head_dim)
@@ -494,40 +510,40 @@ class TorchDevice:
         # shape: (b * n_head, n_imp + suffix_len, head_dim)
         v = v.permute(1, 0, 2).reshape(b * n_head, n_imp + suffix_len, head_dim)
         
-        # shape: (b * n_head, s, n_imp + suffix_len)
-        attn_weights = torch.bmm(q, k) * scaling
+        # shape: (b * n_head, query_len, n_imp + suffix_len)
+        attn_weights = torch.bmm(q, k)
         l = n_imp + suffix_len
 
-        # self.transform_kernel(attn_weights, q, k, scaling, K, L)
-
-        idx = torch.arange(s, device=self.dev)
-        # shape: s, s
-        casual_mask = (idx <= idx.view(s, 1))
-        # shape: s, s+1
-        expanded_mask = torch.nn.functional.pad(casual_mask, (0, 1))
-        expanded_mask[:, -1] = False
-        # shape: b*n_head, l
-        token_idxs = torch.cat([imp_token_idx.to(self.dev), torch.arange(common_prefix_len, s, device=self.dev).unsqueeze(0).expand(b * n_head, -1)], dim=1)
-        token_idxs = token_idxs.view(b, n_head, l)
-        token_idxs[token_idxs == -1] = s
-        expanded_mask = expanded_mask.view(1, 1, s, s+1).expand(b, n_head, s, s+1)
-        # shape: (b, n_head, s, l)
-        mask = expanded_mask.gather(
-            dim=3,
-            index=token_idxs.unsqueeze(2).expand(-1, -1, s, -1)
+        imp_token_idx = imp_token_idx.to(self.dev)
+        suffix_token_idx = torch.arange(
+            common_prefix_len, total_prompt_len, device=self.dev
+        ).unsqueeze(0).expand(b * n_head, -1)
+        token_idxs = torch.cat([imp_token_idx, suffix_token_idx], dim=1)
+        valid_mask = torch.cat(
+            [imp_token_idx.ne(-1),
+             torch.ones_like(suffix_token_idx, dtype=torch.bool)],
+            dim=1,
         )
+        token_idxs = token_idxs.masked_fill(~valid_mask, total_prompt_len)
+        token_idxs = token_idxs.view(b, n_head, l)
+        valid_mask = valid_mask.view(b, n_head, l)
+
+        query_positions = torch.arange(
+            query_start, total_prompt_len, device=self.dev
+        ).view(1, 1, query_len, 1)
+        mask = valid_mask.unsqueeze(2) & (query_positions >= token_idxs.unsqueeze(2))
         
-        attn_weights = attn_weights.view(b, n_head, s, l)
+        attn_weights = attn_weights.view(b, n_head, query_len, l)
         attn_weights = torch.where(mask, attn_weights, -1e4)
-        attn_weights = attn_weights.view(b * n_head, s, l)
+        attn_weights = attn_weights.view(b * n_head, query_len, l)
         attn_weights = F.softmax(attn_weights, dim=2)
-        # shape: (b, n_head, s, head_dim)
-        value = torch.bmm(attn_weights, v).view(b, n_head, s, head_dim)
-        # shape: (b, s, h)
-        value = value.transpose(1, 2).reshape(b, s, h)
+        # shape: (b, n_head, query_len, head_dim)
+        value = torch.bmm(attn_weights, v).view(b, n_head, query_len, head_dim)
+        # shape: (b, query_len, h)
+        value = value.transpose(1, 2).reshape(b, query_len, h)
         value = F.linear(value, w_out.data, bias=b_out.data)
-        # shape : b, s, h
-        value.add_(inputs.data)
+        # shape : b, query_len, h
+        value.add_(residual)
 
         if donate[0]: inputs.delete()
         if donate[1]: attention_mask.delete()
