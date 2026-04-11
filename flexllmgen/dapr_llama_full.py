@@ -1601,6 +1601,22 @@ def log_full_test_metrics():
     )
 
 
+def drop_cache():
+    try:
+        import subprocess
+        subprocess.run(["sudo", "drop_cache"], check=True)
+        logger.info("Successfully dropped system caches")
+    except subprocess.CalledProcessError as exc:
+        logger.warning(f"Failed to drop caches: {exc}")
+    except Exception as exc:
+        logger.warning(f"Unexpected error when dropping caches: {exc}")
+
+
+def maybe_drop_cache(enabled: bool):
+    if enabled:
+        drop_cache()
+
+
 def run_full_request_set(model, tokenizer, args, context, questions):
     max_prompt_len, cut_gen_len = args.prompt_len, args.cut_gen_len
 
@@ -1639,6 +1655,7 @@ def run_full_request_set(model, tokenizer, args, context, questions):
         end_cache_store = torch.cuda.Event(enable_timing=True)
         timers("cache store").start(start_cache_store.record())
         model.finish_one_query(idx)
+        maybe_drop_cache(args.drop_cache)
         end_cache_store.record()
         timers("cache store").stop(end_cache_store.synchronize())
         log_full_test_metrics()
@@ -1889,6 +1906,7 @@ def run_dapr_flexllmgen(args):
 
         print("prefill:",timers("generate").costs[0])
         model.finish_one_query(i)
+        maybe_drop_cache(args.drop_cache)
         print("=" * 50)
     model.final_finish()
     env.close_copy_threads()
@@ -2008,6 +2026,8 @@ def add_parser_arguments(parser):
 
     parser.add_argument("--overlap", type=str2bool, nargs='?',
         const=True, default=True)
+    parser.add_argument("--drop-cache", action="store_true",
+        help="Drop system page cache after each query finishes.")
     parser.add_argument("--input", type=str,
         choices=["dapr", "full_dapr", "full_longbench"], default="dapr")
 
