@@ -64,15 +64,76 @@ def apply_rotary_emb(
     freqs_cis_q = freqs_cis[:q_len]
     freqs_cis_k = freqs_cis[:k_len]
 
-    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
+    xq_ = torch.view_as_complex(
+        xq.float().reshape(*xq.shape[:-1], xq.shape[-1] // 2, 2)
+    )
     freqs_cis_q = reshape_for_broadcast(freqs_cis_q, xq_)
     xq_out = torch.view_as_real(xq_ * freqs_cis_q).flatten(3)
     
-    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
+    xk_ = torch.view_as_complex(
+        xk.float().reshape(*xk.shape[:-1], xk.shape[-1] // 2, 2)
+    )
     freqs_cis_k = reshape_for_broadcast(freqs_cis_k, xk_)
     xk_out = torch.view_as_real(xk_ * freqs_cis_k).flatten(3)
 
     return xq_out.type_as(xq), xk_out.type_as(xk)
+
+
+def apply_rotary_emb_separate(
+    xq: torch.Tensor,
+    xk: torch.Tensor,
+    freqs_cis_q: torch.Tensor,
+    freqs_cis_k: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    xq_ = torch.view_as_complex(
+        xq.float().reshape(*xq.shape[:-1], xq.shape[-1] // 2, 2)
+    )
+    freqs_cis_q = reshape_for_broadcast(freqs_cis_q, xq_)
+    xq_out = torch.view_as_real(xq_ * freqs_cis_q).flatten(3)
+
+    xk_ = torch.view_as_complex(
+        xk.float().reshape(*xk.shape[:-1], xk.shape[-1] // 2, 2)
+    )
+    freqs_cis_k = reshape_for_broadcast(freqs_cis_k, xk_)
+    xk_out = torch.view_as_real(xk_ * freqs_cis_k).flatten(3)
+
+    return xq_out.type_as(xq), xk_out.type_as(xk)
+
+
+def select_important_token_idx(topk_idx: torch.Tensor, common_prefix_len: int):
+    b, n_probe_head, _ = topk_idx.shape
+    threshold = (
+        (topk_idx.shape[2] / common_prefix_len) /
+        (2 - topk_idx.shape[2] / common_prefix_len)
+    ) ** 0.6
+
+    if n_probe_head > 1:
+        jaccard_sum = torch.zeros(b, device=topk_idx.device, dtype=torch.float32)
+        comb = 0
+        for l in range(n_probe_head):
+            lhs = topk_idx[:, l, :]
+            for r in range(l + 1, n_probe_head):
+                rhs = topk_idx[:, r, :]
+                inter = (lhs.unsqueeze(2) == rhs.unsqueeze(1)).any(dim=2).sum(dim=1)
+                union = lhs.shape[1] + rhs.shape[1] - inter
+                jaccard_sum += inter.float() / union.float().clamp_min(1.0)
+                comb += 1
+        keep_mask = (jaccard_sum / comb) >= threshold
+    else:
+        keep_mask = torch.ones(b, device=topk_idx.device, dtype=torch.bool)
+
+    sorted_topk_idx = torch.sort(topk_idx[:, 0, :], dim=1).values.cpu().tolist()
+    keep_mask = keep_mask.cpu().tolist()
+
+    full_prefix_idx = list(range(common_prefix_len))
+    imp_token_idx = []
+    for i in range(b):
+        if keep_mask[i]:
+            imp_token_idx.append(sorted_topk_idx[i])
+        else:
+            imp_token_idx.append(full_prefix_idx)
+
+    return imp_token_idx
 
 class DeviceType(Enum):
     CPU = auto()
@@ -1054,31 +1115,7 @@ class TorchDevice:
         scores = scores.sum(dim = 2)
 
         _, topk_idx = torch.topk(scores, k=n_important, dim=2)
-        S_imp = [[] for _ in range(b)]
-        for i in range(b):
-            for j in range(n_probe_head):
-                idx_set = { int(x) for x in topk_idx[i,j]}
-                S_imp[i].append(idx_set)
-
-        #logger.info(f"IMP_Token Set:{S_imp}")
-
-        thresold = ((n_important/common_prefix_len) / (2 - n_important/common_prefix_len)) ** 0.6
-        
-        #logger.info(f"IMP_Token: thresold={thresold}")
-
-        imp_token_idx = []
-        for i in range(b):
-            jaccard = 0
-            for l in range(n_probe_head):
-                for r in range(l+1, n_probe_head):
-                    jaccard += len(S_imp[i][l] & S_imp[i][r])/len(S_imp[i][l] | S_imp[i][r])
-            comb = (n_probe_head * (n_probe_head - 1)) / 2
-            jaccard /= comb
-            if jaccard >= thresold:
-                imp_token_idx.append(sorted(S_imp[0][0]))
-            else:
-                imp_token_idx.append(list(range(common_prefix_len))) #表示加载全部kv
-            logger.info(f"Get IMP LLAMA:thresold={thresold},jaccard={jaccard}")
+        imp_token_idx = select_important_token_idx(topk_idx, common_prefix_len)
 
         k_cache.delete()
 
@@ -1117,7 +1154,6 @@ class TorchDevice:
 
         # shape: (b, s, h)
         q = F.linear(hidden, w_q.data)
-        # shape: (b, suffix_len, h)
         k_new = F.linear(suffix_hidden, w_k.data)
         v_new = F.linear(suffix_hidden, w_v.data)
 
@@ -1147,6 +1183,7 @@ class TorchDevice:
         else:
             k = ori_k
             v = ori_v
+
         scores = torch.bmm(q, k) / math.sqrt(head_dim)
         scores = F.softmax(scores.float(), dim=-1).type_as(q)
 
@@ -1154,7 +1191,6 @@ class TorchDevice:
         output = output.transpose(1, 2).reshape(b, s, -1)
 
         out = F.linear(output, w_out.data)
-
         out.add_(inputs.data)
 
         if donate[0]: inputs.delete()
@@ -1190,28 +1226,36 @@ class TorchDevice:
         repeat_kv = n_head // n_kv_head  # GQA: how many query heads share one KV head
 
         common_prefix_len = k_cache.shape[0]
+        suffix_len = s - common_prefix_len
         n_important = math.ceil(common_prefix_len * important_ratio)
 
+        if suffix_len <= 0:
+            k_cache.delete()
+            return [list(range(common_prefix_len)) for _ in range(b)]
+
         freqs_cis = freqs_cis[:s].to(self.dev)
+        suffix_freqs_cis = freqs_cis[common_prefix_len:s]
+        prefix_freqs_cis = freqs_cis[:common_prefix_len]
 
         # input_layernorm
         hidden = F.rms_norm(inputs.data[:], (h,), weight=i_n.data, eps=eps)
+        suffix_hidden = hidden[:, common_prefix_len:, :]
 
         # Extract n_probe_head * repeat_kv query heads
         # w_q shape: (n_head * head_dim, h) for GQA, take rows instead of columns
         w_q_probe = w_q.data[:n_probe_head * repeat_kv * head_dim, :]
-        q = F.linear(hidden, w_q_probe)
-        # shape: (b, s, n_probe_head * repeat_kv, head_dim)
-        q = q.view(b, s, n_probe_head * repeat_kv, head_dim)
+        q = F.linear(suffix_hidden, w_q_probe)
+        # shape: (b, suffix_len, n_probe_head * repeat_kv, head_dim)
+        q = q.view(b, suffix_len, n_probe_head * repeat_kv, head_dim)
 
         # Extract n_probe_head key/value heads
         # k_cache shape: (common_prefix_len, b * n_probe_head, head_dim)
         k = k.view(common_prefix_len, b, n_probe_head, head_dim).permute(1, 0, 2, 3) # b, common_prefix_len, n_probe_head, head_dim
 
         # Apply rotary embedding
-        q, k = apply_rotary_emb(q, k, freqs_cis, s, common_prefix_len)
+        q, k = apply_rotary_emb_separate(q, k, suffix_freqs_cis, prefix_freqs_cis)
 
-        # shape: (b, n_probe_head * repeat_kv, s, head_dim)
+        # shape: (b, n_probe_head * repeat_kv, suffix_len, head_dim)
         q = q.transpose(1, 2)
         # shape: (b, n_probe_head, common_prefix_len, head_dim)
         k = k.transpose(1, 2)
@@ -1229,27 +1273,7 @@ class TorchDevice:
         group_scores = group_scores.sum(dim=2)
 
         _, topk_idx = torch.topk(group_scores, k=n_important, dim=2)
-        S_imp = [[] for _ in range(b)]
-        for i in range(b):
-            for j in range(n_probe_head):
-                idx_set = {int(x) for x in topk_idx[i, j]}
-                S_imp[i].append(idx_set)
-
-        thresold = ((n_important/common_prefix_len) / (2 - n_important/common_prefix_len)) ** 0.6
-
-        imp_token_idx = []
-        for i in range(b):
-            jaccard = 0
-            for l in range(n_probe_head):
-                for r in range(l+1, n_probe_head):
-                    jaccard += len(S_imp[i][l] & S_imp[i][r])/len(S_imp[i][l] | S_imp[i][r])
-            comb = (n_probe_head * (n_probe_head - 1)) / 2
-            jaccard /= comb
-            if jaccard >= thresold:
-                imp_token_idx.append(sorted(S_imp[i][0]))
-            else:
-                imp_token_idx.append(list(range(common_prefix_len)))
-            logger.info(f"Get IMP LLAMA Modified: thresold={thresold}, jaccard={jaccard}")
+        imp_token_idx = select_important_token_idx(topk_idx, common_prefix_len)
 
         k_cache.delete()
 

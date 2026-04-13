@@ -544,11 +544,17 @@ class SelfAttention:
             mask, donate[1] = attention_mask.val.smart_copy(self.compute)
             if self.task.common_prefix_len > 0:
                 (k_cache, donate[9]) = cache_read_buf.pop()
-                timers("imp calc").start(self.sync)
+                start_event_imp_calc = torch.cuda.Event(enable_timing=True)
+                end_event_imp_calc = torch.cuda.Event(enable_timing=True)
+                start_event_imp_calc.record(torch.cuda.current_stream())
                 imp_token_idx = self.compute.get_important_token_idx_llama_modified(h, mask, i_n, w_q, self.rms_norm_eps,
                                 freqs_cis, n_head, num_key_value_heads, donate, self.policy.compress_cache, self.policy.comp_cache_config,
                                 k_cache, self.policy.important_ratio)
-                timers("imp calc").stop(self.sync)
+                end_event_imp_calc.record(torch.cuda.current_stream())
+                end_event_imp_calc.synchronize()
+                timers("imp calc").costs.append(
+                    start_event_imp_calc.elapsed_time(end_event_imp_calc) / 1e3
+                )
 
                 imp_token_idx = imp_token_idx[0] # 解开batch维度
 
@@ -1626,14 +1632,14 @@ def run_full_request_set(model, tokenizer, args, context, questions):
         tokenizer=tokenizer,
     )
     print(len(prefix_input[0]))
-    model.generate(
-        prefix_input,
-        max_new_tokens=1,
-        debug_mode=args.debug_mode,
-        cut_gen_len=cut_gen_len,
-        verbose=args.verbose,
-    )
-    model.sync()
+    # model.generate(
+    #     prefix_input,
+    #     max_new_tokens=1,
+    #     debug_mode=args.debug_mode,
+    #     cut_gen_len=cut_gen_len,
+    #     verbose=args.verbose,
+    # )
+    # model.sync()
 
     inputs = [context + query + "\n" for query in questions]
     inputs_ids = tokenizer(inputs, truncation=True, max_length=max_prompt_len).input_ids
